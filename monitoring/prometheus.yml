@@ -1,0 +1,28 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+  external_labels:
+    monitor: 'nexus-trader'
+
+scrape_configs:
+  - job_name: 'nexus-trader'
+    static_configs:
+      - targets: ['nexus-trader:8000']
+    metrics_path: '/api/v1/metrics/prometheus'
+    scrape_interval: 15s
+
+  - job_name: 'redis'
+    static_configs:
+      - targets: ['nexus-redis:6379']
+
+  - job_name: 'node-exporter'
+    static_configs:
+      - targets: ['host.docker.internal:9100']
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: []
+
+rule_files:
+  - 'alerts.yml'

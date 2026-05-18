@@ -1,0 +1,53 @@
+groups:
+  - name: nexus-trader-alerts
+    rules:
+
+      - alert: APIDown
+        expr: up{job="nexus-trader"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Nexus Trader API is DOWN"
+          description: "Backend a fost offline mai mult de 1 minut."
+
+      - alert: HighDrawdown
+        expr: nexus_drawdown_pct > 0.08
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Drawdown depășit 8%"
+          description: "Drawdown curent: {{ $value | humanizePercentage }}"
+
+      - alert: EmergencyDrawdown
+        expr: nexus_drawdown_pct > 0.10
+        for: 0m
+        labels:
+          severity: critical
+        annotations:
+          summary: "EMERGENCY: Drawdown > 10% — trading oprit automat"
+
+      - alert: DailyLossLimit
+        expr: nexus_daily_loss_pct > 0.018
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Daily loss aproape de limită (1.8%/2%)"
+
+      - alert: ConsecutiveLosses
+        expr: nexus_consecutive_losses >= 3
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} pierderi consecutive — cooldown activ"
+
+      - alert: ReconciliationFailed
+        expr: nexus_reconciliation_ok == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Reconciliere Binance eșuată — TRADING BLOCAT"
