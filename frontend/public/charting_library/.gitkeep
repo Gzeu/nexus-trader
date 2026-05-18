@@ -1,0 +1,7 @@
+# Place TradingView Charting Library files here.
+# Download from: https://www.tradingview.com/HTML5-stock-forex-bitcoin-charting-library/
+# Required files:
+#   charting_library.js
+#   charting_library.esm.js
+#   charting_library.esm.js.map (optional)
+#   bundles/ directory
