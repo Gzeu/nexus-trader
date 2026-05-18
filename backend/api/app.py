@@ -1,14 +1,13 @@
 """
 app.py – FastAPI application factory + lifespan.
 
-Fixes / improvements over v1:
-- CORS `allow_origins` uses settings.cors_origins (was hardcoded "*" — security risk)
-- `futures_client.__aexit__` only called when futures_enabled (was always called → crash if None)
-- `result.notes` → `result.errors` (correct field name from ReconciliationReport)
-- Prometheus middleware added (optional, non-blocking if prometheus_client not installed)
-- Startup log includes environment + dry_run + testnet flags for quick audit
-- App version reads from settings instead of hardcoded "1.0.0"
-- `app.state.start_time` set for uptime tracking in /health
+Fixes / improvements:
+- routes_webhook router registered under /api/v1
+- CORS `allow_origins` uses settings.cors_origins (not wildcard)
+- futures_client.__aexit__ only called when futures_enabled
+- Prometheus middleware added (optional, non-blocking)
+- startup log includes environment + dry_run + testnet flags
+- app.state.start_time set for uptime tracking in /health
 """
 from __future__ import annotations
 
@@ -21,6 +20,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api.routes import router as http_router
+from backend.api.routes_webhook import router as webhook_router
 from backend.api.websocket import router as ws_router
 from backend.config import get_settings
 
@@ -45,7 +45,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
         await state.setup()
         result = await state.portfolio.reconcile()
         if not result.success:
-            # Log all errors but do NOT block startup — operator can fix and reconcile manually
             log.critical("reconciliation_failed_at_startup", errors=result.errors)
         else:
             log.info(
@@ -55,11 +54,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
             state.automation.start()  # sync — do NOT await
     except Exception as exc:
         log.critical("startup_exception", error=str(exc))
-        # Still yield — app stays up in degraded mode, /health will report not_reconciled
+        # App stays up in degraded mode; /health reports not_reconciled
 
     yield
 
-    # ── Graceful shutdown ───────────────────────────────────────────────────
+    # ── Graceful shutdown ──────────────────────────────────────────
     log.info("shutdown_begin")
     try:
         if state.automation:
@@ -78,7 +77,6 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
     except Exception as exc:
         log.warning("spot_client_close_error", error=str(exc))
 
-    # Only close futures client if futures were enabled
     if settings.futures_enabled and state.futures_client is not None:
         try:
             await state.futures_client.__aexit__(None, None, None)
@@ -104,7 +102,6 @@ def create_app() -> FastAPI:
     app.state.ctx = ctx
     app.state.start_time = 0.0  # overwritten in lifespan
 
-    # CORS — use configured origins, not wildcard
     app.add_middleware(
         CORSMiddleware,
         allow_origins=settings.cors_origins,
@@ -121,6 +118,11 @@ def create_app() -> FastAPI:
     except ImportError:
         log.info("prometheus_client_not_installed_metrics_endpoint_disabled")
 
+    # REST routes
     app.include_router(http_router, prefix="/api/v1")
+    # TradingView Pine Script webhook  → POST /api/v1/signals/webhook
+    app.include_router(webhook_router, prefix="/api/v1")
+    # WebSocket live updates  → WS /ws
     app.include_router(ws_router)
+
     return app
