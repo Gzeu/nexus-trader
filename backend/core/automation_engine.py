@@ -1,6 +1,9 @@
 """
 automation_engine.py – APScheduler-based signal loop, candle deduplication,
 async EventEmitter, position management loop.
+
+FIX: calc_position_size call now passes market_mode + leverage (PR #fix4).
+FIX: price used for sizing is confirmed close (ohlcv.last_close), NOT live candle.
 """
 from __future__ import annotations
 
@@ -13,14 +16,21 @@ import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from backend.config import get_settings
-from backend.core.trade_logic import evaluate_exit, update_position_after_tp1, ExitDecision
+from backend.core.trade_logic import (
+    evaluate_exit,
+    update_position_after_tp1,
+    ExitDecision,
+    calc_position_size,           # imported here so the fix is always in scope
+    should_enter_long,
+    should_enter_short,
+)
 from backend.models import Action, RiskVeto
 
 log = structlog.get_logger(__name__)
 settings = get_settings()
 
 
-# ── Async EventEmitter ──────────────────────────────────────────────────
+# ── Async EventEmitter ──────────────────────────────────────────────────────
 
 class EventEmitter:
     def __init__(self):
@@ -40,7 +50,7 @@ class EventEmitter:
                 log.error("event_handler_error", event=event, error=str(exc))
 
 
-# ── Automation Engine ──────────────────────────────────────────────────
+# ── Automation Engine ──────────────────────────────────────────────────────
 
 class AutomationEngine:
     """
@@ -50,7 +60,7 @@ class AutomationEngine:
 
     def __init__(
         self,
-        strategy,          # CompositeStrategy or any BaseStrategy
+        strategy,
         portfolio_engine,
         risk_manager,
         execution_engine,
@@ -74,9 +84,9 @@ class AutomationEngine:
 
     async def start(self) -> None:
         interval = settings.scan_interval_seconds
-        self._scheduler.add_job(self._scan_loop, "interval", seconds=interval, id="scan_loop")
-        self._scheduler.add_job(self._position_loop, "interval", seconds=max(interval // 2, 5), id="pos_loop")
-        self._scheduler.add_job(self._reconcile_loop, "interval", seconds=300, id="reconcile_loop")
+        self._scheduler.add_job(self._scan_loop,      "interval", seconds=interval,              id="scan_loop")
+        self._scheduler.add_job(self._position_loop,  "interval", seconds=max(interval // 2, 5), id="pos_loop")
+        self._scheduler.add_job(self._reconcile_loop, "interval", seconds=300,                   id="reconcile_loop")
         self._scheduler.start()
         self.running = True
         log.info("automation_started", interval_s=interval)
@@ -86,7 +96,7 @@ class AutomationEngine:
         self.running = False
         log.info("automation_stopped")
 
-    # ── Scan Loop ────────────────────────────────────────────────────────────
+    # ── Scan Loop ───────────────────────────────────────────────────────────────────
 
     async def _scan_loop(self) -> None:
         if not self._portfolio.is_ready:
@@ -98,6 +108,7 @@ class AutomationEngine:
                 klines = await self._client.get_klines(symbol, settings.primary_timeframe, limit=100)
                 if not klines:
                     continue
+
                 from backend.core.strategy_engine import OHLCV
                 ohlcv = OHLCV(klines)
                 signal = await self._strategy.compute(ohlcv)
@@ -115,10 +126,8 @@ class AutomationEngine:
                     await self.emitter.emit("signal_rejected", {"reason": veto.value, "symbol": symbol})
                     continue
 
-                from backend.core.trade_logic import (
-                    should_enter_long, should_enter_short, calc_position_size
-                )
                 equity = self._risk.equity
+                # FIX: use confirmed close price — NOT the open/live candle price
                 price = ohlcv.last_close
 
                 if signal.action == Action.BUY:
@@ -132,7 +141,15 @@ class AutomationEngine:
                     log.info("signal_rejected_logic", symbol=symbol, reason=reason)
                     continue
 
-                qty = calc_position_size(equity, price, signal.stop_loss)
+                # FIX: pass market_mode and leverage — critical for correct futures sizing
+                qty = calc_position_size(
+                    equity=equity,
+                    entry=price,
+                    stop_loss=signal.stop_loss,
+                    market_mode=signal.market_mode,
+                    leverage=settings.futures_leverage,
+                )
+
                 order = await self._exec.place_market_order(signal, qty)
 
                 if order and order.status.value in ("FILLED", "PARTIALLY_FILLED"):
@@ -146,7 +163,7 @@ class AutomationEngine:
             except Exception as exc:
                 log.error("scan_loop_error", symbol=symbol, error=str(exc))
 
-    # ── Position Management Loop ─────────────────────────────────────────────
+    # ── Position Management Loop ───────────────────────────────────────────────────────
 
     async def _position_loop(self) -> None:
         for symbol, position in list(self._portfolio.positions.items()):
@@ -154,40 +171,39 @@ class AutomationEngine:
                 klines = await self._client.get_klines(symbol, settings.primary_timeframe, limit=5)
                 if not klines:
                     continue
-                price = float(klines[-1][4])
+                # Use confirmed close (second-to-last), not the live candle
+                price = float(klines[-2][4]) if len(klines) >= 2 else float(klines[-1][4])
+
                 reason, fraction = evaluate_exit(position, price)
                 if reason == ExitDecision.NONE:
                     continue
 
                 close_qty = position.quantity * fraction
+
                 if reason == ExitDecision.TP1:
                     position = update_position_after_tp1(position, price)
                     self._portfolio.positions[symbol] = position
                     await self.emitter.emit("tp1_hit", {"symbol": symbol, "price": price})
 
-                # Place close order (opposite side)
-                from backend.models import OrderSide, OrderType, Order, OrderStatus
-                from backend.core.strategy_engine import OHLCV
-                from backend.models import Action
                 close_side = "SELL" if position.side.value == "LONG" else "BUY"
-                close_signal_action = Action.SELL if close_side == "SELL" else Action.BUY
+                close_qty  = self._exec.normalize_quantity(symbol, close_qty)
 
-                # Re-use execution engine for normalised close
-                close_qty = self._exec.normalize_quantity(symbol, close_qty)
                 if close_qty > 0 and not settings.dry_run:
                     await self._client.place_market_order(
-                        symbol=symbol, side=close_side, quantity=close_qty,
+                        symbol=symbol,
+                        side=close_side,
+                        quantity=close_qty,
                         market_mode=position.market_mode,
                     )
                 elif close_qty > 0 and settings.dry_run:
-                    log.info("dry_run_close", symbol=symbol, reason=reason, qty=close_qty)
+                    log.info("dry_run_close", symbol=symbol, reason=reason, qty=close_qty, price=price)
 
                 if fraction >= 1.0:
                     self._portfolio.remove_position(symbol)
                     self._risk.position_closed(symbol)
-                    await self.emitter.emit("position_closed", {"symbol": symbol, "reason": reason})
+                    await self.emitter.emit("position_closed", {"symbol": symbol, "reason": reason, "price": price})
                     if self._telegram:
-                        await self._telegram.send_alert(f"🔴 Position closed: {symbol} | {reason}")
+                        await self._telegram.send_alert(f"🔴 Position closed: {symbol} | {reason} @ {price}")
                 else:
                     position.quantity -= close_qty
                     self._portfolio.positions[symbol] = position
@@ -201,11 +217,11 @@ class AutomationEngine:
             if result.drift_detected:
                 await self.emitter.emit("drift_detected", result.model_dump())
                 if self._telegram:
-                    await self._telegram.send_alert(f"⚠️ Drift detected during periodic reconciliation")
+                    await self._telegram.send_alert("⚠️ Drift detected during periodic reconciliation")
         except Exception as exc:
             log.error("reconcile_loop_error", error=str(exc))
 
-    # ── Deduplication helpers ─────────────────────────────────────────────────
+    # ── Deduplication helpers ───────────────────────────────────────────────────────
 
     def _is_duplicate(self, symbol: str, candle_time: Optional[int]) -> bool:
         if candle_time is None:
@@ -218,5 +234,4 @@ class AutomationEngine:
         cache = self._processed_candles[symbol]
         cache.add(candle_time)
         if len(cache) > 100:
-            oldest = min(cache)
-            cache.discard(oldest)
+            cache.discard(min(cache))
