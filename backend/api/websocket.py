@@ -1,8 +1,8 @@
 """
-websocket.py – WebSocket broadcast hub.
+websocket.py – WebSocket broadcast hub for live TradingView UI updates.
 
-All engine events (fills, positions, signals) are forwarded to every
-connected TradingView client in real-time.
+All EventEmitter events are forwarded to every connected client.
+Client reconnection + ping/pong keepalive included.
 """
 from __future__ import annotations
 
@@ -16,26 +16,11 @@ from fastapi import APIRouter, Request, WebSocket, WebSocketDisconnect
 log = structlog.get_logger(__name__)
 router = APIRouter()
 
-# Set of all active WebSocket connections
+# Global set of connected clients – safe within single-process asyncio event loop
 _clients: Set[WebSocket] = set()
 
-
-async def broadcast(event: str, payload: dict) -> None:
-    """Push a JSON event to all connected clients. Drops dead connections."""
-    message = json.dumps({"event": event, "payload": payload}, default=str)
-    dead: Set[WebSocket] = set()
-    for ws in _clients:
-        try:
-            await ws.send_text(message)
-        except Exception:
-            dead.add(ws)
-    _clients.difference_update(dead)
-    if dead:
-        log.debug("ws_dropped_dead_clients", count=len(dead))
-
-
-# Events emitted by the engines that TradingView needs to react to
-_SUBSCRIBED_EVENTS = [
+# Events forwarded to TradingView broker adapter
+_FORWARDED_EVENTS = (
     "signal_created",
     "signal_rejected",
     "order_filled",
@@ -45,37 +30,45 @@ _SUBSCRIBED_EVENTS = [
     "partial_close",
     "tp_hit",
     "sl_hit",
-    "risk_veto",
-    "daily_loss_limit",
-    "drawdown_limit",
-    "emergency_stop",
-]
+    "daily_loss_pause",
+    "drawdown_stop",
+)
+
+
+async def broadcast(event: str, payload: dict) -> None:
+    """Send an event to all connected WebSocket clients. Drop disconnected ones."""
+    if not _clients:
+        return
+    message = json.dumps({"event": event, "payload": payload})
+    disconnected: Set[WebSocket] = set()
+    for ws in _clients:
+        try:
+            await ws.send_text(message)
+        except Exception:
+            disconnected.add(ws)
+    _clients.difference_update(disconnected)
 
 
 @router.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket, request: Request):
-    """Accept a WebSocket client and subscribe it to all engine events."""
+    """Accept client, register event handlers, handle ping/pong."""
     await websocket.accept()
     _clients.add(websocket)
     ctx = request.app.state.ctx
 
-    # Register broadcast handlers on the shared EventEmitter
-    for event in _SUBSCRIBED_EVENTS:
-        # Capture event name in closure
-        def make_handler(ev: str):
-            def handler(payload: dict):
-                asyncio.create_task(broadcast(ev, payload))
-            return handler
-        ctx.emitter.on(event, make_handler(event))
+    # Register broadcast handlers for all forwarded events
+    for event in _FORWARDED_EVENTS:
+        ctx.emitter.on(
+            event,
+            lambda payload, e=event: asyncio.create_task(broadcast(e, payload)),
+        )
 
     log.info("ws_client_connected", total=len(_clients))
-
     try:
         while True:
-            # Keep-alive: respond to ping frames
             data = await websocket.receive_text()
             if data == "ping":
                 await websocket.send_text("pong")
     except WebSocketDisconnect:
         _clients.discard(websocket)
-        log.info("ws_client_disconnected", remaining=len(_clients))
+        log.info("ws_client_disconnected", total=len(_clients))

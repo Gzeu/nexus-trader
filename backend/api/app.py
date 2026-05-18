@@ -13,35 +13,23 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api.routes import router as http_router
 from backend.api.websocket import router as ws_router
-from backend.api.state import AppState
 
 log = structlog.get_logger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator:
-    """Startup: init all clients, run mandatory reconciliation, start automation.
-    Shutdown: graceful teardown of scheduler and HTTP sessions.
-    """
-    state: AppState = app.state.ctx
-    log.info("startup_begin", dry_run=state.settings.dry_run, testnet=state.settings.testnet)
-
+    """Startup: init clients + mandatory reconciliation. Shutdown: graceful teardown."""
+    state = app.state.ctx
+    log.info("startup_begin")
     await state.setup()
-
     result = await state.portfolio.reconcile()
     if not result.success:
-        log.critical(
-            "reconciliation_failed_at_startup",
-            notes=result.notes,
-            drifted=result.drifted_symbols,
-        )
-        # Still allow server to start but trading stays blocked via portfolio.is_ready=False
+        log.critical("reconciliation_failed_at_startup", notes=result.notes)
     else:
-        log.info("startup_reconciled", positions=len(result.synced_positions))
+        log.info("startup_reconciled", equity=state.portfolio.account.total_equity)
         state.automation.start()
-
     yield
-
     log.info("shutdown_begin")
     state.automation.stop()
     await state.journal.close()
@@ -51,16 +39,16 @@ async def lifespan(app: FastAPI) -> AsyncGenerator:
 
 
 def create_app() -> FastAPI:
-    """Application factory – called from main.py."""
+    """Create and wire the FastAPI application."""
+    from backend.api.state import AppState
     from backend.config import get_settings
-    settings = get_settings()
-    ctx = AppState(settings)
+
+    ctx = AppState(get_settings())
 
     app = FastAPI(
         title="Nexus Trader API",
         version="1.0.0",
         docs_url="/docs",
-        redoc_url="/redoc",
         lifespan=lifespan,
     )
     app.state.ctx = ctx

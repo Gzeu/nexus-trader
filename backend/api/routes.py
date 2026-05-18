@@ -1,17 +1,18 @@
 """
-routes.py – All HTTP REST endpoints.
+routes.py – All HTTP REST endpoints for Nexus Trader.
 
-Endpoints:
-  GET  /health             – liveness + readiness
-  GET  /metrics            – risk + portfolio analytics
-  GET  /signals            – last 50 trades from journal
-  POST /place_order        – manual order placement
-  POST /emergency_stop     – pause trading + kill automation
-  POST /resume_trading     – resume after pause
-  POST /cancel_all         – cancel open orders (optional symbol filter)
-  POST /close_all          – market-close all open positions
-  GET  /positions          – current open positions
-  GET  /account            – account balance info
+Endpoints
+---------
+GET  /health          – System status (reconciled, dry_run, automation)
+GET  /metrics         – Risk + portfolio analytics
+GET  /signals         – Last 50 trade records from journal
+POST /place_order     – Manual order placement (blocked if paused/not reconciled)
+POST /emergency_stop  – Halt automation + pause risk engine
+POST /resume_trading  – Resume after pause
+POST /cancel_all      – Cancel all open orders (optional symbol filter)
+POST /close_all       – Close every open position at market
+GET  /positions       – Current open positions
+GET  /account         – Account balances + equity
 """
 from __future__ import annotations
 
@@ -39,13 +40,14 @@ async def health(ctx=Depends(get_ctx)):
         "status": "ok" if (ctx.portfolio and ctx.portfolio.is_ready) else "not_reconciled",
         "dry_run": ctx.settings.dry_run,
         "testnet": ctx.settings.testnet,
-        "automation_running": bool(ctx.automation and ctx.automation._running),
-        "trading_paused": ctx.risk.paused if ctx.risk else True,
-        "pause_reason": ctx.risk.pause_reason if ctx.risk else "not_initialized",
+        "trading_paused": ctx.risk.paused,
+        "pause_reason": ctx.risk.pause_reason,
+        "automation_running": ctx.automation._running if ctx.automation else False,
+        "open_positions": len(ctx.portfolio.positions) if ctx.portfolio else 0,
     }
 
 
-# ── Metrics ──────────────────────────────────────────────────────────────────
+# ── Metrics ─────────────────────────────────────────────────────────────────
 
 @router.get("/metrics")
 async def metrics(ctx=Depends(get_ctx)):
@@ -56,7 +58,7 @@ async def metrics(ctx=Depends(get_ctx)):
     return {**risk_metrics.model_dump(), **portfolio_summary}
 
 
-# ── Signals / Journal ─────────────────────────────────────────────────────────
+# ── Signals / Journal ───────────────────────────────────────────────────────
 
 @router.get("/signals")
 async def list_signals(ctx=Depends(get_ctx)):
@@ -64,23 +66,20 @@ async def list_signals(ctx=Depends(get_ctx)):
     return {"count": len(trades), "trades": trades[-50:]}
 
 
-# ── Place Order ───────────────────────────────────────────────────────────────
+# ── Order Placement ──────────────────────────────────────────────────────────
 
 class PlaceOrderRequest(BaseModel):
     symbol: str
-    side: str  # BUY | SELL
+    side: str                        # "BUY" | "SELL"
     quantity: float
-    price: Optional[float] = None  # None → market order
-    stop_loss: Optional[float] = None
-    take_profit: Optional[float] = None
-    market_mode: str = "SPOT"  # SPOT | FUTURES
+    price: Optional[float] = None    # None → MARKET order
+    market_mode: str = "SPOT"        # "SPOT" | "FUTURES"
 
 
 @router.post("/place_order")
 async def place_order(req: PlaceOrderRequest, ctx=Depends(get_ctx)):
-    """Place a manual order. Reconciliation must have succeeded."""
     if not ctx.portfolio or not ctx.portfolio.is_ready:
-        raise HTTPException(503, "System not reconciled – trading blocked")
+        raise HTTPException(503, "System not reconciled – trading blocked until startup sync completes")
     if ctx.risk.paused:
         raise HTTPException(403, f"Trading paused: {ctx.risk.pause_reason}")
 
@@ -96,40 +95,35 @@ async def place_order(req: PlaceOrderRequest, ctx=Depends(get_ctx)):
             order = await ctx.execution.place_market_order(
                 req.symbol, side, req.quantity, market_mode=mode
             )
-        log.info("manual_order_placed", symbol=req.symbol, side=req.side, qty=req.quantity)
+        await ctx.journal.log_order(order)
         return order.model_dump(mode="json")
     except Exception as exc:
-        log.error("manual_order_error", error=str(exc))
+        log.error("place_order_error", symbol=req.symbol, error=str(exc))
         raise HTTPException(500, str(exc))
 
 
-# ── Safety Endpoints ──────────────────────────────────────────────────────────
+# ── Kill Switches ────────────────────────────────────────────────────────────
 
 @router.post("/emergency_stop")
 async def emergency_stop(ctx=Depends(get_ctx)):
-    """Immediately pause all trading and stop automation scheduler."""
     ctx.risk._pause("Manual emergency stop via API")
-    if ctx.automation:
-        ctx.automation.stop()
+    ctx.automation.stop()
     log.critical("emergency_stop_triggered")
     from backend.journal.telegram_alerts import send_alert
-    await send_alert("🚨 EMERGENCY STOP triggered manually via API")
-    return {"status": "stopped", "paused": True}
+    await send_alert("🚨 EMERGENCY STOP triggered via /emergency_stop endpoint")
+    return {"status": "stopped", "message": "Automation halted. Call /resume_trading to restart."}
 
 
 @router.post("/resume_trading")
 async def resume_trading(ctx=Depends(get_ctx)):
-    """Resume trading after manual pause."""
     ctx.risk.resume()
-    if ctx.automation:
-        ctx.automation.start()
+    ctx.automation.start()
     log.info("trading_resumed")
-    return {"status": "resumed", "paused": False}
+    return {"status": "resumed"}
 
 
 @router.post("/cancel_all")
 async def cancel_all(symbol: Optional[str] = None, ctx=Depends(get_ctx)):
-    """Cancel all open orders, optionally filtered by symbol."""
     try:
         result = await ctx.spot_client.cancel_all_orders(symbol or "")
         return {"cancelled": result}
@@ -139,27 +133,29 @@ async def cancel_all(symbol: Optional[str] = None, ctx=Depends(get_ctx)):
 
 @router.post("/close_all")
 async def close_all(ctx=Depends(get_ctx)):
-    """Market-close every open position."""
     results = []
     for sym, pos in list(ctx.portfolio.positions.items()):
         try:
             await ctx.execution.close_position(pos)
             ctx.portfolio.remove_position(sym)
             results.append({"symbol": sym, "status": "closed"})
-            log.info("position_closed", symbol=sym)
         except Exception as exc:
-            log.error("close_position_error", symbol=sym, error=str(exc))
+            log.error("close_all_error", symbol=sym, error=str(exc))
             results.append({"symbol": sym, "error": str(exc)})
     return {"results": results}
 
 
-# ── Read-only state ────────────────────────────────────────────────────────────
+# ── Portfolio ────────────────────────────────────────────────────────────────
 
 @router.get("/positions")
 async def get_positions(ctx=Depends(get_ctx)):
+    if not ctx.portfolio:
+        raise HTTPException(503, "Portfolio not initialized")
     return [p.model_dump(mode="json") for p in ctx.portfolio.positions.values()]
 
 
 @router.get("/account")
 async def get_account(ctx=Depends(get_ctx)):
+    if not ctx.portfolio:
+        raise HTTPException(503, "Portfolio not initialized")
     return ctx.portfolio.account.model_dump(mode="json")
