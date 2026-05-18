@@ -1,0 +1,113 @@
+// @version=5
+// Nexus Trader v3 – Pine Script Webhook Template
+// Sends JSON alerts to your FastAPI backend (/api/v1/signals/webhook)
+// Compatible with TradingView Alerts → Webhook URL
+//
+// SETUP:
+// 1. Add this script to your chart
+// 2. Create an Alert → set Webhook URL to: https://your-server.com/api/v1/signals/webhook
+// 3. Set Alert Message to: {{strategy.order.action}} (the script overrides it via alertcondition)
+// 4. Set API_SECRET in your .env to validate incoming webhooks
+
+strategy(
+     title          = "Nexus Trader Webhook",
+     shorttitle     = "NXT",
+     overlay        = true,
+     default_qty_type  = strategy.percent_of_equity,
+     default_qty_value = 10,
+     commission_type   = strategy.commission.percent,
+     commission_value  = 0.1,
+     slippage          = 2
+ )
+
+// ── Inputs ──────────────────────────────────────────────────────────
+webhook_secret = input.string("your_api_secret_here", title="Webhook Secret (match API_SECRET_KEY)")
+ema_fast       = input.int(9,   title="EMA Fast",   minval=3,  maxval=50)
+ema_slow       = input.int(21,  title="EMA Slow",   minval=10, maxval=200)
+rsi_len        = input.int(14,  title="RSI Length",  minval=5,  maxval=50)
+rsi_ob         = input.int(70,  title="RSI Overbought")
+rsi_os         = input.int(30,  title="RSI Oversold")
+atr_len        = input.int(14,  title="ATR Length")
+atr_sl_mult    = input.float(1.5, title="ATR SL Multiplier",  step=0.1)
+atr_tp1_mult   = input.float(2.5, title="ATR TP1 Multiplier", step=0.1)
+atr_tp2_mult   = input.float(4.0, title="ATR TP2 Multiplier", step=0.1)
+market_mode    = input.string("SPOT", title="Market Mode", options=["SPOT", "FUTURES"])
+min_confidence = input.float(0.65, title="Min Confidence to Send", minval=0.0, maxval=1.0, step=0.05)
+
+// ── Indicators ─────────────────────────────────────────────────────────
+ema_f  = ta.ema(close, ema_fast)
+ema_s  = ta.ema(close, ema_slow)
+rsi    = ta.rsi(close, rsi_len)
+atr    = ta.atr(atr_len)
+[macd_line, signal_line, _] = ta.macd(close, 12, 26, 9)
+vol_ma = ta.sma(volume, 20)
+
+// ── Signal Conditions ──────────────────────────────────────────────────
+long_cond  = ta.crossover(ema_f, ema_s) and rsi > 45 and rsi < rsi_ob and macd_line > signal_line and volume > vol_ma
+short_cond = ta.crossunder(ema_f, ema_s) and rsi < 55 and rsi > rsi_os and macd_line < signal_line and volume > vol_ma
+
+// Confidence score: 0.60 base + bonus per additional confirmations
+long_conf  = 0.60 + (rsi > 50 ? 0.05 : 0.0) + (macd_line > 0 ? 0.05 : 0.0) + (volume > vol_ma * 1.5 ? 0.05 : 0.0)
+short_conf = 0.60 + (rsi < 50 ? 0.05 : 0.0) + (macd_line < 0 ? 0.05 : 0.0) + (volume > vol_ma * 1.5 ? 0.05 : 0.0)
+
+// SL / TP calculated from ATR
+long_sl  = close - atr * atr_sl_mult
+long_tp1 = close + atr * atr_tp1_mult
+long_tp2 = close + atr * atr_tp2_mult
+
+short_sl  = close + atr * atr_sl_mult
+short_tp1 = close - atr * atr_tp1_mult
+short_tp2 = close - atr * atr_tp2_mult
+
+// ── Webhook Payloads ────────────────────────────────────────────────────
+// These are the exact JSON strings that will be sent to your FastAPI /signals/webhook endpoint.
+// TradingView replaces {{}} placeholders at alert-fire time.
+
+long_payload = '{' +
+     '"secret":"'       + webhook_secret + '",' +
+     '"symbol":"'       + syminfo.ticker + '",' +
+     '"action":"BUY",'  +
+     '"entry_type":"market",' +
+     '"entry_price":'   + str.tostring(close, "#.########") + ',' +
+     '"stop_loss":'     + str.tostring(long_sl,  "#.########") + ',' +
+     '"take_profit_1":' + str.tostring(long_tp1, "#.########") + ',' +
+     '"take_profit_2":' + str.tostring(long_tp2, "#.########") + ',' +
+     '"confidence":'    + str.tostring(long_conf, "#.##") + ',' +
+     '"timeframe":"'    + timeframe.period + '",' +
+     '"market_mode":"'  + market_mode + '",' +
+     '"candle_open_time":' + str.tostring(time) + ',' +
+     '"reason":"EMA crossover + RSI + MACD + Volume"' +
+     '}'
+
+short_payload = '{' +
+     '"secret":"'        + webhook_secret + '",' +
+     '"symbol":"'        + syminfo.ticker + '",' +
+     '"action":"SELL",'  +
+     '"entry_type":"market",' +
+     '"entry_price":'    + str.tostring(close, "#.########") + ',' +
+     '"stop_loss":'      + str.tostring(short_sl,  "#.########") + ',' +
+     '"take_profit_1":' + str.tostring(short_tp1, "#.########") + ',' +
+     '"take_profit_2":' + str.tostring(short_tp2, "#.########") + ',' +
+     '"confidence":'     + str.tostring(short_conf, "#.##") + ',' +
+     '"timeframe":"'     + timeframe.period + '",' +
+     '"market_mode":"'   + market_mode + '",' +
+     '"candle_open_time":' + str.tostring(time) + ',' +
+     '"reason":"EMA crossunder + RSI + MACD + Volume"' +
+     '}'
+
+// ── Strategy Orders (for backtesting in TradingView) ───────────────────────
+if long_cond and long_conf >= min_confidence
+    strategy.entry("Long", strategy.long)
+    strategy.exit("Long Exit", "Long", stop=long_sl, limit=long_tp1)
+    alert(long_payload, alert.freq_once_per_bar_close)
+
+if short_cond and short_conf >= min_confidence and market_mode == "FUTURES"
+    strategy.entry("Short", strategy.short)
+    strategy.exit("Short Exit", "Short", stop=short_sl, limit=short_tp1)
+    alert(short_payload, alert.freq_once_per_bar_close)
+
+// ── Visuals ──────────────────────────────────────────────────────────────────
+plot(ema_f, title="EMA Fast", color=color.new(color.green, 0), linewidth=1)
+plot(ema_s, title="EMA Slow",  color=color.new(color.red,   0), linewidth=1)
+plotshape(long_cond  and long_conf  >= min_confidence, title="Long Signal",  style=shape.triangleup,   location=location.belowbar, color=color.new(color.lime,  0), size=size.small)
+plotshape(short_cond and short_conf >= min_confidence, title="Short Signal", style=shape.triangledown, location=location.abovebar, color=color.new(color.red,   0), size=size.small)
