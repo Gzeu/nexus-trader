@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.eggs/
+
+# Secrets & config
+.env
+*.env
+*.pem
+*.key
+
+# Dev / editor
+.git/
+.gitignore
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Test & CI
+tests/
+.pytest_cache/
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+
+# Docs
+docs/
+*.md
+
+# Journal (mounted as volume)
+journal/
+
+# Misc
+*.log
+nexus_idempotency.db
+nexus_trader.db
