@@ -9,6 +9,9 @@ Improvements over v2:
 - Dry-run simulates realistic fill at last price +/- 0.01%
 - bracket_order() places market + SL stop-limit + TP limit in one call
 - post_fill() emits order_filled + position_update_required events
+
+FIX 4: bracket_order() now emits RISK_EVENT via WebSocket if SL or TP order
+        is rejected, alerting TradingView UI and Telegram immediately.
 """
 from __future__ import annotations
 
@@ -223,6 +226,10 @@ class ExecutionEngine:
         """
         Place entry market order + SL stop-limit + TP limit.
         Returns (entry_order, sl_order, tp_order).
+
+        FIX 4: After placing SL and TP, check their status and emit RISK_EVENT
+               via WebSocket if either is rejected — position must not be left
+               unprotected silently.
         """
         entry = await self.place_order(
             OrderRequest(
@@ -261,6 +268,47 @@ class ExecutionEngine:
             )
         )
 
+        # FIX 4: Emit RISK_EVENT if protection orders failed
+        if sl_order is not None and sl_order.status == OrderStatus.REJECTED:
+            log.error(
+                "bracket_sl_rejected_position_unprotected",
+                symbol=symbol,
+                entry_id=entry.exchange_order_id,
+            )
+            if self._ws:
+                await self._ws(
+                    WSEventType.RISK_EVENT,
+                    {
+                        "symbol": symbol,
+                        "event": "BRACKET_INCOMPLETE",
+                        "detail": "SL order rejected — position unprotected! Manual SL required.",
+                        "severity": "CRITICAL",
+                        "entry_order_id": entry.exchange_order_id,
+                        "timestamp": datetime.utcnow().isoformat(),
+                    },
+                )
+            # Return immediately — TP placement would be irrelevant without SL
+            return entry, sl_order, tp_order
+
+        if tp_order is not None and tp_order.status == OrderStatus.REJECTED:
+            log.warning(
+                "bracket_tp_rejected_sl_active",
+                symbol=symbol,
+                sl_id=sl_order.exchange_order_id if sl_order else None,
+            )
+            if self._ws:
+                await self._ws(
+                    WSEventType.RISK_EVENT,
+                    {
+                        "symbol": symbol,
+                        "event": "BRACKET_INCOMPLETE",
+                        "detail": "TP order rejected — SL active, manual TP required.",
+                        "severity": "WARNING",
+                        "sl_order_id": sl_order.exchange_order_id if sl_order else None,
+                        "timestamp": datetime.utcnow().isoformat(),
+                    },
+                )
+
         return entry, sl_order, tp_order
 
     async def cancel_order(self, symbol: str, exchange_order_id: str, market_mode: MarketMode) -> bool:
@@ -290,13 +338,6 @@ class ExecutionEngine:
     def normalize_quantity(self, symbol: str, qty: Decimal) -> Decimal:
         """
         Align quantity to LOT_SIZE stepSize using ROUND_DOWN (never over-buy).
-
-        Args:
-            symbol: Trading pair (e.g. "BTCUSDT")
-            qty: Raw desired quantity
-
-        Returns:
-            Quantity floored to the exchange's stepSize precision.
         """
         filters = self._info_cache.get_filters(symbol)
         if not filters or "LOT_SIZE" not in filters:
@@ -307,19 +348,13 @@ class ExecutionEngine:
         if step == 0:
             return qty
         normalized = (qty / step).to_integral_value(rounding=ROUND_DOWN) * step
-        return max(normalized, min_qty)
+        result = max(normalized, min_qty)
+        # Warn if min_qty * price might still be below minNotional
+        log.debug("normalize_quantity", symbol=symbol, raw=str(qty), normalized=str(result))
+        return result
 
     def normalize_price(self, symbol: str, price: Decimal) -> Decimal:
-        """
-        Align price to PRICE_FILTER tickSize.
-
-        Args:
-            symbol: Trading pair
-            price: Raw desired price
-
-        Returns:
-            Price rounded to exchange tickSize.
-        """
+        """Align price to PRICE_FILTER tickSize."""
         filters = self._info_cache.get_filters(symbol)
         if not filters or "PRICE_FILTER" not in filters:
             return price
@@ -335,7 +370,17 @@ class ExecutionEngine:
             return True
         if "MIN_NOTIONAL" in filters:
             mn = Decimal(str(filters["MIN_NOTIONAL"]["minNotional"]))
-            return qty * price >= mn
+            notional = qty * price
+            if notional < mn:
+                log.error(
+                    "below_min_notional_detail",
+                    symbol=symbol,
+                    notional=str(notional),
+                    min_notional=str(mn),
+                    qty=str(qty),
+                    price=str(price),
+                )
+            return notional >= mn
         if "NOTIONAL" in filters:
             mn = Decimal(str(filters["NOTIONAL"].get("minNotional", 0)))
             return qty * price >= mn
@@ -422,19 +467,18 @@ class ExecutionEngine:
             raw_response=raw,
         )
 
-    # ── Dry-run simulation ───────────────────────────────────────────────────
+    # ── Dry-run simulation ───────────────────────────────────────────────────────
 
     async def _dry_run_fill(
         self, req: OrderRequest, qty: Decimal, price: Optional[Decimal]
     ) -> Order:
         """
         Simulate a realistic market fill.
-        Fill price = last price +/- 0.01% slippage (market orders).
+        Fill price = last price +/- 0.01%-0.1% slippage (market orders).
         Introduces 50-200ms simulated latency.
         """
         await asyncio.sleep(random.uniform(0.05, 0.20))
 
-        # Get simulated fill price
         fill_price = price
         if fill_price is None:
             try:
@@ -472,7 +516,7 @@ class ExecutionEngine:
             filled_at=datetime.utcnow(),
         )
 
-    # ── Post-fill actions ────────────────────────────────────────────────────
+    # ── Post-fill actions ────────────────────────────────────────────────────────
 
     async def _post_fill(self, order: Order) -> None:
         """Broadcast order_filled and position_update_required events via WebSocket."""
@@ -493,7 +537,7 @@ class ExecutionEngine:
                 {"symbol": order.symbol, "source": "execution_engine"},
             )
 
-    # ── Helpers ──────────────────────────────────────────────────────────────
+    # ── Helpers ──────────────────────────────────────────────────────────────────
 
     def _client(self, market_mode):
         if str(market_mode) == "FUTURES" and self._futures:

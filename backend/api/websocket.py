@@ -2,21 +2,23 @@
 websocket.py – WebSocket hub for live TradingView sync.
 
 Fixes / improvements over v1:
-- ConnectionManager.broadcast() catches per-client send errors (one broken
-  client no longer kills all others)
+- ConnectionManager.broadcast() catches per-client send errors
 - Stale connections removed from active set on send error
-- Heartbeat task sends HEARTBEAT event every 15s (keeps connection alive through
-  proxies and load balancers)
+- Heartbeat task sends HEARTBEAT event every 15s
 - ws_broadcast callable registered on app.state.ctx at connection time
-  so execution_engine and automation_engine can push events
 - Proper JSON serialization for datetime fields
+
+COMPLETARE 3: broadcast_raw() now handles WSEventType.RISK_EVENT:
+- CRITICAL severity → log.critical() + Telegram alert
+- WARNING severity  → log.warning()
+- Payload enriched with UTC timestamp
 """
 from __future__ import annotations
 
 import asyncio
 import json
 from datetime import datetime
-from typing import Any, Set
+from typing import Any, Optional, Set
 
 import structlog
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
@@ -33,6 +35,11 @@ class ConnectionManager:
 
     def __init__(self):
         self._active: Set[WebSocket] = set()
+        self._telegram = None  # injected from app.state.ctx at startup
+
+    def set_telegram(self, telegram) -> None:
+        """Inject Telegram alert client for RISK_EVENT notifications."""
+        self._telegram = telegram
 
     async def connect(self, ws: WebSocket) -> None:
         await ws.accept()
@@ -62,11 +69,58 @@ class ConnectionManager:
             self._active.discard(ws)
 
     async def broadcast_raw(self, event_type: WSEventType, payload: dict) -> None:
-        """Convenience wrapper used by execution_engine and automation_engine."""
+        """
+        Convenience wrapper used by execution_engine and automation_engine.
+
+        COMPLETARE 3: Handles RISK_EVENT with severity-aware logging and
+        Telegram alerts for critical events.
+        """
+        # Enrich payload with timestamp for all events
+        enriched = {
+            **payload,
+            "ts": datetime.utcnow().isoformat(),
+            "event_type": event_type.value if hasattr(event_type, "value") else str(event_type),
+        }
+
+        # Handle RISK_EVENT with severity routing
+        if event_type == WSEventType.RISK_EVENT:
+            severity = payload.get("severity", "WARNING")
+            symbol   = payload.get("symbol", "UNKNOWN")
+            detail   = payload.get("detail", "")
+            event    = payload.get("event", "RISK_EVENT")
+
+            if severity == "CRITICAL":
+                log.critical(
+                    "risk_event_critical",
+                    symbol=symbol,
+                    event=event,
+                    detail=detail,
+                )
+                # Fire Telegram alert for critical risk events
+                if self._telegram is not None:
+                    try:
+                        await self._telegram.send_alert(
+                            f"🚨 CRITICAL RISK EVENT\n"
+                            f"Symbol: {symbol}\n"
+                            f"Event: {event}\n"
+                            f"Detail: {detail}\n"
+                            f"Time: {datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC"
+                        )
+                    except Exception as tg_exc:
+                        log.error("telegram_alert_failed", error=str(tg_exc))
+            else:
+                log.warning(
+                    "risk_event_warning",
+                    symbol=symbol,
+                    event=event,
+                    detail=detail,
+                    severity=severity,
+                )
+
         await self.broadcast(
             WSEvent(
                 event=event_type,
-                payload=payload,
+                payload=enriched,
             )
         )
 
@@ -85,9 +139,11 @@ async def websocket_endpoint(ws: WebSocket):
     app = ws.app
     await manager.connect(ws)
 
-    # Register broadcast callable on AppState so all engines can push events
+    # Register broadcast callable and Telegram on AppState
     if hasattr(app, "state") and hasattr(app.state, "ctx"):
         app.state.ctx.ws_broadcast = manager.broadcast_raw
+        if hasattr(app.state.ctx, "telegram") and app.state.ctx.telegram:
+            manager.set_telegram(app.state.ctx.telegram)
 
     # Start heartbeat task
     heartbeat_task = asyncio.create_task(_heartbeat(ws))
@@ -95,7 +151,6 @@ async def websocket_endpoint(ws: WebSocket):
     try:
         while True:
             data = await ws.receive_text()
-            # Handle ping from client
             try:
                 msg = json.loads(data)
                 if msg.get("type") == "ping":
