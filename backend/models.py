@@ -1,11 +1,12 @@
 """
-Pydantic v2 domain models.
+Pydantic v2 domain models — complete version.
 Toate modelele folosite de strategy engine, execution, portfolio si API.
 """
 from __future__ import annotations
 
 import uuid
 from datetime import datetime, timezone
+from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
@@ -22,13 +23,39 @@ class Action(str, Enum):
     REVERSE = "REVERSE"
 
 
+class PositionSide(str, Enum):
+    """Used in trade_logic to distinguish long vs short positions."""
+    LONG  = "LONG"
+    SHORT = "SHORT"
+    # convenience aliases matching raw "BUY"/"SELL" side strings
+    BUY   = "LONG"
+    SELL  = "SHORT"
+
+
+class OrderSide(str, Enum):
+    BUY  = "BUY"
+    SELL = "SELL"
+
+
+class OrderType(str, Enum):
+    MARKET           = "MARKET"
+    LIMIT            = "LIMIT"
+    STOP_LOSS        = "STOP_LOSS"
+    STOP_LOSS_LIMIT  = "STOP_LOSS_LIMIT"
+    TAKE_PROFIT      = "TAKE_PROFIT"
+    TAKE_PROFIT_LIMIT = "TAKE_PROFIT_LIMIT"
+    OCO              = "OCO"
+
+
 class OrderStatus(str, Enum):
-    NEW             = "NEW"
+    NEW              = "NEW"
+    PENDING          = "PENDING"
     PARTIALLY_FILLED = "PARTIALLY_FILLED"
-    FILLED          = "FILLED"
-    CANCELED        = "CANCELED"
-    REJECTED        = "REJECTED"
-    EXPIRED         = "EXPIRED"
+    FILLED           = "FILLED"
+    CANCELED         = "CANCELED"
+    REJECTED         = "REJECTED"
+    EXPIRED          = "EXPIRED"
+    DRY_RUN          = "DRY_RUN"   # dry-run simulated fill
 
 
 class RiskVeto(str, Enum):
@@ -47,8 +74,24 @@ class RiskVeto(str, Enum):
 
 
 class MarketMode(str, Enum):
-    SPOT    = "spot"
-    FUTURES = "futures"
+    SPOT    = "SPOT"
+    FUTURES = "FUTURES"
+
+
+class WSEventType(str, Enum):
+    """WebSocket event type constants used by ExecutionEngine and AutomationEngine."""
+    ORDER_FILLED       = "order_filled"
+    POSITION_UPDATED   = "position_update_required"
+    POSITION_OPENED    = "position_opened"
+    POSITION_CLOSED    = "position_closed"
+    SIGNAL_CREATED     = "signal_created"
+    SIGNAL_REJECTED    = "signal_rejected"
+    TP_HIT             = "tp_hit"
+    SL_HIT             = "sl_hit"
+    RISK_EVENT         = "risk_event"
+    RECONCILE_DONE     = "reconcile_done"
+    EMERGENCY_STOP     = "emergency_stop"
+    DAILY_SUMMARY      = "daily_summary"
 
 
 # ─────────────────────────────────────────────────── signal
@@ -66,35 +109,79 @@ class StrategySignal(BaseModel):
     trailing_stop: Optional[float] = None
     timeframe: str = "5m"
     reason: str = ""
+    market_mode: MarketMode = MarketMode.SPOT
     metadata: Dict[str, Any] = Field(default_factory=dict)
-    candle_open_time: Optional[int] = None   # ms timestamp — anti-duplicate
+    candle_open_time: Optional[int] = None   # ms timestamp — anti-duplicate key
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
-# ─────────────────────────────────────────────────── order
+# ─────────────────────────────────────────────────── order request (input)
+
+class OrderRequest(BaseModel):
+    """Input model for ExecutionEngine.place_order()."""
+    symbol: str
+    side: OrderSide
+    order_type: OrderType = OrderType.MARKET
+    quantity: Decimal = Decimal("0")
+    price: Optional[Decimal] = None
+    stop_price: Optional[Decimal] = None
+    market_mode: MarketMode = MarketMode.SPOT
+    time_in_force: str = "GTC"
+    reduce_only: bool = False
+    signal_id: Optional[str] = None
+    idempotency_key: uuid.UUID = Field(default_factory=uuid.uuid4)
+
+
+# ─────────────────────────────────────────────────── order (result)
 
 class Order(BaseModel):
+    """Order as returned by ExecutionEngine after placement / simulation."""
     id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    exchange_order_id: Optional[str] = None
+    idempotency_key: Optional[uuid.UUID] = None
     symbol: str
-    side: str                             # "BUY" | "SELL"
-    type: str = "MARKET"                  # "MARKET" | "LIMIT" | "OCO"
-    quantity: float
-    price: float = 0.0
-    stop_price: Optional[float] = None
+    side: OrderSide = OrderSide.BUY
+    order_type: OrderType = OrderType.MARKET
+    quantity: Decimal = Decimal("0")
+    filled_quantity: Decimal = Decimal("0")
+    avg_fill_price: Optional[Decimal] = None
+    price: Optional[Decimal] = None              # limit price
+    stop_price: Optional[Decimal] = None
     status: OrderStatus = OrderStatus.NEW
-    filled_qty: float = 0.0
-    avg_price: float = 0.0
+    market_mode: MarketMode = MarketMode.SPOT
     commission: float = 0.0
+    signal_id: Optional[str] = None
+    filled_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     updated_at: Optional[datetime] = None
-    idempotency_key: Optional[str] = None
+    raw_response: Optional[Dict[str, Any]] = None
+
+    # legacy aliases kept for backward compat
+    @property
+    def filled_qty(self) -> Decimal:
+        return self.filled_quantity
+
+    @property
+    def avg_price(self) -> Optional[Decimal]:
+        return self.avg_fill_price
+
+
+# ─────────────────────────────────────────────────── FilledOrder (alias used by execution_engine)
+
+class FilledOrder(Order):
+    """
+    Alias / subclass of Order representing a confirmed fill.
+    ExecutionEngine imports this; it is functionally identical to Order
+    but semantically communicates that the order has been executed.
+    """
+    pass
 
 
 # ─────────────────────────────────────────────────── position
 
 class Position(BaseModel):
     symbol: str
-    side: str                             # "BUY" | "SELL"
+    side: str                             # "BUY" | "SELL" | "LONG" | "SHORT"
     quantity: float
     entry_price: float
     current_price: float = 0.0
@@ -105,16 +192,20 @@ class Position(BaseModel):
     tp1_hit: bool = False
     tp2_hit: bool = False
     breakeven_set: bool = False
+    at_breakeven: bool = False            # alias used by trade_logic
     strategy: str = ""
+    market_mode: MarketMode = MarketMode.SPOT
     opened_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     last_activity: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    updated_at: Optional[datetime] = None
 
     @computed_field  # type: ignore[misc]
     @property
     def unrealized_pnl(self) -> float:
         if self.current_price == 0:
             return 0.0
-        if self.side == "BUY":
+        side_norm = self.side.upper()
+        if side_norm in ("BUY", "LONG"):
             return (self.current_price - self.entry_price) * self.quantity
         return (self.entry_price - self.current_price) * self.quantity
 
@@ -124,6 +215,13 @@ class Position(BaseModel):
         if self.entry_price == 0:
             return 0.0
         return (self.unrealized_pnl / (self.entry_price * self.quantity)) * 100
+
+    @property
+    def position_side(self) -> PositionSide:
+        """Normalize side string → PositionSide enum."""
+        if self.side.upper() in ("BUY", "LONG"):
+            return PositionSide.LONG
+        return PositionSide.SHORT
 
 
 # ─────────────────────────────────────────────────── trade (closed)
@@ -177,16 +275,18 @@ class ReconciliationResult(BaseModel):
 # ─────────────────────────────────────────────────── websocket events
 
 class WSEvent(BaseModel):
-    event: str                            # "order_filled", "position_opened", etc.
+    event: str                            # use WSEventType values
     payload: Dict[str, Any] = Field(default_factory=dict)
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
-# ─────────────────────────────────────────────────── legacy compat
-# Pastreaza compatibilitate cu codul vechi care importa AccountInfo din models
+# ─────────────────────────────────────────────────── account
+
 class AccountInfo(BaseModel):
-    """Legacy AccountInfo — folosit intern de reconcile(). Vezi models_extra.py pentru versiunea full."""
+    """Account balance summary used by reconcile() and /balance endpoint."""
     total_equity: float = 0.0
     available_balance: float = 0.0
     unrealized_pnl: float = 0.0
-    mode: str = "spot"
+    mode: str = "SPOT"
+    asset: str = "USDT"
+    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
