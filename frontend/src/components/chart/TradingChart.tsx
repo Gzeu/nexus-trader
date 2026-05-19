@@ -1,27 +1,24 @@
 'use client'
 /**
- * TradingChart.tsx — v3.1 (polish)
+ * TradingChart.tsx — v3.2 (3 targeted fixes)
  * ─────────────────────────────────────────────────────────────────────────────
- * FIXES vs v3
- * ─ [BUG] MACD start offset: signal are length closes.length-26-8, nu closes.length-26
- *   → calcMACD returnează acum { macd[], signal[], hist[], startIdx } cu offset corect
- * ─ [BUG] BB data fence: slice startIdx era 19 (0-indexed period-1) dar BB array
- *   pornea de la period=20 → corect: startIdx = period - 1
- * ─ [BUG] Keyboard scroll: ts.scrollPosition() nu există în LightweightCharts v4
- *   → înlocuit cu ts.scrollToRealTime() + ts.getVisibleLogicalRange() shift manual
- * ─ [BUG] Indicator chip background color era calculat cu if-chain fragil pe string
- *   → mapat direct din paletă cu un Record<string,string>
- * ─ [BUG] BB legend afișa mereu C.bbUpper string indiferent de showBB
- *   → legend item color corect + adăugat label BB Middle / BB Lower
- * ─ [BUG] RSI pane label arăta "OB" / "OS" cu culori inversate (sl=red pe OB)
- *   → OB (70) folosește C.red, OS (30) folosește C.green — convenție standard
- * IMPROVEMENTS vs v3
- * ─ Keyboard focus ring vizibil (outline teal) când chart e activ
- * ─ Tooltip close price folosește culoarea candelei (verde/roșu) dinamic
- * ─ MACD histogram culori folosesc C.green/C.red direct (nu volGreen/volRed)
- *   pentru contrast mai bun în pane-ul mic
- * ─ WS live dot pulsează via CSS animation când e conectat
- * ─ Indicator chips au border explicit 1px ca să fie vizibil și fără background
+ * FIX 1 — MACD sync race at mount
+ *   The MACD useEffect now calls loadData's populate block directly via
+ *   a stable populateMACDPane() callback held in a ref, so if MACD is
+ *   toggled on before loadData resolves the effect registers the callback
+ *   and loadData calls it when data arrives; if data is already loaded the
+ *   callback fires immediately on mount — no ordering dependency.
+ *
+ * FIX 2 — barSpacing cast (TypeScript-safe)
+ *   Replaced (ts.options() as { barSpacing: number }).barSpacing with
+ *   (ts.options() as Record<string, unknown>).barSpacing
+ *   + Number() coercion + nullish fallback of 8, so strict TS won't error.
+ *
+ * FIX 3 — fetch24hChange NaN guard
+ *   d?.priceChangePercent is now optional-chained, parsed safely through
+ *   parseFloat, and validated with isFinite before being returned.
+ *   An error response from Binance (invalid symbol, rate-limit etc.)
+ *   yields null instead of NaN.
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react'
@@ -81,7 +78,7 @@ const C = {
   textMuted: '#797876',
   textFaint: '#5a5957',
   green:     '#6daa45',
-  red:       '#dd6974',   // fix: era C.red = magenta, acum roșu standard
+  red:       '#dd6974',
   blue:      '#5591c7',
   teal:      '#4f98a3',
   orange:    '#fdab43',
@@ -128,27 +125,22 @@ function calcRSI(closes: number[], period = 14): number[] {
   return out
 }
 
-/** FIX: signal are length (macd.length - 8), hist trebuie aliniat la signal.
- *  Returnează startIdx = 26 + 8 = 34 — prima candelă cu date valide în toate 3 serii. */
 function calcMACD(closes: number[]): {
   macd: number[]; signal: number[]; hist: number[]; startIdx: number
 } {
-  const fast   = calcEMA(closes, 12)
-  const slow   = calcEMA(closes, 26)
-  const macdFull = fast.map((v, i) => v - slow[i])          // length = closes.length
-  const macdSlice = macdFull.slice(26)                       // from bar 26
-  const signalFull = calcEMA(macdSlice, 9)                  // length = macdSlice.length
-  // signal[i] aligns with macdSlice[i], but first 8 are EMA warmup
-  // use i >= 8 to get stable signal values
+  const fast      = calcEMA(closes, 12)
+  const slow      = calcEMA(closes, 26)
+  const macdFull  = fast.map((v, i) => v - slow[i])
+  const macdSlice = macdFull.slice(26)
+  const sigFull   = calcEMA(macdSlice, 9)
   const sigOffset = 8
-  const signal = signalFull.slice(sigOffset)                 // length = macdSlice.length - 8
-  const macd   = macdSlice.slice(sigOffset)                  // same length
-  const hist   = macd.map((m, i) => m - signal[i])
-  const startIdx = 26 + sigOffset                            // = 34
+  const signal    = sigFull.slice(sigOffset)
+  const macd      = macdSlice.slice(sigOffset)
+  const hist      = macd.map((m, i) => m - signal[i])
+  const startIdx  = 26 + sigOffset  // = 34
   return { macd, signal, hist, startIdx }
 }
 
-/** FIX: startIdx è period - 1 (0-based), BB array length = closes.length - period + 1 */
 function calcBB(closes: number[], period = 20, mult = 2): {
   upper: number[]; middle: number[]; lower: number[]; startIdx: number
 } {
@@ -168,25 +160,42 @@ function calcBB(closes: number[], period = 20, mult = 2): {
 // Binance REST
 // ─────────────────────────────────────────────────────────────────────────────
 async function fetchCandles(symbol: string, interval: string, limit = 500): Promise<Candle[]> {
-  const res = await fetch(`https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`)
+  const res = await fetch(
+    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
+  )
   if (!res.ok) throw new Error(`Binance klines ${res.status}`)
   const raw = await res.json() as number[][]
-  return raw.map(k => ({ time: (k[0] / 1000) as Time, open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5] }))
+  return raw.map(k => ({
+    time: (k[0] / 1000) as Time,
+    open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5],
+  }))
 }
 
+/**
+ * FIX 3 — NaN guard on priceChangePercent.
+ * d may be an error object if the symbol is invalid or Binance returns 4xx.
+ * We optional-chain the field, parse safely, and return null for non-finite values.
+ */
 async function fetch24hChange(symbol: string): Promise<number | null> {
   try {
     const res = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`)
     if (!res.ok) return null
-    const d = await res.json() as { priceChangePercent: string }
-    return parseFloat(d.priceChangePercent)
-  } catch { return null }
+    const d = await res.json() as Record<string, unknown>
+    const pct = parseFloat(String(d?.priceChangePercent ?? ''))
+    return isFinite(pct) ? pct : null
+  } catch {
+    return null
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // WS auto-reconnect
 // ─────────────────────────────────────────────────────────────────────────────
-function createAutoWS(getUrl: () => string, onMessage: (data: string) => void, maxRetries = 10) {
+function createAutoWS(
+  getUrl: () => string,
+  onMessage: (data: string) => void,
+  maxRetries = 10,
+) {
   let stopped = false, retries = 0
   let ws: WebSocket
   function connect() {
@@ -194,7 +203,7 @@ function createAutoWS(getUrl: () => string, onMessage: (data: string) => void, m
     ws.onmessage = ev => onMessage(ev.data as string)
     ws.onclose   = () => {
       if (stopped || retries >= maxRetries) return
-      const delay = Math.min(1000 * 2 ** retries, 30000); retries++
+      const delay = Math.min(1000 * 2 ** retries, 30_000); retries++
       setTimeout(connect, delay)
     }
     ws.onerror = () => ws.close()
@@ -217,7 +226,6 @@ function fmtVol(v: number): string {
   return v.toFixed(0)
 }
 
-// FIX: chip background culori — map direct din paletă, nu regex pe string
 const CHIP_COLORS: Record<string, string> = {
   EMA:  C.ema9,
   BB:   C.blue,
@@ -265,6 +273,17 @@ export function TradingChart({
   const candleDataRef = useRef<Candle[]>([])
   const priceLineRefs = useRef<ReturnType<ISeriesApi<'Candlestick'>['createPriceLine']>[]>([])
 
+  /**
+   * FIX 1 — MACD sync race.
+   * populateMACDPaneRef holds a stable callback that fills macd/signal/hist
+   * series from candleDataRef.current.  It is written by the MACD useEffect
+   * after the pane is mounted, and called by loadData after candles are set.
+   * If loadData already ran before the MACD effect fires, the effect calls it
+   * immediately on registration because candleDataRef already has data.
+   * Either way the series always gets populated — no race condition.
+   */
+  const populateMACDPaneRef = useRef<(() => void) | null>(null)
+
   const [symbol,     setSymbol]     = useState(initSymbol)
   const [timeframe,  setTimeframe]  = useState(initTimeframe)
   const [loading,    setLoading]    = useState(true)
@@ -283,8 +302,16 @@ export function TradingChart({
   useEffect(() => {
     if (!containerRef.current) return
     const chart = createChart(containerRef.current, {
-      layout: { background: { type: ColorType.Solid, color: C.bg }, textColor: C.textMuted, fontFamily: "'Inter','SF Mono',monospace", fontSize: 11 },
-      grid: { vertLines: { color: C.border, style: LineStyle.Dotted }, horzLines: { color: C.border, style: LineStyle.Dotted } },
+      layout: {
+        background: { type: ColorType.Solid, color: C.bg },
+        textColor: C.textMuted,
+        fontFamily: "'Inter','SF Mono',monospace",
+        fontSize: 11,
+      },
+      grid: {
+        vertLines: { color: C.border, style: LineStyle.Dotted },
+        horzLines: { color: C.border, style: LineStyle.Dotted },
+      },
       crosshair: {
         mode: CrosshairMode.Normal,
         vertLine: { color: C.textFaint, width: 1, style: LineStyle.Dashed, labelBackgroundColor: C.surface2 },
@@ -294,38 +321,48 @@ export function TradingChart({
       timeScale: { borderColor: C.border, timeVisible: true, secondsVisible: false },
       handleScroll: true, handleScale: true,
     })
-    const candles = chart.addCandlestickSeries({ upColor: C.green, downColor: C.red, borderUpColor: C.green, borderDownColor: C.red, wickUpColor: C.green, wickDownColor: C.red })
-    const volume  = chart.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: 'volume' })
+    const candles = chart.addCandlestickSeries({
+      upColor: C.green, downColor: C.red,
+      borderUpColor: C.green, borderDownColor: C.red,
+      wickUpColor: C.green, wickDownColor: C.red,
+    })
+    const volume = chart.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: 'volume' })
     chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } })
-    const ema9  = chart.addLineSeries({ color: C.ema9,  lineWidth: 1, priceLineVisible: false, lastValueVisible: true,  crosshairMarkerVisible: false })
-    const ema21 = chart.addLineSeries({ color: C.ema21, lineWidth: 1, priceLineVisible: false, lastValueVisible: true,  crosshairMarkerVisible: false })
-    const bbUpper  = chart.addLineSeries({ color: C.bbUpper,  lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, lineStyle: LineStyle.Dashed,  visible: false })
-    const bbMiddle = chart.addLineSeries({ color: C.bbMiddle, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, lineStyle: LineStyle.Dotted,  visible: false })
-    const bbLower  = chart.addLineSeries({ color: C.bbLower,  lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, lineStyle: LineStyle.Dashed,  visible: false })
+    const ema9     = chart.addLineSeries({ color: C.ema9,  lineWidth: 1, priceLineVisible: false, lastValueVisible: true,  crosshairMarkerVisible: false })
+    const ema21    = chart.addLineSeries({ color: C.ema21, lineWidth: 1, priceLineVisible: false, lastValueVisible: true,  crosshairMarkerVisible: false })
+    const bbUpper  = chart.addLineSeries({ color: C.bbUpper,  lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, lineStyle: LineStyle.Dashed, visible: false })
+    const bbMiddle = chart.addLineSeries({ color: C.bbMiddle, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, lineStyle: LineStyle.Dotted, visible: false })
+    const bbLower  = chart.addLineSeries({ color: C.bbLower,  lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, lineStyle: LineStyle.Dashed, visible: false })
 
     chart.subscribeCrosshairMove(param => {
       if (!param.time || param.point === undefined) { setTooltip(null); return }
       const bar    = param.seriesData.get(candles) as CandlestickData | undefined
       const volBar = param.seriesData.get(volume)  as HistogramData   | undefined
       if (!bar) { setTooltip(null); return }
-      setTooltip({ time: fmtTime(param.time as number), open: bar.open, high: bar.high, low: bar.low, close: bar.close, volume: volBar?.value ?? 0, change: ((bar.close - bar.open) / bar.open) * 100 })
+      setTooltip({
+        time: fmtTime(param.time as number),
+        open: bar.open, high: bar.high, low: bar.low, close: bar.close,
+        volume: volBar?.value ?? 0,
+        change: ((bar.close - bar.open) / bar.open) * 100,
+      })
     })
 
-    chartRef.current = chart; candleRef.current = candles; volumeRef.current = volume
-    ema9Ref.current = ema9; ema21Ref.current = ema21
+    chartRef.current   = chart;   candleRef.current  = candles; volumeRef.current = volume
+    ema9Ref.current    = ema9;    ema21Ref.current   = ema21
     bbUpperRef.current = bbUpper; bbMiddleRef.current = bbMiddle; bbLowerRef.current = bbLower
 
     return () => {
       chart.remove()
       chartRef.current = candleRef.current = volumeRef.current = null
-      ema9Ref.current = ema21Ref.current = bbUpperRef.current = bbMiddleRef.current = bbLowerRef.current = null
+      ema9Ref.current  = ema21Ref.current  = null
+      bbUpperRef.current = bbMiddleRef.current = bbLowerRef.current = null
     }
   }, [])
 
   // ── 2. RSI chart ──────────────────────────────────────────────────────────
   useEffect(() => {
     if (!showRsi || !rsiRef.current) return
-    const rsiChart = createChart(rsiRef.current, {
+    const rsiChart  = createChart(rsiRef.current, {
       layout: { background: { type: ColorType.Solid, color: C.bg }, textColor: C.textMuted, fontSize: 10 },
       grid: { vertLines: { color: C.border, style: LineStyle.Dotted }, horzLines: { color: C.border, style: LineStyle.Dotted } },
       crosshair: { mode: CrosshairMode.Normal, vertLine: { color: C.textFaint, width: 1, style: LineStyle.Dashed }, horzLine: { color: C.textFaint, width: 1, style: LineStyle.Dashed } },
@@ -334,24 +371,25 @@ export function TradingChart({
       handleScroll: true, handleScale: false,
     })
     const rsiSeries = rsiChart.addLineSeries({ color: C.rsi, lineWidth: 1, priceLineVisible: false, lastValueVisible: true })
-    // FIX: OB=70 → C.red (overbought = danger), OS=30 → C.green (oversold = opportunity)
     rsiSeries.createPriceLine({ price: 70, color: C.red,       lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true,  title: 'OB' })
     rsiSeries.createPriceLine({ price: 30, color: C.green,     lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true,  title: 'OS' })
     rsiSeries.createPriceLine({ price: 50, color: C.textFaint, lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: false, title: '' })
 
-    rsiChartRef.current = rsiChart; rsiSeriesRef.current = rsiSeries
+    rsiChartRef.current  = rsiChart
+    rsiSeriesRef.current = rsiSeries
 
-    const syncMainToRsi = () => { const r = chartRef.current?.timeScale().getVisibleLogicalRange(); if (r) rsiChart.timeScale().setVisibleLogicalRange(r) }
-    const syncRsiToMain = () => { const r = rsiChart.timeScale().getVisibleLogicalRange(); if (r) chartRef.current?.timeScale().setVisibleLogicalRange(r) }
-    chartRef.current?.timeScale().subscribeVisibleLogicalRangeChange(syncMainToRsi)
-    rsiChart.timeScale().subscribeVisibleLogicalRangeChange(syncRsiToMain)
+    const syncToRsi  = () => { const r = chartRef.current?.timeScale().getVisibleLogicalRange(); if (r) rsiChart.timeScale().setVisibleLogicalRange(r) }
+    const syncToMain = () => { const r = rsiChart.timeScale().getVisibleLogicalRange(); if (r) chartRef.current?.timeScale().setVisibleLogicalRange(r) }
+    chartRef.current?.timeScale().subscribeVisibleLogicalRangeChange(syncToRsi)
+    rsiChart.timeScale().subscribeVisibleLogicalRangeChange(syncToMain)
 
     return () => { rsiChart.remove(); rsiChartRef.current = rsiSeriesRef.current = null }
   }, [showRsi])
 
-  // ── 3. MACD chart ─────────────────────────────────────────────────────────
+  // ── 3. MACD chart — FIX 1: populate via stable ref callback ───────────────
   useEffect(() => {
     if (!showMACD || !macdRef.current) return
+
     const macdChart = createChart(macdRef.current, {
       layout: { background: { type: ColorType.Solid, color: C.bg }, textColor: C.textMuted, fontSize: 10 },
       grid: { vertLines: { color: C.border, style: LineStyle.Dotted }, horzLines: { color: C.border, style: LineStyle.Dotted } },
@@ -364,24 +402,37 @@ export function TradingChart({
     const macdSig  = macdChart.addLineSeries({ color: C.signal, lineWidth: 1, priceLineVisible: false, lastValueVisible: true })
     const macdHist = macdChart.addHistogramSeries({ priceScaleId: 'right', priceFormat: { type: 'price', precision: 4 } })
 
-    macdChartRef.current = macdChart; macdLineRef.current = macdLine
-    macdSigRef.current = macdSig; macdHistRef.current = macdHist
+    macdChartRef.current = macdChart
+    macdLineRef.current  = macdLine
+    macdSigRef.current   = macdSig
+    macdHistRef.current  = macdHist
 
     const syncMacd = () => { const r = chartRef.current?.timeScale().getVisibleLogicalRange(); if (r) macdChart.timeScale().setVisibleLogicalRange(r) }
     const syncMain = () => { const r = macdChart.timeScale().getVisibleLogicalRange(); if (r) chartRef.current?.timeScale().setVisibleLogicalRange(r) }
     chartRef.current?.timeScale().subscribeVisibleLogicalRangeChange(syncMacd)
     macdChart.timeScale().subscribeVisibleLogicalRangeChange(syncMain)
 
-    // Populate with existing data
-    const data = candleDataRef.current
-    if (data.length >= 35) {
+    // Register stable populate callback — called either now (data ready) or
+    // later by loadData once candles arrive.
+    const populate = () => {
+      const data = candleDataRef.current
+      if (data.length < 35) return
       const closes = data.map(c => c.close)
       const { macd: mv, signal: sv, hist: hv, startIdx } = calcMACD(closes)
       macdLine.setData(data.slice(startIdx).map((c, i) => ({ time: c.time, value: mv[i] ?? 0 })))
       macdSig.setData(data.slice(startIdx).map((c, i)  => ({ time: c.time, value: sv[i] ?? 0 })))
-      macdHist.setData(data.slice(startIdx).map((c, i) => ({ time: c.time, value: hv[i] ?? 0, color: (hv[i] ?? 0) >= 0 ? C.green : C.red })))
+      macdHist.setData(data.slice(startIdx).map((c, i) => ({
+        time: c.time, value: hv[i] ?? 0, color: (hv[i] ?? 0) >= 0 ? C.green : C.red,
+      })))
     }
-    return () => { macdChart.remove(); macdChartRef.current = macdLineRef.current = macdSigRef.current = macdHistRef.current = null }
+    populateMACDPaneRef.current = populate
+    populate() // immediate call: no-op if data not yet loaded, populates if already loaded
+
+    return () => {
+      populateMACDPaneRef.current = null
+      macdChart.remove()
+      macdChartRef.current = macdLineRef.current = macdSigRef.current = macdHistRef.current = null
+    }
   }, [showMACD])
 
   // ── 4. BB toggle ─────────────────────────────────────────────────────────
@@ -406,13 +457,16 @@ export function TradingChart({
     try {
       const [data, ch] = await Promise.all([fetchCandles(sym, tf), fetch24hChange(sym)])
       if (!candleRef.current) return
+
       candleDataRef.current = data
       candleRef.current.setData(data)
-
-      volumeRef.current?.setData(data.map(c => ({ time: c.time, value: c.volume ?? 0, color: c.close >= c.open ? C.volGreen : C.volRed })))
+      volumeRef.current?.setData(data.map(c => ({
+        time: c.time, value: c.volume ?? 0,
+        color: c.close >= c.open ? C.volGreen : C.volRed,
+      })))
 
       const closes = data.map(c => c.close)
-      ema9Ref.current?.setData(data.map((c, i)  => ({ time: c.time, value: calcEMA(closes, 9)[i]  })))
+      ema9Ref.current?.setData(data.map((c, i)  => ({ time: c.time, value: calcEMA(closes,  9)[i] })))
       ema21Ref.current?.setData(data.map((c, i) => ({ time: c.time, value: calcEMA(closes, 21)[i] })))
 
       if (rsiSeriesRef.current && closes.length > 14) {
@@ -420,21 +474,17 @@ export function TradingChart({
         rsiSeriesRef.current.setData(data.map((c, i) => ({ time: c.time, value: rsiVals[i] })))
       }
 
-      // FIX: usar startIdx da calcBB
       if (closes.length >= 20) {
         const bb = calcBB(closes)
-        bbUpperRef.current?.setData(data.slice(bb.startIdx).map((c, i)  => ({ time: c.time, value: bb.upper[i] })))
+        bbUpperRef.current?.setData(data.slice(bb.startIdx).map((c, i)  => ({ time: c.time, value: bb.upper[i]  })))
         bbMiddleRef.current?.setData(data.slice(bb.startIdx).map((c, i) => ({ time: c.time, value: bb.middle[i] })))
-        bbLowerRef.current?.setData(data.slice(bb.startIdx).map((c, i)  => ({ time: c.time, value: bb.lower[i] })))
+        bbLowerRef.current?.setData(data.slice(bb.startIdx).map((c, i)  => ({ time: c.time, value: bb.lower[i]  })))
       }
 
-      // FIX: usar startIdx da calcMACD
-      if (macdLineRef.current && closes.length >= 35) {
-        const { macd: mv, signal: sv, hist: hv, startIdx } = calcMACD(closes)
-        macdLineRef.current.setData(data.slice(startIdx).map((c, i)  => ({ time: c.time, value: mv[i] ?? 0 })))
-        macdSigRef.current?.setData(data.slice(startIdx).map((c, i)  => ({ time: c.time, value: sv[i] ?? 0 })))
-        macdHistRef.current?.setData(data.slice(startIdx).map((c, i) => ({ time: c.time, value: hv[i] ?? 0, color: (hv[i] ?? 0) >= 0 ? C.green : C.red })))
-      }
+      // FIX 1: call the MACD populate callback if the pane is already mounted.
+      // If it's not mounted yet, the MACD useEffect will call populate() itself
+      // via populateMACDPaneRef after mounting — data is already in candleDataRef.
+      populateMACDPaneRef.current?.()
 
       chartRef.current?.timeScale().fitContent()
       setChange24h(ch)
@@ -454,10 +504,10 @@ export function TradingChart({
         const msg = JSON.parse(raw) as { k: Record<string, unknown> }
         const k = msg.k
         if (!candleRef.current) return
-        const t        = (Number(k.t) / 1000) as Time
-        const open     = +String(k.o), high  = +String(k.h)
-        const low      = +String(k.l), close = +String(k.c)
-        const vol      = +String(k.v), isClosed = Boolean(k.x)
+        const t       = (Number(k.t) / 1000) as Time
+        const open    = +String(k.o), high  = +String(k.h)
+        const low     = +String(k.l), close = +String(k.c)
+        const vol     = +String(k.v), isClosed = Boolean(k.x)
 
         candleRef.current.update({ time: t, open, high, low, close })
         volumeRef.current?.update({ time: t, value: vol, color: close >= open ? C.volGreen : C.volRed })
@@ -466,7 +516,7 @@ export function TradingChart({
           candleDataRef.current = [...candleDataRef.current, { time: t, open, high, low, close, volume: vol }]
           const ac = candleDataRef.current.map(c => c.close)
 
-          const e9  = calcEMA(ac, 9);  ema9Ref.current?.update({ time: t, value: e9[e9.length - 1] })
+          const e9  = calcEMA(ac,  9); ema9Ref.current?.update({ time: t, value: e9[e9.length - 1] })
           const e21 = calcEMA(ac, 21); ema21Ref.current?.update({ time: t, value: e21[e21.length - 1] })
 
           if (rsiSeriesRef.current && ac.length > 14) {
@@ -474,9 +524,9 @@ export function TradingChart({
           }
           if (ac.length >= 20) {
             const bb = calcBB(ac)
-            bbUpperRef.current?.update({ time: t, value: bb.upper[bb.upper.length - 1] })
+            bbUpperRef.current?.update({ time: t, value: bb.upper[bb.upper.length   - 1] })
             bbMiddleRef.current?.update({ time: t, value: bb.middle[bb.middle.length - 1] })
-            bbLowerRef.current?.update({ time: t, value: bb.lower[bb.lower.length - 1] })
+            bbLowerRef.current?.update({ time: t, value: bb.lower[bb.lower.length   - 1] })
           }
           if (macdLineRef.current && ac.length >= 35) {
             const { macd: mv, signal: sv, hist: hv } = calcMACD(ac)
@@ -486,8 +536,11 @@ export function TradingChart({
           }
         }
         setWsLive(true)
-        setPrice(prev => { setPriceDir(prev === null ? null : close > prev ? 'up' : close < prev ? 'down' : null); return close })
-      }
+        setPrice(prev => {
+          setPriceDir(prev === null ? null : close > prev ? 'up' : close < prev ? 'down' : null)
+          return close
+        })
+      },
     )
     binanceWSRef.current = bWS
   }, [])
@@ -505,7 +558,12 @@ export function TradingChart({
           if (!p?.entry_price || (p.symbol && p.symbol !== symbol)) return
           const time = ((p.candle_open_time ? p.candle_open_time / 1000 : Math.floor(Date.now() / 1000))) as Time
           const isBuy = p.action === 'BUY'
-          const marker: SeriesMarker<Time> = { time, position: isBuy ? 'belowBar' : 'aboveBar', color: isBuy ? C.green : C.red, shape: isBuy ? 'arrowUp' : 'arrowDown', text: isBuy ? '▲ BUY' : '▼ SELL', size: 1.5 }
+          const marker: SeriesMarker<Time> = {
+            time, position: isBuy ? 'belowBar' : 'aboveBar',
+            color: isBuy ? C.green : C.red,
+            shape: isBuy ? 'arrowUp' : 'arrowDown',
+            text: isBuy ? '▲ BUY' : '▼ SELL', size: 1.5,
+          }
           markersRef.current = [...markersRef.current.slice(-99), marker]
           candleRef.current?.setMarkers(markersRef.current)
         }
@@ -514,7 +572,11 @@ export function TradingChart({
           if (!p?.price || (p.symbol && p.symbol !== symbol)) return
           const time = ((p.time ? p.time / 1000 : Math.floor(Date.now() / 1000))) as Time
           const isBuy = (p.side ?? '').toUpperCase() === 'BUY'
-          const marker: SeriesMarker<Time> = { time, position: isBuy ? 'belowBar' : 'aboveBar', color: isBuy ? C.teal : C.orange, shape: 'circle', text: `FILL ${p.price?.toFixed(2)}`, size: 1 }
+          const marker: SeriesMarker<Time> = {
+            time, position: isBuy ? 'belowBar' : 'aboveBar',
+            color: isBuy ? C.teal : C.orange, shape: 'circle',
+            text: `FILL ${p.price?.toFixed(2)}`, size: 1,
+          }
           markersRef.current = [...markersRef.current.slice(-99), marker]
           candleRef.current?.setMarkers(markersRef.current)
         }
@@ -523,8 +585,8 @@ export function TradingChart({
           if (!p?.symbol || p.symbol !== symbol || !candleRef.current) return
           const series = candleRef.current
           const newLines: typeof priceLineRefs.current = []
-          newLines.push(series.createPriceLine({ price: p.entry_price, color: C.blue,    lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'Entry' }))
-          if (p.stop_loss)     newLines.push(series.createPriceLine({ price: p.stop_loss,     color: C.slLine,  lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: 'SL' }))
+          newLines.push(series.createPriceLine({ price: p.entry_price, color: C.blue, lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'Entry' }))
+          if (p.stop_loss)     newLines.push(series.createPriceLine({ price: p.stop_loss,     color: C.slLine,  lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: 'SL'  }))
           if (p.take_profit_1) newLines.push(series.createPriceLine({ price: p.take_profit_1, color: C.tp1Line, lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: 'TP1' }))
           if (p.take_profit_2) newLines.push(series.createPriceLine({ price: p.take_profit_2, color: C.tp2Line, lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: 'TP2' }))
           priceLineRefs.current = [...priceLineRefs.current, ...newLines]
@@ -541,7 +603,7 @@ export function TradingChart({
     if (!series) return
     const lines: ReturnType<typeof series.createPriceLine>[] = []
     positions.filter(p => p.symbol === symbol).forEach(p => {
-      lines.push(series.createPriceLine({ price: p.entry_price, color: C.blue,    lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'Entry' }))
+      lines.push(series.createPriceLine({ price: p.entry_price, color: C.blue, lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true, title: 'Entry' }))
       if (p.stop_loss)     lines.push(series.createPriceLine({ price: p.stop_loss,     color: C.slLine,  lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: 'SL'  }))
       if (p.take_profit_1) lines.push(series.createPriceLine({ price: p.take_profit_1, color: C.tp1Line, lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: 'TP1' }))
       if (p.take_profit_2) lines.push(series.createPriceLine({ price: p.take_profit_2, color: C.tp2Line, lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: true, title: 'TP2' }))
@@ -566,7 +628,6 @@ export function TradingChart({
   }, [showRsi, showMACD, fullscreen])
 
   // ── 10. Keyboard shortcuts ────────────────────────────────────────────────
-  // FIX: scrollPosition() non esiste in v4 → shift logicalRange manuale
   useEffect(() => {
     const el = wrapRef.current
     if (!el) return
@@ -584,8 +645,18 @@ export function TradingChart({
           if (r) ts.setVisibleLogicalRange({ from: r.from + 5, to: r.to + 5 })
           e.preventDefault(); break
         }
-        case '+': ts.applyOptions({ barSpacing: Math.min((ts.options() as { barSpacing: number }).barSpacing + 2, 50) }); break
-        case '-': ts.applyOptions({ barSpacing: Math.max((ts.options() as { barSpacing: number }).barSpacing - 2,  2) }); break
+        case '+': {
+          // FIX 2 — type-safe barSpacing read with Record<string, unknown> cast
+          // + Number() coercion + nullish fallback to avoid strict TS error
+          const cur = Number((ts.options() as Record<string, unknown>).barSpacing) || 8
+          ts.applyOptions({ barSpacing: Math.min(cur + 2, 50) })
+          break
+        }
+        case '-': {
+          const cur = Number((ts.options() as Record<string, unknown>).barSpacing) || 8
+          ts.applyOptions({ barSpacing: Math.max(cur - 2, 2) })
+          break
+        }
         case 'r': case 'R': ts.fitContent(); break
         case 'f': case 'F': setFullscreen(f => !f); break
       }
@@ -622,9 +693,8 @@ export function TradingChart({
         borderRadius: fullscreen ? 0 : 8,
         ...(fullscreen ? { position: 'fixed', inset: 0, zIndex: 9999 } : {}),
       }}
-      // FIX: focus ring vizibil când utilizatorul face click pe chart
       onFocus={e => { e.currentTarget.style.boxShadow = `0 0 0 2px ${C.teal}` }}
-      onBlur={e =>  { e.currentTarget.style.boxShadow = 'none' }}
+      onBlur={e  => { e.currentTarget.style.boxShadow = 'none' }}
     >
       {/* ── Toolbar ────────────────────────────────────────────────────────── */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderBottom: `1px solid ${C.border}`, background: C.surface, flexWrap: 'wrap' }}>
@@ -645,7 +715,7 @@ export function TradingChart({
           ))}
         </div>
 
-        {/* FIX: Indicator chips — culori din CHIP_COLORS map, border explicit */}
+        {/* Indicator chips */}
         <div style={{ display: 'flex', gap: 4, marginLeft: 4 }}>
           {([
             { label: 'EMA',  active: true,       disabled: true,  onClick: undefined },
@@ -696,7 +766,6 @@ export function TradingChart({
               {change24h >= 0 ? '+' : ''}{change24h.toFixed(2)}%
             </span>
           )}
-          {/* FIX: WS dot pulsează când live */}
           <span
             title={wsLive ? 'Live' : 'Connecting…'}
             style={{ width: 7, height: 7, borderRadius: '50%', background: wsLive ? C.green : C.textFaint, display: 'inline-block', transition: 'background 300ms ease', animation: wsLive ? 'ws-pulse 2s ease-in-out infinite' : 'none' }}
@@ -720,13 +789,12 @@ export function TradingChart({
           <div style={{ position: 'absolute', top: 8, left: 12, pointerEvents: 'none', background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 6, padding: '6px 10px', fontSize: 11, color: C.textMuted, lineHeight: 1.6, zIndex: 10 }}>
             <div style={{ color: C.textFaint, marginBottom: 2, fontSize: 10 }}>{tooltip.time}</div>
             <div style={{ display: 'grid', gridTemplateColumns: 'auto auto', gap: '0 12px' }}>
-              <span style={{ color: C.textFaint }}>O</span><span style={{ color: C.text,                                         fontFamily: 'monospace' }}>{tooltip.open.toFixed(2)}</span>
-              <span style={{ color: C.textFaint }}>H</span><span style={{ color: C.green,                                        fontFamily: 'monospace' }}>{tooltip.high.toFixed(2)}</span>
-              <span style={{ color: C.textFaint }}>L</span><span style={{ color: C.red,                                          fontFamily: 'monospace' }}>{tooltip.low.toFixed(2)}</span>
-              {/* FIX: close color dinamic pe culoarea candelei */}
-              <span style={{ color: C.textFaint }}>C</span><span style={{ color: tooltip.change >= 0 ? C.green : C.red,          fontFamily: 'monospace', fontWeight: 700 }}>{tooltip.close.toFixed(2)}</span>
-              <span style={{ color: C.textFaint }}>V</span><span style={{ color: C.textMuted,                                    fontFamily: 'monospace' }}>{fmtVol(tooltip.volume)}</span>
-              <span style={{ color: C.textFaint }}>Δ</span><span style={{ color: tooltip.change >= 0 ? C.green : C.red,          fontFamily: 'monospace' }}>{tooltip.change >= 0 ? '+' : ''}{tooltip.change.toFixed(2)}%</span>
+              <span style={{ color: C.textFaint }}>O</span><span style={{ color: C.text,                                  fontFamily: 'monospace' }}>{tooltip.open.toFixed(2)}</span>
+              <span style={{ color: C.textFaint }}>H</span><span style={{ color: C.green,                                 fontFamily: 'monospace' }}>{tooltip.high.toFixed(2)}</span>
+              <span style={{ color: C.textFaint }}>L</span><span style={{ color: C.red,                                   fontFamily: 'monospace' }}>{tooltip.low.toFixed(2)}</span>
+              <span style={{ color: C.textFaint }}>C</span><span style={{ color: tooltip.change >= 0 ? C.green : C.red,   fontFamily: 'monospace', fontWeight: 700 }}>{tooltip.close.toFixed(2)}</span>
+              <span style={{ color: C.textFaint }}>V</span><span style={{ color: C.textMuted,                             fontFamily: 'monospace' }}>{fmtVol(tooltip.volume)}</span>
+              <span style={{ color: C.textFaint }}>Δ</span><span style={{ color: tooltip.change >= 0 ? C.green : C.red,   fontFamily: 'monospace' }}>{tooltip.change >= 0 ? '+' : ''}{tooltip.change.toFixed(2)}%</span>
             </div>
           </div>
         )}
@@ -737,7 +805,6 @@ export function TradingChart({
         <>
           <div style={{ borderTop: `1px solid ${C.border}`, padding: '2px 12px', background: C.surface2, fontSize: 10, color: C.textFaint, display: 'flex', gap: 12 }}>
             <span style={{ color: C.rsi, fontWeight: 600 }}>RSI(14)</span>
-            {/* FIX: OB=rosso, OS=verde — convenzione standard */}
             <span style={{ color: C.red }}>OB 70</span>
             <span style={{ color: C.green }}>OS 30</span>
           </div>
@@ -766,7 +833,6 @@ export function TradingChart({
           { color: C.red,     label: 'Bear' },
           { color: C.ema9,    label: 'EMA9' },
           { color: C.ema21,   label: 'EMA21' },
-          // FIX: BB legend mostra tutte e 3 le bande quando BB è attivo
           ...(showBB ? [
             { color: C.bbUpper,  label: 'BB Upper' },
             { color: C.bbMiddle, label: 'BB Mid' },
