@@ -1,165 +1,111 @@
 #!/usr/bin/env bash
-# ============================================================
-# Nexus Trader — Ubuntu Server Setup (one-time)
-# Testată pe Ubuntu 22.04 LTS / 24.04 LTS
-# Usage: sudo bash scripts/setup_ubuntu.sh
-# ============================================================
+# =============================================================================
+# Nexus Trader — Ubuntu Setup Script
+# Tested on Ubuntu 22.04 LTS / 24.04 LTS
+# Run: chmod +x scripts/setup_ubuntu.sh && ./scripts/setup_ubuntu.sh
+# =============================================================================
 set -euo pipefail
 
-GREEN='\033[0;32m'; YELLOW='\033[1;33m'; BLUE='\033[0;34m'; RESET='\033[0m'
-ok()  { echo -e "${GREEN}✅ $*${RESET}"; }
-log() { echo -e "${BLUE}▶ $*${RESET}"; }
-warn(){ echo -e "${YELLOW}⚠️  $*${RESET}"; }
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; CYAN='\033[0;36m'; NC='\033[0m'
+log()  { echo -e "${GREEN}[✓]${NC} $1"; }
+warn() { echo -e "${YELLOW}[!]${NC} $1"; }
+err()  { echo -e "${RED}[✗]${NC} $1"; exit 1; }
+step() { echo -e "\n${CYAN}━━━ $1 ━━━${NC}"; }
 
-[[ $EUID -eq 0 ]] || { echo "Rulează cu sudo"; exit 1; }
+step "System packages"
+sudo apt-get update -qq
+sudo apt-get install -y \
+  curl wget git build-essential \
+  python3 python3-pip python3-venv python3-dev \
+  libssl-dev libffi-dev \
+  redis-server \
+  sqlite3 \
+  jq httpie
+log "System packages installed"
 
-# ── 1. System update ────────────────────────────────────────
-log "Update sistem..."
-apt-get update -qq && apt-get upgrade -y -qq
-apt-get install -y -qq \
-  curl wget git htop nano ufw fail2ban \
-  python3.11 python3.11-venv python3.11-dev python3-pip \
-  build-essential libssl-dev libffi-dev libpq-dev \
-  openssl ca-certificates gnupg lsb-release
-ok "Sistem actualizat"
-
-# ── 2. Docker ────────────────────────────────────────────────
-if ! command -v docker &>/dev/null; then
-  log "Instalare Docker..."
-  install -m 0755 -d /etc/apt/keyrings
-  curl -fsSL https://download.docker.com/linux/ubuntu/gpg | \
-    gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-  chmod a+r /etc/apt/keyrings/docker.gpg
-  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
-https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | \
-    tee /etc/apt/sources.list.d/docker.list > /dev/null
-  apt-get update -qq
-  apt-get install -y -qq docker-ce docker-ce-cli containerd.io docker-compose-plugin
-  systemctl enable --now docker
-  ok "Docker instalat"
+step "Python version check"
+PY=$(python3 --version 2>&1)
+log "$PY"
+if python3 -c "import sys; sys.exit(0 if sys.version_info >= (3,11) else 1)" 2>/dev/null; then
+  log "Python >= 3.11 OK"
 else
-  ok "Docker deja instalat"
+  warn "Python < 3.11 detected. Installing 3.12 via deadsnakes PPA..."
+  sudo add-apt-repository ppa:deadsnakes/ppa -y
+  sudo apt-get update -qq
+  sudo apt-get install -y python3.12 python3.12-venv python3.12-dev
+  sudo update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1
+  log "Python 3.12 installed"
 fi
 
-# Adaugă user curent la grupul docker
-USERNAME=${SUDO_USER:-$(logname 2>/dev/null || echo ubuntu)}
-usermod -aG docker "$USERNAME" 2>/dev/null || true
-
-# ── 3. Firewall (UFW) ───────────────────────────────────────
-log "Configurare firewall UFW..."
-ufw --force reset
-ufw default deny incoming
-ufw default allow outgoing
-ufw allow ssh
-ufw allow 80/tcp   comment 'HTTP'
-ufw allow 443/tcp  comment 'HTTPS'
-# Blochează accesul direct la porturi interne din internet
-ufw deny 8000/tcp  comment 'API direct — doar prin nginx'
-ufw deny 6379/tcp  comment 'Redis direct'
-ufw deny 9090/tcp  comment 'Prometheus direct'
-ufw deny 3000/tcp  comment 'Grafana direct'
-ufw --force enable
-ok "Firewall configurat"
-
-# ── 4. Fail2ban ─────────────────────────────────────────────
-log "Configurare Fail2ban..."
-cat > /etc/fail2ban/jail.local << 'EOF'
-[DEFAULT]
-bantime  = 3600
-findtime = 600
-maxretry = 5
-
-[sshd]
-enabled = true
-port    = ssh
-logpath = %(sshd_log)s
-
-[nginx-http-auth]
-enabled = true
-EOF
-systemctl enable --now fail2ban
-ok "Fail2ban configurat"
-
-# ── 5. Swap (important pentru VPS cu RAM mic) ───────────────
-if [[ ! -f /swapfile ]]; then
-  log "Creare swap 2GB..."
-  fallocate -l 2G /swapfile
-  chmod 600 /swapfile
-  mkswap /swapfile
-  swapon /swapfile
-  echo '/swapfile none swap sw 0 0' >> /etc/fstab
-  sysctl vm.swappiness=10
-  echo 'vm.swappiness=10' >> /etc/sysctl.conf
-  ok "Swap 2GB creat"
+step "Node.js (v20 LTS) for frontend"
+if ! command -v node &>/dev/null; then
+  curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+  sudo apt-get install -y nodejs
+  log "Node.js $(node --version) installed"
 else
-  ok "Swap deja configurat"
+  log "Node.js already present: $(node --version)"
 fi
 
-# ── 6. Directoare și permisiuni ─────────────────────────────
-log "Creare structură directoare..."
-mkdir -p /opt/nexus-trader
-chown "$USERNAME:$USERNAME" /opt/nexus-trader
+step "Python virtual environment"
+if [ ! -d ".venv" ]; then
+  python3 -m venv .venv
+  log ".venv created"
+fi
+source .venv/bin/activate
+pip install --upgrade pip wheel setuptools -q
+log "venv activated"
 
-# ── 7. Systemd service pentru auto-restart ──────────────────
-log "Creare systemd service..."
-APP_DIR="/opt/nexus-trader"
-cat > /etc/systemd/system/nexus-trader.service << EOF
-[Unit]
-Description=Nexus Trader — Automated Trading System
-After=network-online.target docker.service
-Wants=network-online.target
-Requires=docker.service
+step "Backend Python dependencies"
+pip install -r requirements.txt -q
+log "Backend deps installed"
 
-[Service]
-Type=oneshot
-RemainAfterExit=yes
-User=$USERNAME
-WorkingDirectory=$APP_DIR
-ExecStart=/usr/bin/docker compose -f docker-compose.prod.yml up -d
-ExecStop=/usr/bin/docker compose -f docker-compose.prod.yml down
-TimeoutStartSec=120
-Restart=on-failure
-RestartSec=30
+step "Backtesting dependencies"
+pip install -r backtesting/requirements_backtest.txt -q
+log "Backtesting deps installed"
 
-[Install]
-WantedBy=multi-user.target
+step "Frontend Node dependencies"
+cd frontend && npm install --silent && cd ..
+log "Frontend deps installed"
+
+step ".env file"
+if [ ! -f ".env" ]; then
+  cp .env.example .env
+  warn ".env created from .env.example — edit it with your keys!"
+else
+  log ".env already exists"
+fi
+
+if [ ! -f "frontend/.env.local" ]; then
+  cat > frontend/.env.local << 'EOF'
+NEXT_PUBLIC_API_URL=http://localhost:8000
+NEXT_PUBLIC_WS_URL=ws://localhost:8000/ws
 EOF
-systemctl daemon-reload
-systemctl enable nexus-trader.service
-ok "Systemd service creat și activat la boot"
+  log "frontend/.env.local created"
+fi
 
-# ── 8. Logrotate ────────────────────────────────────────────
-log "Configurare logrotate..."
-cat > /etc/logrotate.d/nexus-trader << 'EOF'
-/opt/nexus-trader/journal/*.log {
-    daily
-    rotate 30
-    compress
-    delaycompress
-    missingok
-    notifempty
-    create 0640 root root
-}
-EOF
-ok "Logrotate configurat"
+step "Redis"
+if systemctl is-active --quiet redis-server; then
+  log "Redis already running"
+else
+  sudo systemctl start redis-server
+  sudo systemctl enable redis-server
+  log "Redis started"
+fi
 
-# ── 9. Cron pentru backup automat ───────────────────────────
-log "Configurare backup cron..."
-cat > /etc/cron.d/nexus-backup << EOF
-# Backup journal zilnic la 03:00
-0 3 * * * $USERNAME /opt/nexus-trader/scripts/backup.sh >> /var/log/nexus-backup.log 2>&1
-EOF
-ok "Backup cron configurat"
+step "Validate .env DRY_RUN / TESTNET"
+if grep -q 'DRY_RUN=true' .env && grep -q 'TESTNET=true' .env; then
+  log "DRY_RUN=true and TESTNET=true — safe for local testing"
+else
+  warn "Make sure DRY_RUN=true and TESTNET=true in .env before testing!"
+fi
 
-echo ""
-ok "Setup Ubuntu complet!"
-echo ""
-echo "  Pași următori:"
-echo "  1. Mută repo-ul în /opt/nexus-trader:"
-echo "     sudo cp -r . /opt/nexus-trader && cd /opt/nexus-trader"
-echo "  2. Copiază și completează .env.prod:"
-echo "     cp .env.prod.example .env.prod && nano .env.prod"
-echo "  3. Rulează deploy:"
-echo "     bash scripts/deploy.sh"
-echo ""
-warn "Re-login sau: newgrp docker — pentru a folosi docker fără sudo"
+echo -e "\n${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${GREEN}  Nexus Trader setup complete!${NC}"
+echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e ""
+echo -e "  Next steps:"
+echo -e "  1. Edit ${YELLOW}.env${NC} — add BINANCE_API_KEY + BINANCE_API_SECRET"
+echo -e "  2. ${CYAN}source .venv/bin/activate${NC}"
+echo -e "  3. Run tests:  ${CYAN}./scripts/test.sh${NC}"
+echo -e "  4. Start all:  ${CYAN}./scripts/start_dev.sh${NC}"
+echo -e ""
