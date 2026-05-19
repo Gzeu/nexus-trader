@@ -1,5 +1,6 @@
 'use client'
 
+import { useState } from 'react'
 import dynamic from 'next/dynamic'
 import { Suspense } from 'react'
 import { Header } from '@/components/layout/Header'
@@ -15,13 +16,21 @@ const TradingChart = dynamic(
 )
 
 export default function TradingTerminal() {
+  const [symbol, setSymbol] = useState('BTCUSDT')
+  const [timeframe, setTimeframe] = useState('15m')
+
   return (
     <div className="flex flex-col h-screen overflow-hidden bg-bg">
       {/* Top status bar — connection + equity + mode */}
       <StatusBar />
 
       {/* Main header — symbol selector, timeframe, mode toggle */}
-      <Header />
+      <Header
+        symbol={symbol}
+        timeframe={timeframe}
+        onSymbolChange={setSymbol}
+        onTimeframeChange={setTimeframe}
+      />
 
       {/* Main content area */}
       <div className="flex flex-1 overflow-hidden">
@@ -32,7 +41,7 @@ export default function TradingTerminal() {
         <div className="flex flex-col flex-1 overflow-hidden">
           <div className="flex-1 overflow-hidden">
             <Suspense fallback={<ChartSkeleton />}>
-              <TradingChart />
+              <TradingChart symbol={symbol} timeframe={timeframe} />
             </Suspense>
           </div>
 
