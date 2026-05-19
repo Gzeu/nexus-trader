@@ -1,9 +1,6 @@
 """
 FastAPI routes — toate endpoint-urile REST ale sistemului.
 "/api/v1/" prefix aplicat in app.py.
-
-FIX: health() citeste dry_run din get_settings() nu din ExecutionEngine
-     (care il citeste intern dar nu il expune ca property public).
 """
 from __future__ import annotations
 
@@ -31,7 +28,7 @@ async def health(state: AppState = Depends(get_state)) -> Dict[str, Any]:
     return {
         "status": "ok",
         "reconciled": state.portfolio.is_ready,
-        "dry_run": cfg.dry_run,          # FIX: citit din config, nu din ExecutionEngine
+        "dry_run": cfg.dry_run,
         "testnet": cfg.testnet,
         "price_cache_ready": state.price_cache.is_ready,
         "automation_running": state.automation.running,
