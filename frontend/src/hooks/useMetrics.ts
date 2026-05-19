@@ -20,8 +20,8 @@ export interface Metrics {
 
 export function useMetrics() {
   const { data, error, isLoading, mutate } = useSWR<Metrics>(
-    '/metrics',
-    () => apiFetch<Metrics>('/metrics'),
+    '/analytics',
+    () => apiFetch<Metrics>('/analytics'),
     { refreshInterval: 5_000, revalidateOnFocus: false }
   )
   return { metrics: data, error, isLoading, refresh: mutate }

@@ -180,7 +180,7 @@ export default function TradingChart({
     const datafeed = makeBinanceDatafeed()
 
     // Lazy import the broker adapter
-    import('../../../broker_adapter/tradingview_broker').then(({ TradingSystemBroker }) => {
+    import('../../../../broker_adapter/tradingview_broker').then(({ TradingSystemBroker }) => {
       // Dummy host for standalone usage; in real TV setup widget provides the host
       const brokerFactory = (host: Parameters<typeof TradingSystemBroker>[0]) =>
         new TradingSystemBroker(host, {

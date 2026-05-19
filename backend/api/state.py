@@ -83,8 +83,7 @@ class AppState:
 
         # Portfolio engine
         self.portfolio = PortfolioEngine(
-            spot_client=self.spot_client,
-            futures_client=self.futures_client,
+            binance_client=self.spot_client,
             risk_manager=self.risk,
         )
 
@@ -107,8 +106,7 @@ class AppState:
             portfolio_engine=self.portfolio,
             risk_manager=self.risk,
             execution_engine=self.execution,
-            spot_client=self.spot_client,
-            futures_client=self.futures_client,
+            binance_client=self.spot_client,
             ws_broadcast=self._ws_broadcast_wrapper,
             journal=self.journal,
             telegram=self.telegram,

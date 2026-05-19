@@ -209,7 +209,11 @@ class BacktestEngine:
         df.ta.rsi(length=self.rsi_period, append=True)
         df.ta.macd(fast=12, slow=26, signal=9, append=True)   # adds MACD_12_26_9, MACDh_12_26_9
         df.ta.atr(length=self.atr_period, append=True)
-        df.ta.bbands(length=20, std=2, append=True)            # BBL_20_2.0, BBU_20_2.0
+        # Manual Bollinger Bands calculation (pandas_ta bbands has numba compatibility issues)
+        df["BBM_20_2.0"] = df["close"].rolling(window=20).mean()
+        std = df["close"].rolling(window=20).std()
+        df["BBU_20_2.0"] = df["BBM_20_2.0"] + (std * 2)
+        df["BBL_20_2.0"] = df["BBM_20_2.0"] - (std * 2)
 
         ema_f = f"EMA_{self.ema_fast}"
         ema_s = f"EMA_{self.ema_slow}"

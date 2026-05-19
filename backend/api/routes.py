@@ -91,7 +91,7 @@ async def analytics(ctx=Depends(get_ctx)):
     if not ctx.portfolio:
         raise HTTPException(503, "Portfolio not initialized")
     risk_metrics = ctx.risk.get_metrics().model_dump()
-    portfolio_summary = ctx.portfolio.get_summary()
+    portfolio_summary = ctx.portfolio.get_analytics()
     return {**risk_metrics, **portfolio_summary}
 
 
