@@ -1,26 +1,27 @@
 'use client'
 /**
- * TradingChart.tsx — v3.4
+ * TradingChart.tsx — v3.5
  * ─────────────────────────────────────────────────────────────────────────────
- * FIX 5 (2026-05-20) — Race condition + Binance connectivity
+ * FIX 6 (2026-05-20) — Strict Mode + browser compat + WS state reset
  *
- * FIX 5a: Race condition — candleRef.current was null when loadData ran.
- *         useEffect([]) order is not guaranteed in React Strict Mode (Next.js 14
- *         double-invokes effects). Solution: chart init effect exposes a
- *         "ready" callback via chartReadyCbRef; loadData subscribes to it
- *         instead of polling candleRef directly.
+ * FIX 6a: React Strict Mode double-mount crash.
+ *         loadData used to resolve the chart-ready Promise with the series
+ *         instance captured at init time. In Strict Mode Next.js 15 mounts
+ *         effects twice — the first series is destroyed by chart.remove() in
+ *         the cleanup, so calling setData() on it silently fails or throws.
+ *         Fix: resolve with () => candleRef.current (always the live ref).
  *
- * FIX 5b: Binance REST geo-block (Romania + other regions block api.binance.com).
- *         fetchCandles now tries api1 → api2 → api3 → api.binance.com in order,
- *         returning on first success. Same for fetch24hChange.
+ * FIX 6b: AbortSignal.timeout() is not available in Safari < 16 / Firefox < 100.
+ *         Replaced with manual AbortController + setTimeout pattern.
  *
- * FIX 5c: Binance WS port 9443 is blocked by some ISPs/firewalls.
- *         createBinanceWS tries wss://stream.binance.com:9443 first, then
- *         wss://stream.binance.com:443 as fallback.
+ * FIX 6c: wsLive indicator was never reset to false on WS close/reconnect.
+ *         Now setWsLive(false) on onclose so the dot goes grey during reconnect.
  *
- * FIX 5d: Error message shown in toolbar with full detail (was silently swallowed).
+ * FIX 6d: loadData now stops the previous binanceWS immediately (before the
+ *         chart-ready await) to avoid two parallel WS streams during
+ *         symbol/timeframe changes.
  *
- * FIX 1–4 from v3.2/v3.3 retained.
+ * FIX 1–5 from v3.2–v3.4 retained.
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react'
@@ -103,6 +104,15 @@ const C = {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// FIX 6b — fetch with timeout (AbortController, not AbortSignal.timeout)
+// ─────────────────────────────────────────────────────────────────────────────
+function fetchWithTimeout(url: string, timeoutMs = 8000): Promise<Response> {
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
+  return fetch(url, { signal: controller.signal }).finally(() => clearTimeout(timer))
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Binance REST — FIX 5b: multi-host failover for geo-blocked regions
 // ─────────────────────────────────────────────────────────────────────────────
 const BINANCE_HOSTS = [
@@ -116,7 +126,7 @@ async function binanceFetch(path: string): Promise<Response> {
   let lastErr: unknown
   for (const host of BINANCE_HOSTS) {
     try {
-      const res = await fetch(`${host}${path}`, { signal: AbortSignal.timeout(8000) })
+      const res = await fetchWithTimeout(`${host}${path}`, 8000)
       if (res.ok) return res
       // 4xx is definitive — no point trying other hosts
       if (res.status >= 400 && res.status < 500) return res
@@ -152,6 +162,7 @@ async function fetch24hChange(symbol: string): Promise<number | null> {
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Binance WS — FIX 5c: port 9443 → 443 fallback
+//              FIX 6c: onDisconnect callback so caller can reset wsLive
 // ─────────────────────────────────────────────────────────────────────────────
 const BINANCE_WS_URLS = (stream: string) => [
   `wss://stream.binance.com:9443/ws/${stream}`,
@@ -162,6 +173,7 @@ function createBinanceWS(
   stream: string,
   onMessage: (data: string) => void,
   onLive: () => void,
+  onDisconnect: () => void,   // FIX 6c
 ) {
   let stopped = false
   let ws: WebSocket
@@ -175,7 +187,7 @@ function createBinanceWS(
     ws.onmessage = ev => onMessage(ev.data as string)
     ws.onclose   = () => {
       if (stopped) return
-      // Alternate between URL variants on each retry
+      onDisconnect()                                          // FIX 6c
       urlIdx++
       const delay = Math.min(1000 * 2 ** Math.min(retries, 6), 30_000)
       retries++
@@ -327,9 +339,10 @@ export function TradingChart({
   // FIX 1 — stable MACD populate ref
   const populateMACDPaneRef = useRef<(() => void) | null>(null)
 
-  // FIX 5a — chart-ready callback: loadData subscribes here instead of
-  // checking candleRef directly (avoids race condition in React Strict Mode)
-  const chartReadyCbRef = useRef<((candle: ISeriesApi<'Candlestick'>) => void) | null>(null)
+  // FIX 5a / FIX 6a — chart-ready gate.
+  // Resolves with a getter (() => candleRef.current) so loadData always
+  // uses the live series, not one captured at init time (Strict Mode safe).
+  const chartReadyCbRef = useRef<((getter: () => ISeriesApi<'Candlestick'> | null) => void) | null>(null)
 
   const [symbol,     setSymbol]     = useState(initSymbol)
   const [timeframe,  setTimeframe]  = useState(initTimeframe)
@@ -408,8 +421,9 @@ export function TradingChart({
     bbMiddleRef.current = bbMiddle
     bbLowerRef.current  = bbLower
 
-    // FIX 5a — notify loadData that candleRef is ready
-    chartReadyCbRef.current?.(candles)
+    // FIX 6a — pass a getter so loadData always reads the current live ref,
+    // not a stale captured instance (safe across Strict Mode double-mount).
+    chartReadyCbRef.current?.(() => candleRef.current)
     chartReadyCbRef.current = null
 
     return () => {
@@ -505,27 +519,43 @@ export function TradingChart({
 
   // ── 6. Load data + Binance WS ─────────────────────────────────────────────
   //
-  // FIX 5a: We no longer gate on candleRef.current directly.
-  // Instead we use a Promise that resolves when the chart init effect fires
-  // chartReadyCbRef, guaranteeing the series exist before we call setData.
+  // FIX 6a: Resolves a getter (() => candleRef.current) instead of a direct
+  // series reference — always uses the live series regardless of Strict Mode
+  // double-mount order.
+  //
+  // FIX 6d: Previous WS is stopped BEFORE the chart-ready await so we never
+  // have two parallel streams during symbol/tf changes.
   const loadData = useCallback(async (sym: string, tf: string) => {
     setLoading(true); setError(null); setTooltip(null)
     markersRef.current = []
     priceLineRefs.current.forEach(l => { try { candleRef.current?.removePriceLine(l) } catch {} })
     priceLineRefs.current = []
-    binanceWSRef.current?.stop(); setWsLive(false)
 
-    // Wait for candleSeries to be ready (chart init effect may not have run yet)
-    const candles = await new Promise<ISeriesApi<'Candlestick'>>((resolve) => {
+    // FIX 6d — stop previous WS immediately, before any await
+    binanceWSRef.current?.stop()
+    binanceWSRef.current = null
+    setWsLive(false)
+
+    // Wait for candleSeries getter to be ready (chart init may not have run yet)
+    const getCandleSeries = await new Promise<() => ISeriesApi<'Candlestick'> | null>((resolve) => {
       if (candleRef.current) {
-        resolve(candleRef.current)
+        // Chart already initialised — resolve immediately with live getter
+        resolve(() => candleRef.current)
       } else {
+        // Chart not ready yet — subscribe to the init callback
         chartReadyCbRef.current = resolve
       }
     })
 
+    // Safety check: series might be null if chart was unmounted during await
+    const candles = getCandleSeries()
+    if (!candles) return
+
     try {
       const [data, ch] = await Promise.all([fetchCandles(sym, tf), fetch24hChange(sym)])
+
+      // Re-check after async gap — component may have unmounted
+      if (!getCandleSeries()) return
 
       candleDataRef.current = data
       candles.setData(data)
@@ -571,13 +601,14 @@ export function TradingChart({
       (raw) => {
         const msg = JSON.parse(raw) as { k: Record<string, unknown> }
         const k = msg.k
-        if (!candleRef.current) return
+        const liveSeries = getCandleSeries()
+        if (!liveSeries) return
         const t        = (Number(k.t) / 1000) as Time
         const open     = +String(k.o), high  = +String(k.h)
         const low      = +String(k.l), close = +String(k.c)
         const vol      = +String(k.v), isClosed = Boolean(k.x)
 
-        candleRef.current.update({ time: t, open, high, low, close })
+        liveSeries.update({ time: t, open, high, low, close })
         volumeRef.current?.update({ time: t, value: vol, color: close >= open ? C.volGreen : C.volRed })
 
         if (isClosed) {
@@ -609,6 +640,7 @@ export function TradingChart({
         })
       },
       () => setWsLive(true),
+      () => setWsLive(false),   // FIX 6c — reset on disconnect
     )
     binanceWSRef.current = bWS
   }, [])
