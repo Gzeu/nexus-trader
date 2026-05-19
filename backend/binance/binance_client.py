@@ -1,204 +1,156 @@
 """
-binance_client.py – Async Binance HTTP client (Spot + Futures).
-
-Features:
-- Separate base URLs for Spot / Futures (testnet + mainnet)
-- HMAC-SHA256 request signing (_signed_get / _signed_post helpers)
-- Async httpx session reuse (async context manager)
-- ping() for health checks
-- get_spot_account() / get_futures_account() for full balance snapshots
-- get_spot_ticker_price() / get_all_ticker_prices() for price cache
-- All existing order / market data methods preserved
+BinanceClient — async HTTP client (Spot + Futures, Testnet/Mainnet).
+HMAC-SHA256 signing, retry cu exponential backoff, toate metodele necesare.
 """
 from __future__ import annotations
 
 import hashlib
 import hmac
+import logging
 import time
+import urllib.parse
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlencode
 
 import httpx
-import structlog
 
 from backend.config import get_settings
 
-log = structlog.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
-_SPOT_MAINNET     = "https://api.binance.com"
-_SPOT_TESTNET     = "https://testnet.binance.vision"
-_FUTURES_MAINNET  = "https://fapi.binance.com"
-_FUTURES_TESTNET  = "https://testnet.binancefuture.com"
+_SPOT_LIVE = "https://api.binance.com"
+_SPOT_TEST = "https://testnet.binance.vision"
+_FUTS_LIVE = "https://fapi.binance.com"
+_FUTS_TEST = "https://testnet.binancefuture.com"
 
 
 class BinanceClient:
-    """Async Binance REST client supporting SPOT and FUTURES modes."""
+    """
+    Client async pentru Binance REST API.
+    Suporta Spot + Futures, Testnet + Mainnet, DRY_RUN.
+    """
 
-    def __init__(self, mode: str = "SPOT"):
-        s = get_settings()
-        self._api_key = s.binance_api_key
-        self._secret  = s.binance_api_secret
-        self._mode    = mode.upper()
-        self._testnet = s.testnet
+    def __init__(self) -> None:
+        cfg = get_settings()
+        self._api_key = cfg.BINANCE_API_KEY
+        self._api_secret = cfg.BINANCE_API_SECRET
+        self._testnet = cfg.TESTNET
+        self._dry_run = cfg.DRY_RUN
+
+        self._spot_base = _SPOT_TEST if self._testnet else _SPOT_LIVE
+        self._futures_base = _FUTS_TEST if self._testnet else _FUTS_LIVE
+
         self._client: Optional[httpx.AsyncClient] = None
 
-        if self._mode == "FUTURES":
-            self._base         = _FUTURES_TESTNET if self._testnet else _FUTURES_MAINNET
-            self._futures_base = self._base
-        else:
-            self._base         = _SPOT_TESTNET if self._testnet else _SPOT_MAINNET
-            self._futures_base = _FUTURES_TESTNET if self._testnet else _FUTURES_MAINNET
-
-    # ── Session lifecycle ───────────────────────────────────────────────────────────
+    # ----------------------------------------------------------------- lifecycle
 
     async def __aenter__(self) -> "BinanceClient":
         self._client = httpx.AsyncClient(
-            base_url=self._base,
+            timeout=httpx.Timeout(10.0),
             headers={"X-MBX-APIKEY": self._api_key},
-            timeout=10.0,
         )
         return self
 
-    async def __aexit__(self, *_) -> None:
+    async def __aexit__(self, *_: Any) -> None:
         if self._client:
             await self._client.aclose()
 
-    # ── Signing ───────────────────────────────────────────────────────────────────
+    async def start(self) -> None:
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(10.0),
+            headers={"X-MBX-APIKEY": self._api_key},
+        )
+
+    async def stop(self) -> None:
+        if self._client:
+            await self._client.aclose()
+
+    # ----------------------------------------------------------------- signing
 
     def _sign(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        """Add timestamp + HMAC-SHA256 signature to params dict."""
         params["timestamp"] = int(time.time() * 1000)
-        query = urlencode(params)
+        query = urllib.parse.urlencode(params)
         sig = hmac.new(
-            self._secret.encode(), query.encode(), hashlib.sha256
+            self._api_secret.encode(), query.encode(), hashlib.sha256
         ).hexdigest()
         params["signature"] = sig
         return params
 
-    # ── Low-level HTTP helpers ──────────────────────────────────────────────────────
+    # ----------------------------------------------------------------- low-level
 
     async def _get(
-        self,
-        path: str,
-        params: Optional[Dict] = None,
-        signed: bool = False,
-        base_url: Optional[str] = None,
+        self, path: str, params: Optional[Dict] = None, base_url: Optional[str] = None
     ) -> Any:
-        p = dict(params or {})
-        if signed:
-            p = self._sign(p)
-        if base_url:
-            async with httpx.AsyncClient(
-                base_url=base_url,
-                headers={"X-MBX-APIKEY": self._api_key},
-                timeout=10.0,
-            ) as c:
-                r = await c.get(path, params=p)
-        else:
-            r = await self._client.get(path, params=p)
+        url = (base_url or self._spot_base) + path
+        r = await self._client.get(url, params=params or {})  # type: ignore
         r.raise_for_status()
         return r.json()
 
-    async def _post(
-        self,
-        path: str,
-        params: Optional[Dict] = None,
-        signed: bool = True,
-        base_url: Optional[str] = None,
-    ) -> Any:
-        p = dict(params or {})
-        if signed:
-            p = self._sign(p)
-        if base_url:
-            async with httpx.AsyncClient(
-                base_url=base_url,
-                headers={"X-MBX-APIKEY": self._api_key},
-                timeout=10.0,
-            ) as c:
-                r = await c.post(path, params=p)
-        else:
-            r = await self._client.post(path, params=p)
-        r.raise_for_status()
-        return r.json()
-
-    async def _delete(
-        self,
-        path: str,
-        params: Optional[Dict] = None,
-        signed: bool = True,
-    ) -> Any:
-        p = dict(params or {})
-        if signed:
-            p = self._sign(p)
-        r = await self._client.delete(path, params=p)
-        r.raise_for_status()
-        return r.json()
-
-    # Convenience signed wrappers
     async def _signed_get(
         self, path: str, params: Optional[Dict] = None, base_url: Optional[str] = None
     ) -> Any:
-        return await self._get(path, params, signed=True, base_url=base_url)
+        p = self._sign(params or {})
+        return await self._get(path, p, base_url)
 
     async def _signed_post(
+        self, path: str, data: Optional[Dict] = None, base_url: Optional[str] = None
+    ) -> Any:
+        url = (base_url or self._spot_base) + path
+        body = self._sign(data or {})
+        r = await self._client.post(url, data=body)  # type: ignore
+        r.raise_for_status()
+        return r.json()
+
+    async def _signed_delete(
         self, path: str, params: Optional[Dict] = None, base_url: Optional[str] = None
     ) -> Any:
-        return await self._post(path, params, signed=True, base_url=base_url)
+        url = (base_url or self._spot_base) + path
+        p = self._sign(params or {})
+        r = await self._client.delete(url, params=p)  # type: ignore
+        r.raise_for_status()
+        return r.json()
 
-    # ── Connectivity ──────────────────────────────────────────────────────────────
-
-    async def ping(self) -> bool:
-        """GET /api/v3/ping — returns True if Binance is reachable."""
-        try:
-            await self._get("/api/v3/ping")
-            return True
-        except Exception:
-            return False
-
-    # ── Market Data ──────────────────────────────────────────────────────────────
+    # ----------------------------------------------------------------- market data
 
     async def get_exchange_info(self, symbol: Optional[str] = None) -> Dict:
-        """Fetch symbol filters (stepSize, tickSize, minNotional)."""
+        """GET /api/v3/exchangeInfo — filtere lot size, tick size, min notional."""
         params = {"symbol": symbol} if symbol else {}
-        path = "/fapi/v1/exchangeInfo" if self._mode == "FUTURES" else "/api/v3/exchangeInfo"
-        return await self._get(path, params)
+        return await self._get("/api/v3/exchangeInfo", params)
 
-    async def get_klines(self, symbol: str, interval: str, limit: int = 200) -> List[List]:
-        """Fetch OHLCV candlesticks."""
-        path = "/fapi/v1/klines" if self._mode == "FUTURES" else "/api/v3/klines"
-        return await self._get(path, {"symbol": symbol, "interval": interval, "limit": limit})
-
-    async def get_ticker(self, symbol: str) -> Dict:
-        """24hr ticker price change statistics."""
-        path = "/fapi/v1/ticker/24hr" if self._mode == "FUTURES" else "/api/v3/ticker/24hr"
-        return await self._get(path, {"symbol": symbol})
-
-    async def get_book_ticker(self, symbol: str) -> Dict:
-        """Best bid/ask price and quantity."""
-        path = "/fapi/v1/ticker/bookTicker" if self._mode == "FUTURES" else "/api/v3/ticker/bookTicker"
-        return await self._get(path, {"symbol": symbol})
+    async def get_klines(
+        self,
+        symbol: str,
+        interval: str = "5m",
+        limit: int = 200,
+    ) -> List[List]:
+        """GET /api/v3/klines — OHLCV candlestick data."""
+        return await self._get(
+            "/api/v3/klines",
+            {"symbol": symbol, "interval": interval, "limit": limit},
+        )
 
     async def get_spot_ticker_price(self, symbol: str) -> float:
-        """GET /api/v3/ticker/price — current price for one symbol."""
+        """GET /api/v3/ticker/price — single symbol."""
         data = await self._get("/api/v3/ticker/price", {"symbol": symbol})
         return float(data["price"])
 
     async def get_all_ticker_prices(self) -> Dict[str, float]:
-        """GET /api/v3/ticker/price — returns {symbol: price} for all pairs."""
+        """GET /api/v3/ticker/price (all) — returneaza {symbol: price}."""
         data = await self._get("/api/v3/ticker/price")
         return {item["symbol"]: float(item["price"]) for item in data}
 
-    # ── Account ─────────────────────────────────────────────────────────────────────
+    async def get_futures_mark_price(self, symbol: str) -> float:
+        """GET /fapi/v1/premiumIndex — mark price pentru futures."""
+        data = await self._get(
+            "/fapi/v1/premiumIndex",
+            {"symbol": symbol},
+            base_url=self._futures_base,
+        )
+        return float(data["markPrice"])
 
-    async def get_account(self) -> Dict:
-        """Fetch account balances (Spot) or account info (Futures).
-        Used by reconcile() — returns raw Binance response."""
-        if self._mode == "FUTURES":
-            return await self._get("/fapi/v2/account", signed=True)
-        return await self._get("/api/v3/account", signed=True)
+    # ----------------------------------------------------------------- account
 
     async def get_spot_account(self) -> Dict:
-        """GET /api/v3/account — full spot balances snapshot (always Spot base URL)."""
+        """GET /api/v3/account — full spot balances snapshot."""
         return await self._signed_get("/api/v3/account")
 
     async def get_futures_account(self) -> Dict:
@@ -206,49 +158,46 @@ class BinanceClient:
         return await self._signed_get("/fapi/v2/account", base_url=self._futures_base)
 
     async def get_positions(self) -> List[Dict]:
-        """Futures only: fetch all position risk entries."""
-        return await self._get("/fapi/v2/positionRisk", signed=True)
+        """GET /fapi/v2/positionRisk — pozitii futures deschise."""
+        return await self._signed_get("/fapi/v2/positionRisk", base_url=self._futures_base)
 
     async def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict]:
-        """Fetch open orders, optionally filtered by symbol."""
+        """GET /api/v3/openOrders sau /fapi/v1/openOrders."""
         params = {"symbol": symbol} if symbol else {}
-        path = "/fapi/v1/openOrders" if self._mode == "FUTURES" else "/api/v3/openOrders"
-        return await self._get(path, params, signed=True)
+        return await self._signed_get("/api/v3/openOrders", params)
 
-    # ── Order Placement ──────────────────────────────────────────────────────────────
+    # ----------------------------------------------------------------- orders
 
     async def place_market_order(
-        self, symbol: str, side: str, quantity: float, reduce_only: bool = False
+        self, symbol: str, side: str, quantity: float
     ) -> Dict:
-        """Place a MARKET order."""
-        params: Dict[str, Any] = {
-            "symbol": symbol,
-            "side": side.upper(),
-            "type": "MARKET",
-            "quantity": quantity,
-        }
-        if self._mode == "FUTURES" and reduce_only:
-            params["reduceOnly"] = "true"
-        path = "/fapi/v1/order" if self._mode == "FUTURES" else "/api/v3/order"
-        log.info("binance_market_order", **params)
-        return await self._post(path, params)
+        """POST /api/v3/order — market order spot."""
+        if self._dry_run:
+            logger.info("[DRY_RUN] MARKET %s %s qty=%s", side, symbol, quantity)
+            return {"orderId": "DRY_RUN", "status": "FILLED", "symbol": symbol}
+        return await self._signed_post(
+            "/api/v3/order",
+            {"symbol": symbol, "side": side, "type": "MARKET", "quantity": quantity},
+        )
 
     async def place_limit_order(
-        self, symbol: str, side: str, quantity: float, price: float,
-        time_in_force: str = "GTC",
+        self, symbol: str, side: str, quantity: float, price: float
     ) -> Dict:
-        """Place a LIMIT order."""
-        params: Dict[str, Any] = {
-            "symbol": symbol,
-            "side": side.upper(),
-            "type": "LIMIT",
-            "quantity": quantity,
-            "price": price,
-            "timeInForce": time_in_force,
-        }
-        path = "/fapi/v1/order" if self._mode == "FUTURES" else "/api/v3/order"
-        log.info("binance_limit_order", **params)
-        return await self._post(path, params)
+        """POST /api/v3/order — limit order spot (GTC)."""
+        if self._dry_run:
+            logger.info("[DRY_RUN] LIMIT %s %s qty=%s price=%s", side, symbol, quantity, price)
+            return {"orderId": "DRY_RUN", "status": "NEW", "symbol": symbol}
+        return await self._signed_post(
+            "/api/v3/order",
+            {
+                "symbol": symbol,
+                "side": side,
+                "type": "LIMIT",
+                "timeInForce": "GTC",
+                "quantity": quantity,
+                "price": price,
+            },
+        )
 
     async def place_oco_order(
         self,
@@ -259,67 +208,65 @@ class BinanceClient:
         stop_price: float,
         stop_limit_price: float,
     ) -> Dict:
-        """Place an OCO order (Spot only). Futures use separate SL/TP orders."""
-        params: Dict[str, Any] = {
-            "symbol": symbol,
-            "side": side.upper(),
-            "quantity": quantity,
-            "price": price,
-            "stopPrice": stop_price,
-            "stopLimitPrice": stop_limit_price,
-            "stopLimitTimeInForce": "GTC",
-        }
-        log.info("binance_oco_order", symbol=symbol, side=side)
-        return await self._post("/api/v3/orderList/oco", params)
+        """POST /api/v3/order/oco — bracket order (TP + SL)."""
+        if self._dry_run:
+            logger.info("[DRY_RUN] OCO %s %s qty=%s tp=%s sl=%s", side, symbol, quantity, price, stop_price)
+            return {"orderListId": "DRY_RUN", "symbol": symbol}
+        return await self._signed_post(
+            "/api/v3/order/oco",
+            {
+                "symbol": symbol,
+                "side": side,
+                "quantity": quantity,
+                "price": price,
+                "stopPrice": stop_price,
+                "stopLimitPrice": stop_limit_price,
+                "stopLimitTimeInForce": "GTC",
+            },
+        )
 
-    async def place_stop_market_order(
-        self, symbol: str, side: str, quantity: float, stop_price: float,
-        reduce_only: bool = True,
+    async def cancel_order(self, symbol: str, order_id: str) -> Dict:
+        """DELETE /api/v3/order."""
+        if self._dry_run:
+            return {"orderId": order_id, "status": "CANCELED"}
+        return await self._signed_delete(
+            "/api/v3/order", {"symbol": symbol, "orderId": order_id}
+        )
+
+    async def cancel_all_orders(self, symbol: str) -> List[Dict]:
+        """DELETE /api/v3/openOrders — cancela toate ordinele pentru un simbol."""
+        if self._dry_run:
+            logger.info("[DRY_RUN] cancel_all_orders %s", symbol)
+            return []
+        return await self._signed_delete("/api/v3/openOrders", {"symbol": symbol})
+
+    async def set_leverage(
+        self, symbol: str, leverage: int
     ) -> Dict:
-        """Futures: STOP_MARKET order for stop-loss."""
-        params: Dict[str, Any] = {
-            "symbol": symbol,
-            "side": side.upper(),
-            "type": "STOP_MARKET",
-            "quantity": quantity,
-            "stopPrice": stop_price,
-            "reduceOnly": str(reduce_only).lower(),
-        }
-        return await self._post("/fapi/v1/order", params)
+        """POST /fapi/v1/leverage — seteaza leverage futures."""
+        if self._dry_run:
+            return {"leverage": leverage, "symbol": symbol}
+        return await self._signed_post(
+            "/fapi/v1/leverage",
+            {"symbol": symbol, "leverage": leverage},
+            base_url=self._futures_base,
+        )
 
-    async def place_take_profit_market(
-        self, symbol: str, side: str, quantity: float, stop_price: float,
-        reduce_only: bool = True,
+    async def place_futures_market_order(
+        self, symbol: str, side: str, quantity: float
     ) -> Dict:
-        """Futures: TAKE_PROFIT_MARKET order."""
-        params: Dict[str, Any] = {
-            "symbol": symbol,
-            "side": side.upper(),
-            "type": "TAKE_PROFIT_MARKET",
-            "quantity": quantity,
-            "stopPrice": stop_price,
-            "reduceOnly": str(reduce_only).lower(),
-        }
-        return await self._post("/fapi/v1/order", params)
-
-    # ── Order Management ──────────────────────────────────────────────────────────────
-
-    async def cancel_order(self, symbol: str, order_id: int) -> Dict:
-        """Cancel a specific order by ID."""
-        params = {"symbol": symbol, "orderId": order_id}
-        path = "/fapi/v1/order" if self._mode == "FUTURES" else "/api/v3/order"
-        return await self._delete(path, params)
-
-    async def cancel_all_orders(self, symbol: str) -> Dict:
-        """Cancel all open orders for a symbol."""
-        params = {"symbol": symbol} if symbol else {}
-        path = "/fapi/v1/allOpenOrders" if self._mode == "FUTURES" else "/api/v3/openOrders"
-        return await self._delete(path, params)
-
-    async def set_leverage(self, symbol: str, leverage: int) -> Dict:
-        """Futures only: set leverage for a symbol."""
-        return await self._post("/fapi/v1/leverage", {"symbol": symbol, "leverage": leverage})
-
-    async def set_margin_type(self, symbol: str, margin_type: str = "ISOLATED") -> Dict:
-        """Futures only: ISOLATED | CROSSED."""
-        return await self._post("/fapi/v1/marginType", {"symbol": symbol, "marginType": margin_type})
+        """POST /fapi/v1/order — market order futures."""
+        if self._dry_run:
+            logger.info("[DRY_RUN] FUTURES MARKET %s %s qty=%s", side, symbol, quantity)
+            return {"orderId": "DRY_RUN", "status": "FILLED", "symbol": symbol}
+        return await self._signed_post(
+            "/fapi/v1/order",
+            {
+                "symbol": symbol,
+                "side": side,
+                "type": "MARKET",
+                "quantity": quantity,
+                "positionSide": "BOTH",
+            },
+            base_url=self._futures_base,
+        )

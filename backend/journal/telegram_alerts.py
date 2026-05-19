@@ -1,118 +1,77 @@
 """
-telegram_alerts.py – Telegram notification service.
-
-Fixes / improvements over v1:
-- TelegramAlerter is a proper class (not module-level functions)
-  so it can be mocked in tests and passed as a dependency
-- send_alert() is rate-limited (max 1 message per 3s) to avoid Telegram 429
-- All methods are no-ops when telegram is not configured (no exceptions thrown)
-- _format_signal() / _format_order_filled() helpers for consistent messages
-- alert_daily_summary() generates a clean P&L table
-- Standalone send_alert() module-level function kept for backwards compat
+TelegramAlerter — notificari async pentru evenimente critice.
+Nu arunca exceptii — logeaza si continua.
 """
 from __future__ import annotations
 
-import asyncio
-import time
-from decimal import Decimal
+import logging
 from typing import Optional
 
 import httpx
-import structlog
 
-from backend.config import get_settings
+from backend.models import Order, StrategySignal, Trade
 
-log = structlog.get_logger(__name__)
-settings = get_settings()
-
-_RATE_LIMIT_SECONDS = 3.0  # min gap between messages
+logger = logging.getLogger(__name__)
 
 
 class TelegramAlerter:
-    """Sends Telegram alerts for critical trading events."""
+    """Trimite mesaje Markdown la un chat Telegram."""
 
-    def __init__(self):
-        self._last_sent: float = 0.0
-        self._enabled = settings.is_telegram_configured()
-        self._base_url = (
-            f"https://api.telegram.org/bot{settings.telegram_bot_token}"
-            if settings.telegram_bot_token
-            else ""
-        )
+    def __init__(self, token: str, chat_id: str) -> None:
+        self._token = token
+        self._chat_id = chat_id
+        self._base = f"https://api.telegram.org/bot{token}/sendMessage"
+        self._enabled = bool(token and chat_id)
 
-    async def send_alert(self, message: str, parse_mode: str = "HTML") -> None:
-        """Send a plain text message. Rate-limited, non-blocking."""
+    async def send_alert(self, text: str) -> None:
+        """Trimite un mesaj simplu Markdown."""
         if not self._enabled:
+            logger.debug("Telegram disabled — skipping: %s", text[:60])
             return
-        now = time.monotonic()
-        gap = now - self._last_sent
-        if gap < _RATE_LIMIT_SECONDS:
-            await asyncio.sleep(_RATE_LIMIT_SECONDS - gap)
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with httpx.AsyncClient(timeout=5.0) as client:
                 await client.post(
-                    f"{self._base_url}/sendMessage",
-                    json={
-                        "chat_id": settings.telegram_chat_id,
-                        "text": message,
-                        "parse_mode": parse_mode,
-                    },
+                    self._base,
+                    json={"chat_id": self._chat_id, "text": text, "parse_mode": "Markdown"},
                 )
-            self._last_sent = time.monotonic()
         except Exception as exc:
-            log.warning("telegram_send_failed", error=str(exc))
+            logger.warning("Telegram send failed: %s", exc)
 
-    async def alert_signal(self, signal) -> None:
-        if not self._enabled:
-            return
-        action = str(signal.action)
-        emoji = "🟢" if action == "BUY" else "🔴"
+    async def alert_signal(self, signal: StrategySignal) -> None:
+        emoji = "🟢" if signal.action in ("BUY", "LONG") else "🔴" if signal.action in ("SELL", "SHORT") else "⚪"
         msg = (
-            f"{emoji} <b>Signal: {action}</b> — {signal.symbol}\n"
-            f"Confidence: {signal.confidence:.0%} | TF: {signal.timeframe}\n"
-            f"Entry: {signal.entry_price} | SL: {signal.stop_loss} | TP1: {signal.take_profit_1}\n"
-            f"<i>{signal.reason[:120]}</i>"
+            f"{emoji} *{signal.action}* `{signal.symbol}`\n"
+            f"Confidence: `{signal.confidence:.0%}`\n"
+            f"Entry: `{signal.entry_price}`  SL: `{signal.stop_loss}`\n"
+            f"TP1: `{signal.take_profit_1}`  TP2: `{signal.take_profit_2}`\n"
+            f"Reason: _{signal.reason}_"
         )
         await self.send_alert(msg)
 
-    async def alert_order_filled(self, order) -> None:
-        if not self._enabled:
-            return
+    async def alert_order_filled(self, order: Order) -> None:
         msg = (
-            f"✅ <b>Order Filled</b>\n"
-            f"Symbol: {order.symbol} | Side: {order.side}\n"
-            f"Qty: {order.filled_quantity} @ {order.avg_fill_price}\n"
-            f"ID: {order.exchange_order_id}"
+            f"✅ *Order Filled* `{order.symbol}`\n"
+            f"Side: `{order.side}`  Qty: `{order.quantity}`\n"
+            f"Price: `{order.price}`  ID: `{order.id}`"
         )
         await self.send_alert(msg)
 
-    async def alert_risk_event(self, event: str, details: str = "") -> None:
-        if not self._enabled:
-            return
-        msg = f"⚠️ <b>Risk Event: {event}</b>\n{details[:200]}"
+    async def alert_risk_event(self, event: str, detail: str = "") -> None:
+        msg = f"⚠️ *Risk Event*: {event}\n{detail}"
         await self.send_alert(msg)
 
-    async def alert_daily_summary(self, metrics: dict) -> None:
-        if not self._enabled:
-            return
-        wl = metrics.get("win_rate", 0)
+    async def alert_daily_summary(
+        self,
+        equity: float,
+        pnl_today: float,
+        win_rate: float,
+        trades_today: int,
+    ) -> None:
+        direction = "📈" if pnl_today >= 0 else "📉"
         msg = (
-            f"📊 <b>Daily Summary</b>\n"
-            f"Equity: {metrics.get('equity', 0):.2f} USDT\n"
-            f"Daily P&amp;L: {metrics.get('daily_pnl', 0):+.2f} ({metrics.get('daily_pnl_pct', 0):+.2%})\n"
-            f"Trades: {metrics.get('total_trades', 0)} | Win rate: {wl:.0%}\n"
-            f"Drawdown: {metrics.get('current_drawdown', 0):.2%} / {metrics.get('max_drawdown', 0):.2%}"
+            f"{direction} *Daily Summary*\n"
+            f"Equity: `${equity:,.2f}`\n"
+            f"PnL Today: `{'+' if pnl_today >= 0 else ''}{pnl_today:,.2f} USDT`\n"
+            f"Win Rate: `{win_rate:.0%}`  Trades: `{trades_today}`"
         )
         await self.send_alert(msg)
-
-
-# Backwards-compat module-level function
-_default_alerter: Optional[TelegramAlerter] = None
-
-
-async def send_alert(message: str) -> None:
-    """Module-level send_alert for backwards compatibility."""
-    global _default_alerter
-    if _default_alerter is None:
-        _default_alerter = TelegramAlerter()
-    await _default_alerter.send_alert(message)

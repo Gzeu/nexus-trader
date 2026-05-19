@@ -1,123 +1,113 @@
 """
-state.py – AppState: wires all components into a single shared container.
-
-Fixes / improvements over v1:
-- `set_exchange_info()` removed — function doesn't exist in v3 ExecutionEngine
-  (ExecutionEngine.setup() handles its own exchange_info refresh internally)
-- `execution_engine` constructed with correct signature (spot, futures, ws_broadcast)
-- `automation_engine` constructed with correct v3 signature
-- Per-symbol CompositeStrategy dict passed to automation ("*" fallback key)
-- futures_client only opened/passed when futures_enabled
-- `ws_broadcast` callable passed to execution so post_fill() can emit WS events
-- `telegram_alerts` instance created and passed to automation
-- `start_time` tracked for uptime metric
+AppState — dependency injection container pentru FastAPI.
+Wiring complet: BinanceClient -> PriceCache -> PortfolioEngine -> engines.
 """
 from __future__ import annotations
 
-import time
-
-import structlog
+import logging
+from functools import lru_cache
+from typing import Optional
 
 from backend.binance.binance_client import BinanceClient
-from backend.config import Settings, get_settings
-from backend.core.automation_engine import AutomationEngine, EventEmitter
+from backend.config import get_settings
+from backend.core.automation_engine import AutomationEngine
 from backend.core.execution_engine import ExecutionEngine
+from backend.core.ohlcv_provider import OHLCVProvider
 from backend.core.portfolio_engine import PortfolioEngine
+from backend.core.price_cache import PriceCache
 from backend.core.risk_manager import RiskManager
-from backend.core.strategy_engine import (
-    BreakoutStrategy,
-    CompositeStrategy,
-    MeanReversionStrategy,
-    TrendFollowingStrategy,
-)
-from backend.journal.journal import TradeJournal
+from backend.core.strategy_engine import CompositeStrategy
+from backend.journal.trade_journal import TradeJournal
 from backend.journal.telegram_alerts import TelegramAlerter
 
-log = structlog.get_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class AppState:
-    """Central dependency container — one instance per process."""
+    """
+    Singleton container — initializat o singura data in lifespan.
+    Toate componentele sunt accesate prin Depends(get_state).
+    """
 
-    def __init__(self, settings: Settings | None = None):
-        self.settings = settings or get_settings()
-        self.start_time: float = time.monotonic()
+    def __init__(self) -> None:
+        cfg = get_settings()
 
-        # Binance clients
-        self.spot_client = BinanceClient(mode="SPOT")
-        self.futures_client: BinanceClient | None = (
-            BinanceClient(mode="FUTURES") if self.settings.futures_enabled else None
-        )
-
-        # Core components (initialized in setup())
-        self.risk = RiskManager()
-        self.portfolio: PortfolioEngine | None = None
-        self.execution: ExecutionEngine | None = None
-        self.automation: AutomationEngine | None = None
+        # Infrastructure
+        self.client = BinanceClient()
+        self.price_cache = PriceCache(self.client, refresh_interval=30.0)
+        self.ohlcv = OHLCVProvider(self.client)
         self.journal = TradeJournal()
-        self.telegram = TelegramAlerter()
-        self.emitter = EventEmitter()
-
-        # WS broadcast callable — set by websocket.py after app creation
-        self.ws_broadcast = None
-
-    async def setup(self) -> None:
-        """Async init: open HTTP sessions, build all components."""
-        log.info("state_setup_begin")
-
-        # Open HTTP clients
-        await self.spot_client.__aenter__()
-        if self.futures_client is not None:
-            await self.futures_client.__aenter__()
-
-        # Journal + telegram
-        await self.journal.setup()
-
-        # Execution engine: handles its own exchange_info cache refresh in setup()
-        self.execution = ExecutionEngine(
-            spot_client=self.spot_client,
-            futures_client=self.futures_client,
-            ws_broadcast=self._ws_broadcast_wrapper,
+        self.telegram = TelegramAlerter(
+            token=cfg.TELEGRAM_BOT_TOKEN,
+            chat_id=cfg.TELEGRAM_CHAT_ID,
         )
-        await self.execution.setup()
 
-        # Portfolio engine
+        # Core engines
         self.portfolio = PortfolioEngine(
-            binance_client=self.spot_client,
-            risk_manager=self.risk,
+            client=self.client,
+            price_cache=self.price_cache,
+            mode=cfg.MARKET_MODE,
         )
-
-        # Build per-symbol strategy dict for automation
-        # Key = symbol, "*" = fallback for any unlisted symbol
-        strategy_map = {}
-        whitelist = self.settings.symbol_whitelist
-        for sym in whitelist:
-            tf = TrendFollowingStrategy(sym, self.settings.primary_timeframe)
-            mr = MeanReversionStrategy(sym, self.settings.primary_timeframe)
-            bo = BreakoutStrategy(sym, self.settings.primary_timeframe)
-            strategy_map[sym] = CompositeStrategy(
-                strategies=[(tf, 0.4), (mr, 0.3), (bo, 0.3)],
-                symbol=sym,
-                timeframe=self.settings.primary_timeframe,
-            )
-
+        self.risk = RiskManager()
+        self.execution = ExecutionEngine(
+            client=self.client,
+            dry_run=cfg.DRY_RUN,
+        )
+        self.strategy = CompositeStrategy(
+            symbols=cfg.SYMBOL_WHITELIST,
+        )
         self.automation = AutomationEngine(
-            strategy=strategy_map,
-            portfolio_engine=self.portfolio,
-            risk_manager=self.risk,
-            execution_engine=self.execution,
-            binance_client=self.spot_client,
-            ws_broadcast=self._ws_broadcast_wrapper,
+            strategy=self.strategy,
+            ohlcv=self.ohlcv,
+            risk=self.risk,
+            execution=self.execution,
+            portfolio=self.portfolio,
             journal=self.journal,
             telegram=self.telegram,
         )
 
-        log.info("state_setup_complete", symbols=whitelist)
+    async def setup(self) -> None:
+        """Porneste toate serviciile async in ordine corecta."""
+        await self.client.start()
+        logger.info("BinanceClient started (testnet=%s, dry_run=%s)",
+                    get_settings().TESTNET, get_settings().DRY_RUN)
 
-    async def _ws_broadcast_wrapper(self, event_type, payload: dict) -> None:
-        """Forward events to the WebSocket hub if it's been registered."""
-        if self.ws_broadcast is not None:
-            try:
-                await self.ws_broadcast(event_type, payload)
-            except Exception as exc:
-                log.warning("ws_broadcast_error", error=str(exc))
+        await self.price_cache.start()
+        ready = await self.price_cache.wait_ready(timeout=15.0)
+        if not ready:
+            logger.warning("PriceCache not ready after 15s — continuing anyway")
+
+        await self.journal.init()
+        logger.info("TradeJournal initialized")
+
+        result = await self.portfolio.reconcile()
+        if result.success:
+            logger.info("Reconciliation OK — trading enabled")
+        else:
+            logger.error("Reconciliation FAILED: %s — trading BLOCKED", result.error)
+
+        await self.automation.start()
+        logger.info("AutomationEngine started")
+
+    async def teardown(self) -> None:
+        """Opreste toate serviciile in ordine inversa."""
+        await self.automation.stop()
+        await self.price_cache.stop()
+        await self.client.stop()
+        logger.info("AppState teardown complete")
+
+
+_state: Optional[AppState] = None
+
+
+def get_state() -> AppState:
+    """FastAPI Depends() factory — returneaza singleton-ul AppState."""
+    if _state is None:
+        raise RuntimeError("AppState not initialized — call init_state() first")
+    return _state
+
+
+def init_state() -> AppState:
+    global _state
+    _state = AppState()
+    return _state
