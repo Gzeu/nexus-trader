@@ -15,9 +15,15 @@ from backend.core.ohlcv_provider import OHLCVProvider
 from backend.core.portfolio_engine import PortfolioEngine
 from backend.core.price_cache import PriceCache
 from backend.core.risk_manager import RiskManager
-from backend.core.strategy_engine import CompositeStrategy
+from backend.core.strategy_engine import (
+    BreakoutStrategy,
+    CompositeStrategy,
+    MeanReversionStrategy,
+    TrendFollowingStrategy,
+)
 from backend.journal.trade_journal import TradeJournal
 from backend.journal.telegram_alerts import TelegramAlerter
+from backend.models import MarketMode
 
 logger = logging.getLogger(__name__)
 
@@ -27,15 +33,19 @@ class AppState:
     Singleton container — initializat o singura data in lifespan.
     Toate componentele sunt accesate prin Depends(get_state).
 
-    NOTE (Pydantic v2): BaseSettings normalizeaza campurile la lowercase.
-    Foloseste cfg.telegram_bot_token, cfg.dry_run, cfg.market_mode etc.
-    NOTE (ExecutionEngine): __init__ primeste spot_client/futures_client/
-    ws_broadcast, nu 'client' sau 'dry_run' — dry_run este citit intern
-    din get_settings().
+    FIX: CompositeStrategy primeste 'symbol' (str, primul din whitelist) +
+         sub-strategies explicit wirate, nu 'symbols' (list) care nu exista
+         in BaseStrategy.__init__.
     """
 
     def __init__(self) -> None:
         cfg = get_settings()
+
+        # Primul simbol din whitelist ca simbol implicit al composite strategy
+        primary_symbol: str = (
+            cfg.symbol_whitelist[0] if cfg.symbol_whitelist else "BTCUSDT"
+        )
+        market_mode = cfg.market_mode  # MarketMode enum
 
         # ── Infrastructure ─────────────────────────────────────────
         self.client = BinanceClient()
@@ -51,7 +61,7 @@ class AppState:
         self.portfolio = PortfolioEngine(
             client=self.client,
             price_cache=self.price_cache,
-            mode=cfg.market_mode,
+            mode=market_mode,
         )
         self.risk = RiskManager()
 
@@ -59,12 +69,29 @@ class AppState:
         # dry_run este citit intern din get_settings() — nu se paseaza ca argument
         self.execution = ExecutionEngine(
             spot_client=self.client,
-            futures_client=None,          # se poate inlocui cu un FuturesClient dedicat
-            ws_broadcast=None,            # se seteaza post-init in setup() dupa ce WS hub e gata
+            futures_client=None,   # se poate inlocui cu un FuturesClient dedicat
+            ws_broadcast=None,     # se seteaza post-init in setup() dupa ce WS hub e gata
         )
+
+        # Sub-strategies partajate — fiecare primeste symbol + market_mode
+        _shared_kwargs = dict(symbol=primary_symbol, market_mode=market_mode)
+        sub_strategies = [
+            TrendFollowingStrategy(**_shared_kwargs),
+            MeanReversionStrategy(**_shared_kwargs),
+            BreakoutStrategy(**_shared_kwargs),
+        ]
         self.strategy = CompositeStrategy(
-            symbols=cfg.symbol_whitelist,
+            symbol=primary_symbol,
+            market_mode=market_mode,
+            strategies=sub_strategies,
+            weights={
+                "TrendFollowingStrategy": 1.2,
+                "MeanReversionStrategy":  0.9,
+                "BreakoutStrategy":       1.0,
+            },
+            min_consensus=0.55,
         )
+
         self.automation = AutomationEngine(
             strategy=self.strategy,
             ohlcv=self.ohlcv,
