@@ -27,37 +27,43 @@ class AppState:
     Singleton container — initializat o singura data in lifespan.
     Toate componentele sunt accesate prin Depends(get_state).
 
-    NOTE: Pydantic v2 BaseSettings expune campurile in lowercase indiferent
-    de cum sunt definite in .env (case_sensitive=False). Foloseste intotdeauna
-    cfg.telegram_bot_token, cfg.dry_run, cfg.market_mode etc.
+    NOTE (Pydantic v2): BaseSettings normalizeaza campurile la lowercase.
+    Foloseste cfg.telegram_bot_token, cfg.dry_run, cfg.market_mode etc.
+    NOTE (ExecutionEngine): __init__ primeste spot_client/futures_client/
+    ws_broadcast, nu 'client' sau 'dry_run' — dry_run este citit intern
+    din get_settings().
     """
 
     def __init__(self) -> None:
         cfg = get_settings()
 
-        # ── Infrastructure ────────────────────────────────────────────
+        # ── Infrastructure ─────────────────────────────────────────
         self.client = BinanceClient()
         self.price_cache = PriceCache(self.client, refresh_interval=30.0)
         self.ohlcv = OHLCVProvider(self.client)
         self.journal = TradeJournal()
         self.telegram = TelegramAlerter(
-            token=cfg.telegram_bot_token,        # lowercase — Pydantic v2
+            token=cfg.telegram_bot_token,
             chat_id=cfg.telegram_chat_id,
         )
 
-        # ── Core engines ──────────────────────────────────────────────
+        # ── Core engines ───────────────────────────────────────────
         self.portfolio = PortfolioEngine(
             client=self.client,
             price_cache=self.price_cache,
-            mode=cfg.market_mode,                # lowercase
+            mode=cfg.market_mode,
         )
         self.risk = RiskManager()
+
+        # ExecutionEngine.__init__(self, spot_client, futures_client=None, ws_broadcast=None)
+        # dry_run este citit intern din get_settings() — nu se paseaza ca argument
         self.execution = ExecutionEngine(
-            client=self.client,
-            dry_run=cfg.dry_run,                 # lowercase
+            spot_client=self.client,
+            futures_client=None,          # se poate inlocui cu un FuturesClient dedicat
+            ws_broadcast=None,            # se seteaza post-init in setup() dupa ce WS hub e gata
         )
         self.strategy = CompositeStrategy(
-            symbols=cfg.symbol_whitelist,        # lowercase
+            symbols=cfg.symbol_whitelist,
         )
         self.automation = AutomationEngine(
             strategy=self.strategy,
@@ -83,6 +89,9 @@ class AppState:
         ready = await self.price_cache.wait_ready(timeout=15.0)
         if not ready:
             logger.warning("PriceCache not ready after 15s — continuing anyway")
+
+        await self.execution.setup()
+        logger.info("ExecutionEngine initialized (idempotency store ready)")
 
         await self.journal.init()
         logger.info("TradeJournal initialized")

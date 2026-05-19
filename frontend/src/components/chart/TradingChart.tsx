@@ -1,24 +1,17 @@
 'use client'
 /**
- * TradingChart.tsx — v3.2 (3 targeted fixes)
+ * TradingChart.tsx — v3.3
  * ─────────────────────────────────────────────────────────────────────────────
- * FIX 1 — MACD sync race at mount
- *   The MACD useEffect now calls loadData's populate block directly via
- *   a stable populateMACDPane() callback held in a ref, so if MACD is
- *   toggled on before loadData resolves the effect registers the callback
- *   and loadData calls it when data arrives; if data is already loaded the
- *   callback fires immediately on mount — no ordering dependency.
+ * FIX 4 — lightweight-charts v4 API migration
+ *   v4 removed the deprecated chart.addCandlestickSeries() / addLineSeries() /
+ *   addHistogramSeries() shorthand methods in favour of the explicit
+ *   chart.addSeries(SeriesType, options) overload.
+ *   All series creation calls are updated to the v4 API:
+ *     chart.addCandlestickSeries(opts)  →  chart.addSeries(CandlestickSeries, opts)
+ *     chart.addLineSeries(opts)         →  chart.addSeries(LineSeries, opts)
+ *     chart.addHistogramSeries(opts)    →  chart.addSeries(HistogramSeries, opts)
  *
- * FIX 2 — barSpacing cast (TypeScript-safe)
- *   Replaced (ts.options() as { barSpacing: number }).barSpacing with
- *   (ts.options() as Record<string, unknown>).barSpacing
- *   + Number() coercion + nullish fallback of 8, so strict TS won't error.
- *
- * FIX 3 — fetch24hChange NaN guard
- *   d?.priceChangePercent is now optional-chained, parsed safely through
- *   parseFloat, and validated with isFinite before being returned.
- *   An error response from Binance (invalid symbol, rate-limit etc.)
- *   yields null instead of NaN.
+ * FIX 1–3 from v3.2 are retained (MACD race, barSpacing cast, NaN guard).
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react'
@@ -33,6 +26,9 @@ import {
   CandlestickData,
   HistogramData,
   SeriesMarker,
+  CandlestickSeries,
+  LineSeries,
+  HistogramSeries,
 } from 'lightweight-charts'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -137,7 +133,7 @@ function calcMACD(closes: number[]): {
   const signal    = sigFull.slice(sigOffset)
   const macd      = macdSlice.slice(sigOffset)
   const hist      = macd.map((m, i) => m - signal[i])
-  const startIdx  = 26 + sigOffset  // = 34
+  const startIdx  = 26 + sigOffset
   return { macd, signal, hist, startIdx }
 }
 
@@ -173,8 +169,6 @@ async function fetchCandles(symbol: string, interval: string, limit = 500): Prom
 
 /**
  * FIX 3 — NaN guard on priceChangePercent.
- * d may be an error object if the symbol is invalid or Binance returns 4xx.
- * We optional-chain the field, parse safely, and return null for non-finite values.
  */
 async function fetch24hChange(symbol: string): Promise<number | null> {
   try {
@@ -273,15 +267,7 @@ export function TradingChart({
   const candleDataRef = useRef<Candle[]>([])
   const priceLineRefs = useRef<ReturnType<ISeriesApi<'Candlestick'>['createPriceLine']>[]>([])
 
-  /**
-   * FIX 1 — MACD sync race.
-   * populateMACDPaneRef holds a stable callback that fills macd/signal/hist
-   * series from candleDataRef.current.  It is written by the MACD useEffect
-   * after the pane is mounted, and called by loadData after candles are set.
-   * If loadData already ran before the MACD effect fires, the effect calls it
-   * immediately on registration because candleDataRef already has data.
-   * Either way the series always gets populated — no race condition.
-   */
+  // FIX 1 — stable MACD populate ref (v3.2)
   const populateMACDPaneRef = useRef<(() => void) | null>(null)
 
   const [symbol,     setSymbol]     = useState(initSymbol)
@@ -321,18 +307,23 @@ export function TradingChart({
       timeScale: { borderColor: C.border, timeVisible: true, secondsVisible: false },
       handleScroll: true, handleScale: true,
     })
-    const candles = chart.addCandlestickSeries({
+
+    // FIX 4 — LWC v4 API: chart.addSeries(SeriesType, options)
+    const candles = chart.addSeries(CandlestickSeries, {
       upColor: C.green, downColor: C.red,
       borderUpColor: C.green, borderDownColor: C.red,
       wickUpColor: C.green, wickDownColor: C.red,
     })
-    const volume = chart.addHistogramSeries({ priceFormat: { type: 'volume' }, priceScaleId: 'volume' })
+    const volume = chart.addSeries(HistogramSeries, {
+      priceFormat: { type: 'volume' },
+      priceScaleId: 'volume',
+    })
     chart.priceScale('volume').applyOptions({ scaleMargins: { top: 0.82, bottom: 0 } })
-    const ema9     = chart.addLineSeries({ color: C.ema9,  lineWidth: 1, priceLineVisible: false, lastValueVisible: true,  crosshairMarkerVisible: false })
-    const ema21    = chart.addLineSeries({ color: C.ema21, lineWidth: 1, priceLineVisible: false, lastValueVisible: true,  crosshairMarkerVisible: false })
-    const bbUpper  = chart.addLineSeries({ color: C.bbUpper,  lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, lineStyle: LineStyle.Dashed, visible: false })
-    const bbMiddle = chart.addLineSeries({ color: C.bbMiddle, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, lineStyle: LineStyle.Dotted, visible: false })
-    const bbLower  = chart.addLineSeries({ color: C.bbLower,  lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, lineStyle: LineStyle.Dashed, visible: false })
+    const ema9     = chart.addSeries(LineSeries, { color: C.ema9,     lineWidth: 1, priceLineVisible: false, lastValueVisible: true,  crosshairMarkerVisible: false })
+    const ema21    = chart.addSeries(LineSeries, { color: C.ema21,    lineWidth: 1, priceLineVisible: false, lastValueVisible: true,  crosshairMarkerVisible: false })
+    const bbUpper  = chart.addSeries(LineSeries, { color: C.bbUpper,  lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, lineStyle: LineStyle.Dashed,  visible: false })
+    const bbMiddle = chart.addSeries(LineSeries, { color: C.bbMiddle, lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, lineStyle: LineStyle.Dotted, visible: false })
+    const bbLower  = chart.addSeries(LineSeries, { color: C.bbLower,  lineWidth: 1, priceLineVisible: false, lastValueVisible: false, crosshairMarkerVisible: false, lineStyle: LineStyle.Dashed,  visible: false })
 
     chart.subscribeCrosshairMove(param => {
       if (!param.time || param.point === undefined) { setTooltip(null); return }
@@ -347,9 +338,9 @@ export function TradingChart({
       })
     })
 
-    chartRef.current   = chart;   candleRef.current  = candles; volumeRef.current = volume
-    ema9Ref.current    = ema9;    ema21Ref.current   = ema21
-    bbUpperRef.current = bbUpper; bbMiddleRef.current = bbMiddle; bbLowerRef.current = bbLower
+    chartRef.current   = chart;    candleRef.current   = candles; volumeRef.current = volume
+    ema9Ref.current    = ema9;     ema21Ref.current    = ema21
+    bbUpperRef.current = bbUpper;  bbMiddleRef.current = bbMiddle; bbLowerRef.current = bbLower
 
     return () => {
       chart.remove()
@@ -370,7 +361,8 @@ export function TradingChart({
       timeScale: { borderColor: C.border, timeVisible: true, secondsVisible: false, visible: false },
       handleScroll: true, handleScale: false,
     })
-    const rsiSeries = rsiChart.addLineSeries({ color: C.rsi, lineWidth: 1, priceLineVisible: false, lastValueVisible: true })
+    // FIX 4 — v4 API
+    const rsiSeries = rsiChart.addSeries(LineSeries, { color: C.rsi, lineWidth: 1, priceLineVisible: false, lastValueVisible: true })
     rsiSeries.createPriceLine({ price: 70, color: C.red,       lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true,  title: 'OB' })
     rsiSeries.createPriceLine({ price: 30, color: C.green,     lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true,  title: 'OS' })
     rsiSeries.createPriceLine({ price: 50, color: C.textFaint, lineWidth: 1, lineStyle: LineStyle.Dotted, axisLabelVisible: false, title: '' })
@@ -398,9 +390,10 @@ export function TradingChart({
       timeScale: { borderColor: C.border, timeVisible: true, secondsVisible: false, visible: false },
       handleScroll: true, handleScale: false,
     })
-    const macdLine = macdChart.addLineSeries({ color: C.macd,   lineWidth: 1, priceLineVisible: false, lastValueVisible: true })
-    const macdSig  = macdChart.addLineSeries({ color: C.signal, lineWidth: 1, priceLineVisible: false, lastValueVisible: true })
-    const macdHist = macdChart.addHistogramSeries({ priceScaleId: 'right', priceFormat: { type: 'price', precision: 4 } })
+    // FIX 4 — v4 API
+    const macdLine = macdChart.addSeries(LineSeries,      { color: C.macd,   lineWidth: 1, priceLineVisible: false, lastValueVisible: true })
+    const macdSig  = macdChart.addSeries(LineSeries,      { color: C.signal, lineWidth: 1, priceLineVisible: false, lastValueVisible: true })
+    const macdHist = macdChart.addSeries(HistogramSeries, { priceScaleId: 'right', priceFormat: { type: 'price', precision: 4 } })
 
     macdChartRef.current = macdChart
     macdLineRef.current  = macdLine
@@ -412,8 +405,6 @@ export function TradingChart({
     chartRef.current?.timeScale().subscribeVisibleLogicalRangeChange(syncMacd)
     macdChart.timeScale().subscribeVisibleLogicalRangeChange(syncMain)
 
-    // Register stable populate callback — called either now (data ready) or
-    // later by loadData once candles arrive.
     const populate = () => {
       const data = candleDataRef.current
       if (data.length < 35) return
@@ -426,7 +417,7 @@ export function TradingChart({
       })))
     }
     populateMACDPaneRef.current = populate
-    populate() // immediate call: no-op if data not yet loaded, populates if already loaded
+    populate()
 
     return () => {
       populateMACDPaneRef.current = null
@@ -481,9 +472,7 @@ export function TradingChart({
         bbLowerRef.current?.setData(data.slice(bb.startIdx).map((c, i)  => ({ time: c.time, value: bb.lower[i]  })))
       }
 
-      // FIX 1: call the MACD populate callback if the pane is already mounted.
-      // If it's not mounted yet, the MACD useEffect will call populate() itself
-      // via populateMACDPaneRef after mounting — data is already in candleDataRef.
+      // FIX 1: call the MACD populate callback if the pane is already mounted
       populateMACDPaneRef.current?.()
 
       chartRef.current?.timeScale().fitContent()
@@ -496,7 +485,6 @@ export function TradingChart({
       setLoading(false)
     }
 
-    // ── Binance live WS ──
     const stream = `${sym.toLowerCase()}@kline_${tf}`
     const bWS = createAutoWS(
       () => `wss://stream.binance.com:9443/ws/${stream}`,
@@ -646,8 +634,7 @@ export function TradingChart({
           e.preventDefault(); break
         }
         case '+': {
-          // FIX 2 — type-safe barSpacing read with Record<string, unknown> cast
-          // + Number() coercion + nullish fallback to avoid strict TS error
+          // FIX 2 — type-safe barSpacing read (v3.2)
           const cur = Number((ts.options() as Record<string, unknown>).barSpacing) || 8
           ts.applyOptions({ barSpacing: Math.min(cur + 2, 50) })
           break
@@ -680,9 +667,6 @@ export function TradingChart({
   const macdHeight = showMACD ? 110 : 0
   const mainHeight = height - rsiHeight - macdHeight - (showRsi ? 4 : 0) - (showMACD ? 4 : 0)
 
-  // ─────────────────────────────────────────────────────────────────────────
-  // Render
-  // ─────────────────────────────────────────────────────────────────────────
   return (
     <div
       ref={wrapRef}
@@ -698,14 +682,10 @@ export function TradingChart({
     >
       {/* ── Toolbar ────────────────────────────────────────────────────────── */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderBottom: `1px solid ${C.border}`, background: C.surface, flexWrap: 'wrap' }}>
-
-        {/* Symbol */}
         <select value={symbol} onChange={e => handleSymbol(e.target.value)}
           style={{ background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 4, padding: '3px 8px', fontSize: 12, fontWeight: 700, cursor: 'pointer', outline: 'none' }}>
           {SYMBOLS.map(s => <option key={s} value={s}>{s}</option>)}
         </select>
-
-        {/* Timeframes */}
         <div style={{ display: 'flex', gap: 2 }}>
           {TIMEFRAMES.map(tf => (
             <button key={tf} onClick={() => handleTimeframe(tf)}
@@ -714,8 +694,6 @@ export function TradingChart({
             </button>
           ))}
         </div>
-
-        {/* Indicator chips */}
         <div style={{ display: 'flex', gap: 4, marginLeft: 4 }}>
           {([
             { label: 'EMA',  active: true,       disabled: true,  onClick: undefined },
@@ -742,8 +720,6 @@ export function TradingChart({
             )
           })}
         </div>
-
-        {/* EMA legend */}
         <div style={{ display: 'flex', gap: 6, marginLeft: 2 }}>
           {[{c: C.ema9, l: 'EMA9'}, {c: C.ema21, l: 'EMA21'}].map(({c, l}) => (
             <span key={l} style={{ fontSize: 10, color: c, display: 'flex', alignItems: 'center', gap: 3 }}>
@@ -751,8 +727,6 @@ export function TradingChart({
             </span>
           ))}
         </div>
-
-        {/* Right: price + 24h + WS dot + fullscreen */}
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
           {loading && <span style={{ fontSize: 11, color: C.textFaint }}>Loading…</span>}
           {error   && <span style={{ fontSize: 11, color: C.red, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>⚠ {error}</span>}
@@ -766,8 +740,7 @@ export function TradingChart({
               {change24h >= 0 ? '+' : ''}{change24h.toFixed(2)}%
             </span>
           )}
-          <span
-            title={wsLive ? 'Live' : 'Connecting…'}
+          <span title={wsLive ? 'Live' : 'Connecting…'}
             style={{ width: 7, height: 7, borderRadius: '50%', background: wsLive ? C.green : C.textFaint, display: 'inline-block', transition: 'background 300ms ease', animation: wsLive ? 'ws-pulse 2s ease-in-out infinite' : 'none' }}
           />
           <button onClick={() => setFullscreen(f => !f)} title={fullscreen ? 'Exit fullscreen (Esc)' : 'Fullscreen (F)'}
@@ -777,14 +750,10 @@ export function TradingChart({
         </div>
       </div>
 
-      {/* WS pulse keyframe */}
       <style>{`@keyframes ws-pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }`}</style>
 
-      {/* ── Main chart ─────────────────────────────────────────────────────── */}
       <div style={{ position: 'relative', flex: fullscreen ? 1 : 'none' }}>
         <div ref={containerRef} style={{ width: '100%', height: fullscreen ? '100%' : mainHeight }} />
-
-        {/* OHLCV tooltip */}
         {tooltip && (
           <div style={{ position: 'absolute', top: 8, left: 12, pointerEvents: 'none', background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 6, padding: '6px 10px', fontSize: 11, color: C.textMuted, lineHeight: 1.6, zIndex: 10 }}>
             <div style={{ color: C.textFaint, marginBottom: 2, fontSize: 10 }}>{tooltip.time}</div>
@@ -800,7 +769,6 @@ export function TradingChart({
         )}
       </div>
 
-      {/* ── RSI pane ───────────────────────────────────────────────────────── */}
       {showRsi && (
         <>
           <div style={{ borderTop: `1px solid ${C.border}`, padding: '2px 12px', background: C.surface2, fontSize: 10, color: C.textFaint, display: 'flex', gap: 12 }}>
@@ -812,7 +780,6 @@ export function TradingChart({
         </>
       )}
 
-      {/* ── MACD pane ──────────────────────────────────────────────────────── */}
       {showMACD && (
         <>
           <div style={{ borderTop: `1px solid ${C.border}`, padding: '2px 12px', background: C.surface2, fontSize: 10, color: C.textFaint, display: 'flex', gap: 12 }}>
@@ -826,18 +793,13 @@ export function TradingChart({
         </>
       )}
 
-      {/* ── Legend footer ──────────────────────────────────────────────────── */}
       <div style={{ display: 'flex', gap: 14, padding: '5px 12px', borderTop: `1px solid ${C.border}`, background: C.surface, fontSize: 10, color: C.textFaint, flexWrap: 'wrap', alignItems: 'center' }}>
         {[
           { color: C.green,   label: 'Bull' },
           { color: C.red,     label: 'Bear' },
           { color: C.ema9,    label: 'EMA9' },
           { color: C.ema21,   label: 'EMA21' },
-          ...(showBB ? [
-            { color: C.bbUpper,  label: 'BB Upper' },
-            { color: C.bbMiddle, label: 'BB Mid' },
-            { color: C.bbLower,  label: 'BB Lower' },
-          ] : []),
+          ...(showBB ? [{ color: C.bbUpper, label: 'BB Upper' }, { color: C.bbMiddle, label: 'BB Mid' }, { color: C.bbLower, label: 'BB Lower' }] : []),
           ...(showMACD ? [{ color: C.macd, label: 'MACD' }, { color: C.signal, label: 'Signal' }] : []),
           { color: C.blue,    label: 'Entry' },
           { color: C.slLine,  label: 'SL' },
