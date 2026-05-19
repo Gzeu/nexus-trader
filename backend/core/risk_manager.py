@@ -1,6 +1,10 @@
 """
 risk_manager.py – Pre-trade risk gate, daily loss tracker, drawdown guard,
 cooldown, consecutive-loss circuit breaker, and volatility/spread filters.
+
+FIX 1: _check_rr() now resolves entry price from metadata["last_close"] for
+        market orders where entry_price=None — prevents silent RR bypass.
+FIX 3: _sharpe() uses percentage returns (pnl/equity) not absolute PnL values.
 """
 from __future__ import annotations
 
@@ -142,9 +146,19 @@ class RiskManager:
         return (self.equity - self.daily_start_equity) / self.daily_start_equity
 
     def _check_rr(self, signal: StrategySignal) -> bool:
-        entry = signal.entry_price or 0
-        if entry <= 0:
-            return True
+        """
+        FIX 1: Resolve entry price from metadata["last_close"] for market orders.
+        Previously entry_price=None (market orders) caused silent skip of RR check.
+        Now we always verify RR using the best available price estimate.
+        """
+        entry = signal.entry_price or signal.metadata.get("last_close", 0.0)
+        if not entry or entry <= 0:
+            log.warning(
+                "rr_check_skipped_no_price",
+                symbol=signal.symbol,
+                action=str(signal.action),
+            )
+            return True  # cannot verify — pass with warning
         tp1 = signal.take_profit_1
         sl = signal.stop_loss
         if signal.action.value == "BUY":
@@ -154,18 +168,35 @@ class RiskManager:
             risk = sl - entry
             reward = entry - tp1
         if risk <= 0:
+            log.warning("rr_invalid_risk_zero", symbol=signal.symbol, entry=entry, sl=sl)
             return False
-        return (reward / risk) >= settings.min_rr
+        rr = reward / risk
+        ok = rr >= settings.min_rr
+        if not ok:
+            log.warning(
+                "rr_too_low",
+                symbol=signal.symbol,
+                rr=round(rr, 3),
+                min_rr=settings.min_rr,
+                entry=entry,
+            )
+        return ok
 
     def _sharpe(self, risk_free: float = 0.0) -> float:
-        if len(self._pnl_history) < 2:
+        """
+        FIX 3: Sharpe on percentage returns (pnl/equity) — not absolute PnL.
+        Absolute values were incomparable across accounts of different sizes
+        and degraded artificially as equity grew.
+        """
+        if len(self._pnl_history) < 2 or self.equity <= 0:
             return 0.0
         import statistics
-        avg = statistics.mean(self._pnl_history)
-        std = statistics.stdev(self._pnl_history)
+        returns = [p / self.equity for p in self._pnl_history]
+        avg = statistics.mean(returns)
+        std = statistics.stdev(returns)
         if std == 0:
             return 0.0
-        return (avg - risk_free) / std
+        return round((avg - risk_free) / std, 4)
 
     def _pause(self, reason: str, daily: bool = False) -> None:
         self.paused = True
