@@ -1,47 +1,52 @@
 version: "3.9"
 
 services:
-  nexus-trader:
-    build: .
-    container_name: nexus-trader
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: runtime
+    image: nexus-trader-backend:latest
+    container_name: nexus-trader-backend
     restart: unless-stopped
     ports:
       - "8000:8000"
     env_file:
       - .env
     volumes:
-      - ./journal:/app/journal
-      - nexus_db:/app
-    depends_on:
-      - redis
+      - journal_data:/app/journal_data
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/v1/health"]
       interval: 30s
-      timeout: 10s
+      timeout: 5s
       retries: 3
       start_period: 20s
     networks:
-      - nexus
+      - nexus-net
 
-  # Optional Redis for idempotency + caching
-  redis:
-    image: redis:7-alpine
-    container_name: nexus-redis
+  frontend:
+    image: node:20-alpine
+    container_name: nexus-trader-frontend
+    working_dir: /app
     restart: unless-stopped
-    command: redis-server --maxmemory 128mb --maxmemory-policy allkeys-lru
     ports:
-      - "6379:6379"
+      - "3000:3000"
+    volumes:
+      - ./frontend:/app
+    command: sh -c "npm install && npm run dev"
+    environment:
+      - NEXT_PUBLIC_API_URL=http://backend:8000
+      - NEXT_PUBLIC_WS_URL=ws://backend:8000
+    depends_on:
+      backend:
+        condition: service_healthy
     networks:
-      - nexus
-    healthcheck:
-      test: ["CMD", "redis-cli", "ping"]
-      interval: 10s
-      timeout: 5s
-      retries: 3
+      - nexus-net
 
 volumes:
-  nexus_db:
+  journal_data:
+    driver: local
 
 networks:
-  nexus:
+  nexus-net:
     driver: bridge

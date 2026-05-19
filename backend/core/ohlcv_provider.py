@@ -1,153 +1,101 @@
 """
-ohlcv_provider.py – Async OHLCV provider with 60-second in-memory cache.
+OHLCVProvider — fetches and caches OHLCV candles from Binance.
+Used by StrategyEngine to supply numpy arrays to each strategy.
 
-Completion 1: required by automation_engine to feed strategies.
+Features:
+- LRU-style in-memory cache per (symbol, interval)
+- Deduplicated requests via asyncio locks
+- Returns np.ndarray shape (N, 6): [ts, open, high, low, close, volume]
 """
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
+from typing import Optional
 
-from loguru import logger
+import numpy as np
 
-from backend.config import get_settings
-from backend.models import MarketMode
+logger = logging.getLogger(__name__)
 
-TF_MAP: Dict[str, str] = {
-    "1m":  "1m",
-    "5m":  "5m",
-    "15m": "15m",
-    "1h":  "1h",
-    "4h":  "4h",
-    "1d":  "1d",
+# Cache TTL per timeframe (seconds)
+_TTL: dict[str, float] = {
+    "1m": 60,
+    "3m": 180,
+    "5m": 300,
+    "15m": 900,
+    "30m": 1800,
+    "1h": 3600,
+    "4h": 14400,
+    "1d": 86400,
 }
-
-MIN_CANDLES_HARD = 20   # raise ValueError below this
-MIN_CANDLES_WARN = 50   # log warning below this
-
-
-@dataclass
-class OHLCV:
-    """Container for OHLCV data arrays (same length)."""
-    opens:      List[float]
-    highs:      List[float]
-    lows:       List[float]
-    closes:     List[float]
-    volumes:    List[float]
-    timestamps: List[int]   # milliseconds UTC
-
-    def __len__(self) -> int:
-        return len(self.closes)
-
-
-@dataclass
-class _CacheEntry:
-    ohlcv:      OHLCV
-    fetched_at: float   # time.monotonic()
+_DEFAULT_TTL = 300
+_LIMIT = 200  # candles per request
 
 
 class OHLCVProvider:
-    """
-    Fetches OHLCV candles from Binance Spot or Futures REST API.
-    Results are cached in-memory for 60 seconds per (symbol, timeframe, mode).
-    """
+    """Async OHLCV cache with per-key locks to prevent thundering herd."""
 
-    CACHE_TTL_SECONDS = 60
+    def __init__(self, client) -> None:
+        self._client = client
+        # {(symbol, interval): (timestamp_fetched, np.ndarray)}
+        self._cache: dict[tuple[str, str], tuple[float, np.ndarray]] = {}
+        self._locks: dict[tuple[str, str], asyncio.Lock] = {}
 
-    def __init__(self, binance_client: "BinanceClient") -> None:  # type: ignore[name-defined]
-        self._client = binance_client
-        self._cache: Dict[Tuple[str, str, str], _CacheEntry] = {}
-        self._lock = asyncio.Lock()
-
-    # ─── Public API ──────────────────────────────────────────────────────────
-
-    async def get_ohlcv(
+    async def get(
         self,
         symbol: str,
-        timeframe: str,
-        limit: int = 200,
-        market_mode: Optional[MarketMode] = None,
-    ) -> OHLCV:
+        interval: str = "5m",
+        limit: int = _LIMIT,
+        force_refresh: bool = False,
+    ) -> np.ndarray:
         """
-        Return OHLCV for (symbol, timeframe, mode).
-        Uses cache; fetches from Binance if stale or missing.
-
-        Raises:
-            ValueError: if the exchange returns fewer than MIN_CANDLES_HARD candles.
+        Return OHLCV array for symbol/interval.
+        Columns: [open_time_ms, open, high, low, close, volume]
         """
-        settings = get_settings()
-        mode = market_mode or MarketMode(settings.market_mode)
-        tf = TF_MAP.get(timeframe, timeframe)
-        cache_key = (symbol.upper(), tf, mode.value)
+        key = (symbol, interval)
+        ttl = _TTL.get(interval, _DEFAULT_TTL)
 
-        async with self._lock:
-            entry = self._cache.get(cache_key)
-            if entry and (time.monotonic() - entry.fetched_at) < self.CACHE_TTL_SECONDS:
-                logger.debug("ohlcv_cache_hit", symbol=symbol, tf=tf, mode=mode.value)
-                return entry.ohlcv
+        if not force_refresh:
+            cached = self._cache.get(key)
+            if cached and (time.monotonic() - cached[0]) < ttl:
+                return cached[1]
 
-        # Cache miss — fetch from Binance
-        logger.debug("ohlcv_fetch", symbol=symbol, tf=tf, mode=mode.value, limit=limit)
-        raw = await self._client.get_klines(
-            symbol=symbol.upper(),
-            interval=tf,
-            limit=limit,
-            futures=(mode == MarketMode.FUTURES),
+        lock = self._locks.setdefault(key, asyncio.Lock())
+        async with lock:
+            # Double-check after acquiring lock
+            cached = self._cache.get(key)
+            if not force_refresh and cached and (time.monotonic() - cached[0]) < ttl:
+                return cached[1]
+
+            arr = await self._fetch(symbol, interval, limit)
+            self._cache[key] = (time.monotonic(), arr)
+            return arr
+
+    async def invalidate(self, symbol: str, interval: Optional[str] = None) -> None:
+        """Remove cache entries for symbol (optionally specific interval)."""
+        keys = (
+            [(symbol, interval)]
+            if interval
+            else [k for k in self._cache if k[0] == symbol]
         )
+        for k in keys:
+            self._cache.pop(k, None)
 
-        ohlcv = self._parse(raw)
-        n = len(ohlcv)
+    # ------------------------------------------------------------------ #
+    # Internal
+    # ------------------------------------------------------------------ #
 
-        if n < MIN_CANDLES_HARD:
-            raise ValueError(
-                f"Insufficient candles for {symbol} {tf}: got {n}, need {MIN_CANDLES_HARD}"
+    async def _fetch(self, symbol: str, interval: str, limit: int) -> np.ndarray:
+        try:
+            raw = await self._client.get_klines(symbol, interval, limit=limit)
+            # Binance kline: [open_time, open, high, low, close, volume, ...]
+            arr = np.array(
+                [[float(c[0]), float(c[1]), float(c[2]), float(c[3]), float(c[4]), float(c[5])] for c in raw],
+                dtype=np.float64,
             )
-        if n < MIN_CANDLES_WARN:
-            logger.warning(
-                "ohlcv_low_candle_count",
-                symbol=symbol,
-                tf=tf,
-                count=n,
-                warn_threshold=MIN_CANDLES_WARN,
-            )
-
-        async with self._lock:
-            self._cache[cache_key] = _CacheEntry(ohlcv=ohlcv, fetched_at=time.monotonic())
-
-        return ohlcv
-
-    def invalidate(self, symbol: str, timeframe: str, mode: MarketMode) -> None:
-        """Force-expire a cache entry (e.g. after a trade fill)."""
-        tf = TF_MAP.get(timeframe, timeframe)
-        self._cache.pop((symbol.upper(), tf, mode.value), None)
-
-    def clear_cache(self) -> None:
-        """Clear all cached data."""
-        self._cache.clear()
-
-    # ─── Internal ───────────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _parse(raw: List[List]) -> OHLCV:
-        """
-        Parse Binance kline response.
-        Each element: [open_time, open, high, low, close, volume, ...]
-        """
-        timestamps, opens, highs, lows, closes, volumes = [], [], [], [], [], []
-        for k in raw:
-            timestamps.append(int(k[0]))
-            opens.append(float(k[1]))
-            highs.append(float(k[2]))
-            lows.append(float(k[3]))
-            closes.append(float(k[4]))
-            volumes.append(float(k[5]))
-        return OHLCV(
-            opens=opens,
-            highs=highs,
-            lows=lows,
-            closes=closes,
-            volumes=volumes,
-            timestamps=timestamps,
-        )
+            logger.debug("OHLCVProvider fetched %s %s — %d candles", symbol, interval, len(arr))
+            return arr
+        except Exception as exc:
+            logger.error("OHLCVProvider._fetch %s %s failed: %s", symbol, interval, exc)
+            return np.empty((0, 6), dtype=np.float64)
