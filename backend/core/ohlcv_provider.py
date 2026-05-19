@@ -1,179 +1,153 @@
 """
-ohlcv_provider.py – Async OHLCV fetcher with in-memory TTL cache.
+ohlcv_provider.py – Async OHLCV provider with 60-second in-memory cache.
 
-Provides a single OHLCVProvider class that:
-- Fetches klines from Binance Spot or Futures
-- Caches results for 60 seconds per (symbol, timeframe, market_mode)
-- Validates minimum candle count before returning
-- Accepts a BinanceClient injected at construction
-
-Usage:
-    provider = OHLCVProvider(spot_client=spot, futures_client=futures)
-    ohlcv = await provider.get_ohlcv("BTCUSDT", "15m", market_mode=MarketMode.SPOT)
+Completion 1: required by automation_engine to feed strategies.
 """
 from __future__ import annotations
 
 import asyncio
-from datetime import datetime, timedelta
-from typing import Dict, Optional, Tuple
+import time
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
-import structlog
+from loguru import logger
 
 from backend.config import get_settings
 from backend.models import MarketMode
-from backend.core.strategy_engine import OHLCV
 
-log = structlog.get_logger(__name__)
-settings = get_settings()
-
-# Minimum candle counts
-MIN_CANDLES_HARD = 20    # ValueError raised below this
-MIN_CANDLES_WARN = 50    # Warning logged below this
-
-# Supported timeframe aliases (Binance accepts these directly)
-VALID_TIMEFRAMES = {"1m", "3m", "5m", "15m", "30m", "1h", "2h", "4h", "6h", "8h", "12h", "1d", "3d", "1w"}
-
-# User-friendly aliases → Binance format
-TIMEFRAME_MAP: Dict[str, str] = {
-    "1min": "1m",
-    "5min": "5m",
-    "15min": "15m",
-    "30min": "30m",
-    "1hour": "1h",
-    "4hour": "4h",
-    "1day": "1d",
+TF_MAP: Dict[str, str] = {
+    "1m":  "1m",
+    "5m":  "5m",
+    "15m": "15m",
+    "1h":  "1h",
+    "4h":  "4h",
+    "1d":  "1d",
 }
 
+MIN_CANDLES_HARD = 20   # raise ValueError below this
+MIN_CANDLES_WARN = 50   # log warning below this
 
+
+@dataclass
+class OHLCV:
+    """Container for OHLCV data arrays (same length)."""
+    opens:      List[float]
+    highs:      List[float]
+    lows:       List[float]
+    closes:     List[float]
+    volumes:    List[float]
+    timestamps: List[int]   # milliseconds UTC
+
+    def __len__(self) -> int:
+        return len(self.closes)
+
+
+@dataclass
 class _CacheEntry:
-    __slots__ = ("ohlcv", "expires_at")
-
-    def __init__(self, ohlcv: OHLCV, ttl_seconds: int = 60):
-        self.ohlcv      = ohlcv
-        self.expires_at = datetime.utcnow() + timedelta(seconds=ttl_seconds)
-
-    @property
-    def is_fresh(self) -> bool:
-        return datetime.utcnow() < self.expires_at
+    ohlcv:      OHLCV
+    fetched_at: float   # time.monotonic()
 
 
 class OHLCVProvider:
     """
-    Async OHLCV provider with 60-second TTL cache.
-
-    Args:
-        spot_client:    Binance Spot client (required)
-        futures_client: Binance Futures client (optional)
-        cache_ttl:      Cache TTL in seconds (default 60)
+    Fetches OHLCV candles from Binance Spot or Futures REST API.
+    Results are cached in-memory for 60 seconds per (symbol, timeframe, mode).
     """
 
-    def __init__(self, spot_client, futures_client=None, cache_ttl: int = 60):
-        self._spot     = spot_client
-        self._futures  = futures_client
-        self._cache:   Dict[Tuple[str, str, str], _CacheEntry] = {}
-        self._ttl      = cache_ttl
-        self._lock     = asyncio.Lock()
+    CACHE_TTL_SECONDS = 60
+
+    def __init__(self, binance_client: "BinanceClient") -> None:  # type: ignore[name-defined]
+        self._client = binance_client
+        self._cache: Dict[Tuple[str, str, str], _CacheEntry] = {}
+        self._lock = asyncio.Lock()
+
+    # ─── Public API ──────────────────────────────────────────────────────────
 
     async def get_ohlcv(
         self,
-        symbol:      str,
-        timeframe:   str,
-        limit:       int = 200,
-        market_mode: MarketMode = MarketMode.SPOT,
+        symbol: str,
+        timeframe: str,
+        limit: int = 200,
+        market_mode: Optional[MarketMode] = None,
     ) -> OHLCV:
         """
-        Fetch OHLCV data, serving from cache when fresh.
-
-        Args:
-            symbol:      Trading pair, e.g. "BTCUSDT"
-            timeframe:   Interval string, e.g. "15m", "1h"
-            limit:       Number of candles to fetch (default 200)
-            market_mode: SPOT or FUTURES
-
-        Returns:
-            OHLCV wrapper with confirmed-close accessors
+        Return OHLCV for (symbol, timeframe, mode).
+        Uses cache; fetches from Binance if stale or missing.
 
         Raises:
-            ValueError: If fewer than MIN_CANDLES_HARD candles returned
+            ValueError: if the exchange returns fewer than MIN_CANDLES_HARD candles.
         """
-        tf = self._normalize_timeframe(timeframe)
-        cache_key = (symbol, tf, market_mode.value if hasattr(market_mode, "value") else str(market_mode))
+        settings = get_settings()
+        mode = market_mode or MarketMode(settings.market_mode)
+        tf = TF_MAP.get(timeframe, timeframe)
+        cache_key = (symbol.upper(), tf, mode.value)
 
         async with self._lock:
             entry = self._cache.get(cache_key)
-            if entry and entry.is_fresh:
-                log.debug("ohlcv_cache_hit", symbol=symbol, tf=tf)
+            if entry and (time.monotonic() - entry.fetched_at) < self.CACHE_TTL_SECONDS:
+                logger.debug("ohlcv_cache_hit", symbol=symbol, tf=tf, mode=mode.value)
                 return entry.ohlcv
 
-        # Fetch outside lock to allow concurrent fetches on different symbols
-        ohlcv = await self._fetch(symbol, tf, limit, market_mode)
+        # Cache miss — fetch from Binance
+        logger.debug("ohlcv_fetch", symbol=symbol, tf=tf, mode=mode.value, limit=limit)
+        raw = await self._client.get_klines(
+            symbol=symbol.upper(),
+            interval=tf,
+            limit=limit,
+            futures=(mode == MarketMode.FUTURES),
+        )
 
-        async with self._lock:
-            self._cache[cache_key] = _CacheEntry(ohlcv, ttl_seconds=self._ttl)
+        ohlcv = self._parse(raw)
+        n = len(ohlcv)
 
-        return ohlcv
-
-    async def invalidate(self, symbol: str, timeframe: str, market_mode: MarketMode) -> None:
-        """Force cache invalidation for a specific key (e.g. after a fill)."""
-        tf = self._normalize_timeframe(timeframe)
-        key = (symbol, tf, market_mode.value if hasattr(market_mode, "value") else str(market_mode))
-        async with self._lock:
-            self._cache.pop(key, None)
-        log.debug("ohlcv_cache_invalidated", symbol=symbol, tf=tf)
-
-    def cache_size(self) -> int:
-        """Number of cached OHLCV entries."""
-        return len(self._cache)
-
-    # ── Private ──────────────────────────────────────────────────────────────
-
-    async def _fetch(
-        self,
-        symbol:      str,
-        timeframe:   str,
-        limit:       int,
-        market_mode: MarketMode,
-    ) -> OHLCV:
-        """Fetch raw klines from exchange and wrap in OHLCV."""
-        client = self._client(market_mode)
-        try:
-            klines = await client.get_klines(symbol, timeframe, limit=limit)
-        except Exception as exc:
-            log.error("ohlcv_fetch_failed", symbol=symbol, tf=timeframe, error=str(exc))
-            raise
-
-        count = len(klines) if klines else 0
-
-        if count < MIN_CANDLES_HARD:
+        if n < MIN_CANDLES_HARD:
             raise ValueError(
-                f"Insufficient candles for {symbol}/{timeframe}: "
-                f"got {count}, need at least {MIN_CANDLES_HARD}"
+                f"Insufficient candles for {symbol} {tf}: got {n}, need {MIN_CANDLES_HARD}"
             )
-
-        if count < MIN_CANDLES_WARN:
-            log.warning(
+        if n < MIN_CANDLES_WARN:
+            logger.warning(
                 "ohlcv_low_candle_count",
                 symbol=symbol,
-                tf=timeframe,
-                count=count,
+                tf=tf,
+                count=n,
                 warn_threshold=MIN_CANDLES_WARN,
             )
 
-        log.debug("ohlcv_fetched", symbol=symbol, tf=timeframe, candles=count)
-        return OHLCV(klines)
+        async with self._lock:
+            self._cache[cache_key] = _CacheEntry(ohlcv=ohlcv, fetched_at=time.monotonic())
 
-    def _client(self, market_mode: MarketMode):
-        mode = market_mode.value if hasattr(market_mode, "value") else str(market_mode)
-        if mode == "FUTURES" and self._futures:
-            return self._futures
-        return self._spot
+        return ohlcv
+
+    def invalidate(self, symbol: str, timeframe: str, mode: MarketMode) -> None:
+        """Force-expire a cache entry (e.g. after a trade fill)."""
+        tf = TF_MAP.get(timeframe, timeframe)
+        self._cache.pop((symbol.upper(), tf, mode.value), None)
+
+    def clear_cache(self) -> None:
+        """Clear all cached data."""
+        self._cache.clear()
+
+    # ─── Internal ───────────────────────────────────────────────────────────────────
 
     @staticmethod
-    def _normalize_timeframe(tf: str) -> str:
-        """Normalize timeframe string to Binance format."""
-        normalized = TIMEFRAME_MAP.get(tf, tf)
-        if normalized not in VALID_TIMEFRAMES:
-            raise ValueError(
-                f"Invalid timeframe: '{tf}'. Valid options: {sorted(VALID_TIMEFRAMES)}"
-            )
-        return normalized
+    def _parse(raw: List[List]) -> OHLCV:
+        """
+        Parse Binance kline response.
+        Each element: [open_time, open, high, low, close, volume, ...]
+        """
+        timestamps, opens, highs, lows, closes, volumes = [], [], [], [], [], []
+        for k in raw:
+            timestamps.append(int(k[0]))
+            opens.append(float(k[1]))
+            highs.append(float(k[2]))
+            lows.append(float(k[3]))
+            closes.append(float(k[4]))
+            volumes.append(float(k[5]))
+        return OHLCV(
+            opens=opens,
+            highs=highs,
+            lows=lows,
+            closes=closes,
+            volumes=volumes,
+            timestamps=timestamps,
+        )
