@@ -5,7 +5,6 @@ Wiring complet: BinanceClient -> PriceCache -> PortfolioEngine -> engines.
 from __future__ import annotations
 
 import logging
-from functools import lru_cache
 from typing import Optional
 
 from backend.binance.binance_client import BinanceClient
@@ -27,34 +26,38 @@ class AppState:
     """
     Singleton container — initializat o singura data in lifespan.
     Toate componentele sunt accesate prin Depends(get_state).
+
+    NOTE: Pydantic v2 BaseSettings expune campurile in lowercase indiferent
+    de cum sunt definite in .env (case_sensitive=False). Foloseste intotdeauna
+    cfg.telegram_bot_token, cfg.dry_run, cfg.market_mode etc.
     """
 
     def __init__(self) -> None:
         cfg = get_settings()
 
-        # Infrastructure
+        # ── Infrastructure ────────────────────────────────────────────
         self.client = BinanceClient()
         self.price_cache = PriceCache(self.client, refresh_interval=30.0)
         self.ohlcv = OHLCVProvider(self.client)
         self.journal = TradeJournal()
         self.telegram = TelegramAlerter(
-            token=cfg.TELEGRAM_BOT_TOKEN,
-            chat_id=cfg.TELEGRAM_CHAT_ID,
+            token=cfg.telegram_bot_token,        # lowercase — Pydantic v2
+            chat_id=cfg.telegram_chat_id,
         )
 
-        # Core engines
+        # ── Core engines ──────────────────────────────────────────────
         self.portfolio = PortfolioEngine(
             client=self.client,
             price_cache=self.price_cache,
-            mode=cfg.MARKET_MODE,
+            mode=cfg.market_mode,                # lowercase
         )
         self.risk = RiskManager()
         self.execution = ExecutionEngine(
             client=self.client,
-            dry_run=cfg.DRY_RUN,
+            dry_run=cfg.dry_run,                 # lowercase
         )
         self.strategy = CompositeStrategy(
-            symbols=cfg.SYMBOL_WHITELIST,
+            symbols=cfg.symbol_whitelist,        # lowercase
         )
         self.automation = AutomationEngine(
             strategy=self.strategy,
@@ -68,9 +71,13 @@ class AppState:
 
     async def setup(self) -> None:
         """Porneste toate serviciile async in ordine corecta."""
+        cfg = get_settings()
         await self.client.start()
-        logger.info("BinanceClient started (testnet=%s, dry_run=%s)",
-                    get_settings().TESTNET, get_settings().DRY_RUN)
+        logger.info(
+            "BinanceClient started (testnet=%s, dry_run=%s)",
+            cfg.testnet,
+            cfg.dry_run,
+        )
 
         await self.price_cache.start()
         ready = await self.price_cache.wait_ready(timeout=15.0)
@@ -84,7 +91,9 @@ class AppState:
         if result.success:
             logger.info("Reconciliation OK — trading enabled")
         else:
-            logger.error("Reconciliation FAILED: %s — trading BLOCKED", result.error)
+            logger.error(
+                "Reconciliation FAILED: %s — trading BLOCKED", result.error
+            )
 
         await self.automation.start()
         logger.info("AutomationEngine started")
