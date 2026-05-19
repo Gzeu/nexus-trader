@@ -1,58 +1,81 @@
 'use client'
-import type { Position } from '@/hooks/usePositions'
+import { useState } from 'react'
 import { apiFetch } from '@/lib/config'
-import clsx from 'clsx'
-import { X } from 'lucide-react'
+import { X, TrendingUp, TrendingDown } from 'lucide-react'
 
-interface Props {
-  position: Position
-  onClose?: () => void
+interface Position {
+  id: string
+  symbol: string
+  side: 'BUY' | 'SELL'
+  quantity: number
+  entry_price: number
+  current_price?: number
+  unrealized_pnl?: number
+  stop_loss: number
+  take_profit_1: number
+  tp1_hit?: boolean
+  breakeven_set?: boolean
+  is_dry_run?: boolean
 }
 
-export function PositionRow({ position: p, onClose }: Props) {
-  const pnlColor = p.unrealized_pnl >= 0 ? 'text-success' : 'text-error'
-  const sideColor = p.side === 'LONG' ? 'text-long' : 'text-short'
+export function PositionRow({ position: p, onClose }: { position: Position; onClose?: () => void }) {
+  const [closing, setClosing] = useState(false)
 
-  const handleClose = async () => {
-    if (!confirm(`Close ${p.symbol} ${p.side} position?`)) return
+  const pnl = p.unrealized_pnl ?? 0
+  const pnlColor = pnl > 0 ? 'var(--color-success)' : pnl < 0 ? 'var(--color-error)' : 'var(--color-muted)'
+  const pnlSign  = pnl > 0 ? '+' : ''
+
+  const handleClose = async (e: React.MouseEvent) => {
+    e.stopPropagation()
+    if (!confirm(`Close ${p.symbol} position?`)) return
+    setClosing(true)
     try {
-      await apiFetch('/signals/webhook', {
-        method: 'POST',
-        body: JSON.stringify({
-          secret: process.env.NEXT_PUBLIC_API_KEY,
-          symbol: p.symbol,
-          action: 'CLOSE',
-          stop_loss: 0,
-          take_profit_1: 0,
-          take_profit_2: 0,
-          confidence: 1.0,
-          reason: 'Manual close from UI',
-        }),
-      })
-      setTimeout(() => onClose?.(), 500)
-    } catch (e) { console.error(e) }
+      await apiFetch(`/close_position/${p.id}`, { method: 'POST' })
+      onClose?.()
+    } catch (err) { console.error(err) }
+    finally { setClosing(false) }
   }
 
   return (
-    <tr className="border-b border-divider/50 hover:bg-surface2/50 transition-colors">
-      <td className="px-3 py-2 font-mono font-medium text-text">{p.symbol}</td>
-      <td className={clsx('px-3 py-2 font-semibold', sideColor)}>{p.side}</td>
-      <td className="px-3 py-2 text-text">{p.quantity.toFixed(6)}</td>
-      <td className="px-3 py-2">{p.entry_price.toFixed(2)}</td>
-      <td className="px-3 py-2">{p.current_price.toFixed(2)}</td>
-      <td className={clsx('px-3 py-2 font-medium', pnlColor)}>
-        {p.unrealized_pnl >= 0 ? '+' : ''}{p.unrealized_pnl.toFixed(2)}
+    <tr className="anim-fade-in">
+      <td>
+        <div className="flex items-center gap-1.5">
+          <span className="mono" style={{ fontWeight: 600 }}>{p.symbol}</span>
+          {p.is_dry_run && <span className="badge badge-primary" style={{ fontSize: 8 }}>DRY</span>}
+        </div>
       </td>
-      <td className="px-3 py-2 text-error">{p.stop_loss.toFixed(2)}</td>
-      <td className="px-3 py-2 text-success">{p.take_profit_1.toFixed(2)}</td>
-      <td className="px-3 py-2 text-muted">{new Date(p.opened_at).toLocaleTimeString()}</td>
-      <td className="px-3 py-2">
+      <td>
+        <span className={p.side === 'BUY' ? 'badge badge-buy' : 'badge badge-sell'}>
+          {p.side === 'BUY' ? <TrendingUp size={9} /> : <TrendingDown size={9} />}
+          {p.side}
+        </span>
+      </td>
+      <td className="mono">{p.quantity}</td>
+      <td className="mono">{p.entry_price.toFixed(2)}</td>
+      <td className="mono" style={{ color: 'var(--color-muted)' }}>
+        {p.current_price ? p.current_price.toFixed(2) : '—'}
+      </td>
+      <td className="mono" style={{ color: pnlColor, fontWeight: 600 }}>
+        {pnlSign}{pnl.toFixed(2)}
+      </td>
+      <td className="mono" style={{ color: 'var(--color-error)' }}>{p.stop_loss.toFixed(2)}</td>
+      <td className="mono" style={{ color: 'var(--color-success)' }}>
+        <span>{p.take_profit_1.toFixed(2)}</span>
+        {p.tp1_hit && <span className="badge badge-buy" style={{ marginLeft: 4, fontSize: 8 }}>HIT</span>}
+      </td>
+      <td>
+        {p.breakeven_set
+          ? <span className="badge" style={{ background: 'var(--color-gold-dim)', color: 'var(--color-gold)', fontSize: 9 }}>BE</span>
+          : <span style={{ fontSize: 10, color: 'var(--color-muted)' }}>OPEN</span>}
+      </td>
+      <td>
         <button
+          className="btn btn-sm btn-danger"
           onClick={handleClose}
-          className="p-1 rounded hover:bg-error/20 text-muted hover:text-error transition-colors"
-          title="Close position"
+          disabled={closing}
+          style={{ padding: '2px 6px' }}
         >
-          <X size={12} />
+          {closing ? '…' : <X size={10} />}
         </button>
       </td>
     </tr>
