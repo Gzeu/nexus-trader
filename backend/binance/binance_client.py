@@ -31,10 +31,12 @@ class BinanceClient:
 
     def __init__(self) -> None:
         cfg = get_settings()
-        self._api_key = cfg.BINANCE_API_KEY
-        self._api_secret = cfg.BINANCE_API_SECRET
-        self._testnet = cfg.TESTNET
-        self._dry_run = cfg.DRY_RUN
+        # Pydantic v2 normalises all field names to snake_case regardless of
+        # how they are written in .env.  Always access via snake_case here.
+        self._api_key = cfg.binance_api_key
+        self._api_secret = cfg.binance_api_secret
+        self._testnet = cfg.testnet
+        self._dry_run = cfg.dry_run
 
         self._spot_base = _SPOT_TEST if self._testnet else _SPOT_LIVE
         self._futures_base = _FUTS_TEST if self._testnet else _FUTS_LIVE
