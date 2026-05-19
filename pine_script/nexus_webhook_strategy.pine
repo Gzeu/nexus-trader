@@ -1,0 +1,179 @@
+//@version=5
+// ═══════════════════════════════════════════════════════════════════════════════
+// Nexus Trader — TradingView Webhook Strategy
+// Fires JSON alerts to /api/v1/signals on every signal change.
+// Supports: trend_following, mean_reversion, breakout strategies.
+// ═══════════════════════════════════════════════════════════════════════════════
+strategy(
+     title        = "Nexus Trader Webhook Strategy",
+     shorttitle   = "NEXUS",
+     overlay      = true,
+     pyramiding   = 0,
+     default_qty_type  = strategy.percent_of_equity,
+     default_qty_value = 100,
+     commission_type   = strategy.commission.percent,
+     commission_value  = 0.05
+)
+
+// ─── Inputs ──────────────────────────────────────────────────────────────────
+string  strategyMode  = input.string("composite",   "Strategy Mode",
+                          options=["trend", "mean_reversion", "breakout", "composite"])
+string  marketMode    = input.string("FUTURES",      "Market Mode",
+                          options=["SPOT", "FUTURES"])
+int     leverage      = input.int(10, "Leverage", minval=1, maxval=125)
+float   riskPct       = input.float(1.0, "Risk % per Trade", minval=0.1, maxval=5.0, step=0.1)
+float   minConfidence = input.float(0.60, "Min Confidence threshold", minval=0.3, maxval=1.0, step=0.05)
+
+// ATR settings
+int     atrLen        = input.int(14, "ATR Length")
+float   atrMult_sl    = input.float(1.5, "ATR × for Stop Loss", step=0.1)
+float   atrMult_tp1   = input.float(2.0, "ATR × for TP1", step=0.1)
+float   atrMult_tp2   = input.float(3.5, "ATR × for TP2", step=0.1)
+
+// Trend inputs
+int     emaFast  = input.int(9,  "EMA Fast")
+int     emaSlow  = input.int(21, "EMA Slow")
+int     rsiLen   = input.int(14, "RSI Length")
+float   rsiLong  = input.float(50.0, "RSI min for Long")
+float   rsiShort = input.float(50.0, "RSI max for Short")
+
+// Mean Reversion inputs
+int     bbLen    = input.int(20, "BB Length")
+float   bbMult   = input.float(2.0, "BB StdDev")
+
+// Breakout inputs
+int     brLen    = input.int(20, "Breakout lookback (candles)")
+float   volMult  = input.float(1.5, "Volume confirmation multiplier")
+
+// ─── Indicators ──────────────────────────────────────────────────────────────
+atrVal      = ta.atr(atrLen)
+emaFastLine = ta.ema(close, emaFast)
+emaSlowLine = ta.ema(close, emaSlow)
+rsiVal      = ta.rsi(close, rsiLen)
+[bbUpper, bbBasis, bbLower] = ta.bb(close, bbLen, bbMult)
+volAvg      = ta.sma(volume, 20)
+
+// ─── Signal logic (per strategy mode) ────────────────────────────────────────
+// Trend
+trendLong  = ta.crossover (emaFastLine, emaSlowLine) and rsiVal > rsiLong
+trendShort = ta.crossunder(emaFastLine, emaSlowLine) and rsiVal < rsiShort
+
+// Mean Reversion
+mrLong  = ta.crossover (close, bbLower)  and rsiVal < 35
+mrShort = ta.crossunder(close, bbUpper)  and rsiVal > 65
+
+// Breakout
+hiLen    = ta.highest(high, brLen)[1]
+loLen    = ta.lowest (low,  brLen)[1]
+brLong   = ta.crossover (close, hiLen) and volume > volAvg * volMult
+brShort  = ta.crossunder(close, loLen) and volume > volAvg * volMult
+
+// Composite (simple majority vote, equal weight)
+compLong  = (trendLong  ? 1 : 0) + (mrLong  ? 1 : 0) + (brLong  ? 1 : 0) >= 2
+compShort = (trendShort ? 1 : 0) + (mrShort ? 1 : 0) + (brShort ? 1 : 0) >= 2
+
+goLong  = strategyMode == "trend"          ? trendLong  :
+          strategyMode == "mean_reversion" ? mrLong     :
+          strategyMode == "breakout"       ? brLong     : compLong
+
+goShort = strategyMode == "trend"          ? trendShort :
+          strategyMode == "mean_reversion" ? mrShort    :
+          strategyMode == "breakout"       ? brShort    : compShort
+
+// Confidence score: proportion of agreeing sub-strategies (0.33 - 1.0)
+confLong  = ((trendLong  ? 1 : 0) + (mrLong  ? 1 : 0) + (brLong  ? 1 : 0)) / 3.0
+confShort = ((trendShort ? 1 : 0) + (mrShort ? 1 : 0) + (brShort ? 1 : 0)) / 3.0
+confidence = goLong ? confLong : goShort ? confShort : 0.0
+
+// ─── SL / TP levels ──────────────────────────────────────────────────────────
+slBuy  = close - atrVal * atrMult_sl
+tp1Buy = close + atrVal * atrMult_tp1
+tp2Buy = close + atrVal * atrMult_tp2
+
+slSell  = close + atrVal * atrMult_sl
+tp1Sell = close - atrVal * atrMult_tp1
+tp2Sell = close - atrVal * atrMult_tp2
+
+// ─── Strategy entries (for TradingView backtest equity curve) ────────────────
+if goLong  and strategy.position_size <= 0
+    strategy.entry("Long",  strategy.long)
+if goShort and strategy.position_size >= 0
+    strategy.entry("Short", strategy.short)
+
+if strategy.position_size > 0
+    strategy.exit("Long SL/TP",  "Long",  stop=slBuy,  limit=tp1Buy)
+if strategy.position_size < 0
+    strategy.exit("Short SL/TP", "Short", stop=slSell, limit=tp1Sell)
+
+// ─── Webhook alert payloads ───────────────────────────────────────────────────
+// Configure TradingView alert → Webhook URL → https://your-backend.com/api/v1/signals
+// Message field: paste {{strategy.order.alert_message}} or use per-alert JSON below.
+
+// Long entry alert
+if goLong and confidence >= minConfidence and strategy.position_size <= 0
+    alert(
+         '{"source":"tradingview","symbol":"' + syminfo.ticker +
+         '","action":"BUY","confidence":' + str.tostring(confidence, "#.##") +
+         ',"entry_type":"market","entry_price":' + str.tostring(close, "#.##") +
+         ',"stop_loss":'    + str.tostring(slBuy,  "#.##") +
+         ',"take_profit_1":' + str.tostring(tp1Buy, "#.##") +
+         ',"take_profit_2":' + str.tostring(tp2Buy, "#.##") +
+         ',"timeframe":"'   + timeframe.period +
+         '","strategy":"'  + strategyMode +
+         '","market_mode":"' + marketMode +
+         '","leverage":'    + str.tostring(leverage) +
+         ',"risk_pct":'     + str.tostring(riskPct) +
+         ',"reason":"EMA crossover + RSI + composite vote"}',
+         alert.freq_once_per_bar_close
+    )
+
+// Short entry alert
+if goShort and confidence >= minConfidence and strategy.position_size >= 0
+    alert(
+         '{"source":"tradingview","symbol":"' + syminfo.ticker +
+         '","action":"SELL","confidence":' + str.tostring(confidence, "#.##") +
+         ',"entry_type":"market","entry_price":' + str.tostring(close, "#.##") +
+         ',"stop_loss":'    + str.tostring(slSell,  "#.##") +
+         ',"take_profit_1":' + str.tostring(tp1Sell, "#.##") +
+         ',"take_profit_2":' + str.tostring(tp2Sell, "#.##") +
+         ',"timeframe":"'   + timeframe.period +
+         '","strategy":"'  + strategyMode +
+         '","market_mode":"' + marketMode +
+         '","leverage":'    + str.tostring(leverage) +
+         ',"risk_pct":'     + str.tostring(riskPct) +
+         ',"reason":"EMA crossunder + RSI + composite vote"}',
+         alert.freq_once_per_bar_close
+    )
+
+// Close long on opposite signal
+if strategy.position_size > 0 and goShort
+    alert(
+         '{"source":"tradingview","symbol":"' + syminfo.ticker +
+         '","action":"CLOSE","confidence":' + str.tostring(confidence, "#.##") +
+         ',"entry_price":' + str.tostring(close, "#.##") +
+         ',"stop_loss":0,"take_profit_1":0,"take_profit_2":0' +
+         ',"timeframe":"' + timeframe.period +
+         '","strategy":"' + strategyMode +
+         '","market_mode":"' + marketMode +
+         '","reason":"Close long — opposite signal"}',
+         alert.freq_once_per_bar_close
+    )
+
+// ─── Visual overlays ─────────────────────────────────────────────────────────
+plot(emaFastLine, "EMA Fast", color=#26C6DA, linewidth=1)
+plot(emaSlowLine, "EMA Slow", color=#EF5350, linewidth=1)
+plot(bbUpper, "BB Upper", color=color.new(color.gray, 70), linewidth=1)
+plot(bbLower, "BB Lower", color=color.new(color.gray, 70), linewidth=1)
+
+plotshape(goLong  and confidence >= minConfidence, title="Long Signal",
+          location=location.belowbar, color=color.new(#26C6DA, 10),
+          style=shape.triangleup,  size=size.small)
+plotshape(goShort and confidence >= minConfidence, title="Short Signal",
+          location=location.abovebar, color=color.new(#EF5350, 10),
+          style=shape.triangledown, size=size.small)
+
+// Confidence label
+if barstate.islast
+    label.new(bar_index, high, "Conf: " + str.tostring(confidence * 100, "#") + "%",
+              color=color.new(color.black, 80), textcolor=color.white,
+              style=label.style_label_down, size=size.small)

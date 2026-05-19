@@ -1,661 +1,528 @@
 """
-backtest_engine.py – Production-grade vectorized backtesting engine for Nexus Trader.
-
-FIXES vs previous version:
-  - EMA crossover detected on confirmed bars: shift(1)/shift(2) — zero lookahead
-  - Execution price = open of NEXT bar (realistic fill simulation)
-  - testnet=False by default (testnet has no real historical data)
-  - MACD histogram momentum filter (+~18% signal quality)
-  - ATR% volatility regime guard (skip entries when market is too volatile)
-  - Walk-forward parameter optimizer (grid search best EMA/ATR params)
+Nexus Trader — Backtesting Engine (vectorbt + pandas).
 
 Usage:
-    # Quick backtest (downloads 1 year of BTCUSDT 15m from Binance mainnet):
-    python -m backtesting.backtest_engine --symbol BTCUSDT --tf 15m --days 365
-
-    # Optimize parameters:
-    python -m backtesting.backtest_engine --symbol BTCUSDT --tf 15m --days 365 --optimize
-
-    # Long + short (Futures):
-    python -m backtesting.backtest_engine --symbol BTCUSDT --tf 1h --days 365 --futures
-
-    # Load from CSV instead of Binance:
-    python -m backtesting.backtest_engine --symbol BTCUSDT --tf 15m --csv data/btcusdt_15m.csv
-
-Outputs:
-    backtesting/results/{symbol}_{tf}.html        – interactive Plotly tearsheet
-    backtesting/results/{symbol}_{tf}_trades.csv  – full trade log
-    backtesting/results/{symbol}_{tf}_params.json – optimal params (if --optimize)
-
-Requirements:
-    pip install pandas pandas-ta plotly httpx
+    python -m backtesting.backtest_engine \\
+        --symbol BTCUSDT \\
+        --interval 15m \\
+        --start 2024-01-01 \\
+        --end   2024-12-31 \\
+        --strategy composite \\
+        --initial-capital 10000
 """
 from __future__ import annotations
 
 import argparse
 import asyncio
 import json
+import logging
 import os
-from datetime import datetime
-from itertools import product
+import sys
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 
-try:
-    import pandas_ta as ta
-except ImportError:
-    raise ImportError("Run: pip install pandas-ta")
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-try:
-    import plotly.graph_objects as go
-    from plotly.subplots import make_subplots
-    HAS_PLOTLY = True
-except ImportError:
-    HAS_PLOTLY = False
+# ─── Data structures ─────────────────────────────────────────────────────────
 
-RESULTS_DIR = Path("backtesting/results")
-RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+@dataclass
+class BacktestConfig:
+    symbol:          str   = "BTCUSDT"
+    interval:        str   = "15m"
+    start:           str   = "2024-01-01"
+    end:             str   = "2024-12-31"
+    strategy:        str   = "composite"
+    initial_capital: float = 10_000.0
+    risk_per_trade:  float = 0.01        # 1 %
+    commission_pct:  float = 0.0005      # 0.05 %
+    slippage_pct:    float = 0.0002      # 0.02 %
+    atr_len:         int   = 14
+    atr_sl_mult:     float = 1.5
+    atr_tp1_mult:    float = 2.0
+    atr_tp2_mult:    float = 3.5
+    ema_fast:        int   = 9
+    ema_slow:        int   = 21
+    rsi_len:         int   = 14
+    bb_len:          int   = 20
+    bb_std:          float = 2.0
+    breakout_len:    int   = 20
+    vol_mult:        float = 1.5
+    min_confidence:  float = 0.60
 
 
-class BacktestEngine:
-    """
-    Vectorized backtesting engine that mirrors the live strategy logic exactly.
+@dataclass
+class BacktestResult:
+    symbol:           str
+    interval:         str
+    start:            str
+    end:              str
+    strategy:         str
+    initial_capital:  float
+    final_equity:     float
+    total_return_pct: float
+    max_drawdown_pct: float
+    sharpe_ratio:     float
+    sortino_ratio:    float
+    calmar_ratio:     float
+    win_rate:         float
+    profit_factor:    float
+    expectancy:       float
+    total_trades:     int
+    winning_trades:   int
+    losing_trades:    int
+    avg_win_pct:      float
+    avg_loss_pct:     float
+    best_trade_pct:   float
+    worst_trade_pct:  float
+    avg_holding_bars: float
+    r_multiples:      list[float] = field(default_factory=list)
+    equity_curve:     list[float] = field(default_factory=list)
 
-    Key correctness guarantees:
-      1. All indicator inputs use shift(1) — only confirmed candles enter calculations.
-      2. Trade execution price = open price of the bar AFTER the signal bar.
-      3. Fees (0.1% taker) + slippage (0.1%) applied to both entry and exit.
-      4. TP1 partial close at 40%, breakeven SL move, trailing stop on remainder.
-    """
 
-    # Parameter grid for walk-forward optimization
-    PARAM_GRID = {
-        "ema_fast":    [7, 9, 12],
-        "ema_slow":    [21, 26, 34],
-        "atr_sl_mult": [1.2, 1.5, 2.0],
-        "atr_tp_mult": [2.0, 2.5, 3.0],
-        "rsi_min":     [48, 50, 52],
-        "vol_mult":    [0.6, 0.7, 0.8],
-    }
+# ─── Indicators ──────────────────────────────────────────────────────────────
 
-    def __init__(
-        self,
-        symbol: str = "BTCUSDT",
-        timeframe: str = "15m",
-        ema_fast: int = 9,
-        ema_slow: int = 21,
-        rsi_period: int = 14,
-        atr_period: int = 14,
-        atr_sl_mult: float = 1.5,
-        atr_tp_mult: float = 2.5,
-        rsi_min: float = 50.0,       # min RSI for long entry
-        vol_mult: float = 0.7,        # volume must be >= vol_mult * rolling_avg_20
-        risk_per_trade: float = 0.01,
-        initial_capital: float = 10_000.0,
-        fees: float = 0.001,
-        slippage: float = 0.001,
-    ):
-        self.symbol          = symbol
-        self.timeframe       = timeframe
-        self.ema_fast        = ema_fast
-        self.ema_slow        = ema_slow
-        self.rsi_period      = rsi_period
-        self.atr_period      = atr_period
-        self.atr_sl_mult     = atr_sl_mult
-        self.atr_tp_mult     = atr_tp_mult
-        self.rsi_min         = rsi_min
-        self.vol_mult        = vol_mult
-        self.risk_per_trade  = risk_per_trade
-        self.initial_capital = initial_capital
-        self.fees            = fees
-        self.slippage        = slippage
-        self._df: Optional[pd.DataFrame] = None
+class Indicators:
+    """Vectorised indicator calculations on a DataFrame with OHLCV columns."""
 
-    # ── Data loading ─────────────────────────────────────────────────────────────
+    @staticmethod
+    def ema(series: pd.Series, period: int) -> pd.Series:
+        return series.ewm(span=period, adjust=False).mean()
 
-    def load_from_csv(self, path: str) -> "BacktestEngine":
-        """Load OHLCV from CSV. Expected columns: timestamp,open,high,low,close,volume"""
-        df = pd.read_csv(path, parse_dates=["timestamp"], index_col="timestamp")
-        df.columns = [c.lower() for c in df.columns]
-        self._df = df[["open", "high", "low", "close", "volume"]].astype(float)
-        print(f"Loaded {len(self._df)} candles from {path}")
-        return self
+    @staticmethod
+    def rsi(series: pd.Series, period: int) -> pd.Series:
+        delta = series.diff()
+        gain  = delta.clip(lower=0)
+        loss  = (-delta).clip(lower=0)
+        avg_g = gain.ewm(alpha=1 / period, adjust=False).mean()
+        avg_l = loss.ewm(alpha=1 / period, adjust=False).mean()
+        rs    = avg_g / avg_l.replace(0, np.nan)
+        return 100 - 100 / (1 + rs)
 
-    async def load_from_binance(
-        self,
-        days: int = 365,
-        testnet: bool = False,    # FIX: mainnet by default — testnet has no history
-    ) -> "BacktestEngine":
-        """
-        Fetch OHLCV data from Binance mainnet REST API.
-        No API key required for public klines endpoint.
-        """
-        try:
-            import httpx
-        except ImportError:
-            raise ImportError("Run: pip install httpx")
+    @staticmethod
+    def atr(df: pd.DataFrame, period: int) -> pd.Series:
+        hl  = df["high"] - df["low"]
+        hpc = (df["high"] - df["close"].shift()).abs()
+        lpc = (df["low"]  - df["close"].shift()).abs()
+        tr  = pd.concat([hl, hpc, lpc], axis=1).max(axis=1)
+        return tr.ewm(alpha=1 / period, adjust=False).mean()
 
-        # FIX: always use mainnet for historical data
-        base = "https://testnet.binance.vision/api" if testnet else "https://api.binance.com/api"
+    @staticmethod
+    def bollinger(series: pd.Series, period: int, std: float) -> tuple[pd.Series, pd.Series, pd.Series]:
+        basis = series.rolling(period).mean()
+        sd    = series.rolling(period).std()
+        return basis + std * sd, basis, basis - std * sd
 
-        interval_minutes = {
-            "1m": 1, "3m": 3, "5m": 5, "15m": 15, "30m": 30,
-            "1h": 60, "4h": 240, "1d": 1440,
-        }
-        minutes_per_bar  = interval_minutes.get(self.timeframe, 15)
-        target_candles   = (days * 24 * 60) // minutes_per_bar
 
-        rows: list = []
-        end_ms = int(datetime.utcnow().timestamp() * 1000)
+# ─── Signal generators ───────────────────────────────────────────────────────
 
-        async with httpx.AsyncClient(timeout=30) as client:
-            while len(rows) < target_candles:
-                batch = min(1000, target_candles - len(rows))
-                resp = await client.get(
-                    f"{base}/v3/klines",
-                    params={"symbol": self.symbol, "interval": self.timeframe,
-                            "limit": batch, "endTime": end_ms},
-                )
-                resp.raise_for_status()
-                data = resp.json()
-                if not data:
-                    break
-                for k in data:
-                    rows.append({
-                        "timestamp": pd.Timestamp(int(k[0]), unit="ms"),
-                        "open":   float(k[1]),
-                        "high":   float(k[2]),
-                        "low":    float(k[3]),
-                        "close":  float(k[4]),
-                        "volume": float(k[5]),
-                    })
-                end_ms = int(data[0][0]) - 1
-                if len(data) < 1000:
-                    break
+class SignalGenerator:
+    def __init__(self, df: pd.DataFrame, cfg: BacktestConfig):
+        self.df  = df.copy()
+        self.cfg = cfg
+        self._compute_all()
 
-        df = (pd.DataFrame(rows)
-                .sort_values("timestamp")
-                .set_index("timestamp")
-                .drop_duplicates()
-                .astype(float))
-        self._df = df
-        print(f"Loaded {len(self._df)} candles for {self.symbol} {self.timeframe} "
-              f"({df.index[0].date()} → {df.index[-1].date()})")
-        return self
+    def _compute_all(self) -> None:
+        df  = self.df
+        cfg = self.cfg
 
-    # ── Signal generation ───────────────────────────────────────────────────────
+        df["ema_fast"] = Indicators.ema(df["close"], cfg.ema_fast)
+        df["ema_slow"] = Indicators.ema(df["close"], cfg.ema_slow)
+        df["rsi"]      = Indicators.rsi(df["close"], cfg.rsi_len)
+        df["atr"]      = Indicators.atr(df, cfg.atr_len)
 
-    def _compute_signals(self) -> pd.DataFrame:
-        """
-        Compute all indicators and entry signals on a CONFIRMED-close basis.
+        bb_upper, _, bb_lower = Indicators.bollinger(df["close"], cfg.bb_len, cfg.bb_std)
+        df["bb_upper"] = bb_upper
+        df["bb_lower"] = bb_lower
 
-        FIX: all indicator values are shifted by 1 bar so that the signal
-        is only generated AFTER the indicator candle has fully closed.
-        Execution happens on open[i+1] — the next bar's open price.
+        df["vol_avg"] = df["volume"].rolling(20).mean()
+        df["hi_n"]    = df["high"].rolling(cfg.breakout_len).max().shift(1)
+        df["lo_n"]    = df["low"].rolling(cfg.breakout_len).min().shift(1)
 
-        Additional filters vs original:
-          - MACD histogram momentum (histogram > 0 for longs)
-          - ATR% volatility guard (skip if ATR/close > 3%)
-          - Volume filter (volume > vol_mult * rolling_20_avg)
-        """
-        df = self._df.copy()
+        # Trend
+        df["trend_long"]  = (df["ema_fast"] > df["ema_slow"]) & \
+                            (df["ema_fast"].shift() <= df["ema_slow"].shift()) & \
+                            (df["rsi"] > 50)
+        df["trend_short"] = (df["ema_fast"] < df["ema_slow"]) & \
+                            (df["ema_fast"].shift() >= df["ema_slow"].shift()) & \
+                            (df["rsi"] < 50)
 
-        # —— Indicators ——
-        df.ta.ema(length=self.ema_fast, append=True)
-        df.ta.ema(length=self.ema_slow, append=True)
-        df.ta.rsi(length=self.rsi_period, append=True)
-        df.ta.macd(fast=12, slow=26, signal=9, append=True)   # adds MACD_12_26_9, MACDh_12_26_9
-        df.ta.atr(length=self.atr_period, append=True)
-        # Manual Bollinger Bands calculation (pandas_ta bbands has numba compatibility issues)
-        df["BBM_20_2.0"] = df["close"].rolling(window=20).mean()
-        std = df["close"].rolling(window=20).std()
-        df["BBU_20_2.0"] = df["BBM_20_2.0"] + (std * 2)
-        df["BBL_20_2.0"] = df["BBM_20_2.0"] - (std * 2)
+        # Mean reversion
+        df["mr_long"]  = (df["close"] > df["bb_lower"]) & \
+                         (df["close"].shift() <= df["bb_lower"].shift()) & \
+                         (df["rsi"] < 35)
+        df["mr_short"] = (df["close"] < df["bb_upper"]) & \
+                         (df["close"].shift() >= df["bb_upper"].shift()) & \
+                         (df["rsi"] > 65)
 
-        ema_f = f"EMA_{self.ema_fast}"
-        ema_s = f"EMA_{self.ema_slow}"
-        rsi_c = f"RSI_{self.rsi_period}"
-        atr_c = f"ATRr_{self.atr_period}"
-        mcdh  = "MACDh_12_26_9"   # MACD histogram
-        bbl   = "BBL_20_2.0"
-        bbu   = "BBU_20_2.0"
-        bbm   = "BBM_20_2.0"
+        # Breakout
+        df["br_long"]  = (df["close"] > df["hi_n"]) & (df["volume"] > df["vol_avg"] * cfg.vol_mult)
+        df["br_short"] = (df["close"] < df["lo_n"]) & (df["volume"] > df["vol_avg"] * cfg.vol_mult)
 
-        # ── FIX: shift all indicator values by 1 so signal fires on confirmed bar ──
-        ema_f_s1 = df[ema_f].shift(1)   # confirmed fast EMA
-        ema_s_s1 = df[ema_s].shift(1)   # confirmed slow EMA
-        ema_f_s2 = df[ema_f].shift(2)   # one bar before
-        ema_s_s2 = df[ema_s].shift(2)
-        rsi_s1   = df[rsi_c].shift(1)
-        atr_s1   = df[atr_c].shift(1)
-        mcdh_s1  = df[mcdh].shift(1)
-        bbl_s1   = df[bbl].shift(1)
-        bbu_s1   = df[bbu].shift(1)
-        bbm_s1   = df[bbm].shift(1)
-        vol_avg  = df["volume"].rolling(20).mean().shift(1)
-        atr_pct  = atr_s1 / df["close"].shift(1)
+        # Composite
+        df["comp_long"]  = (df["trend_long"].astype(int) +
+                            df["mr_long"].astype(int) +
+                            df["br_long"].astype(int)) >= 2
+        df["comp_short"] = (df["trend_short"].astype(int) +
+                            df["mr_short"].astype(int) +
+                            df["br_short"].astype(int)) >= 2
 
-        # ── Filters ──
-        vol_ok      = df["volume"].shift(1) >= self.vol_mult * vol_avg
-        not_volatile= atr_pct < 0.03        # skip if ATR% > 3% (too choppy)
-        macd_bull   = mcdh_s1 > 0           # MACD histogram positive → momentum up
-        macd_bear   = mcdh_s1 < 0
+        self.df = df
 
-        # ── EMA crossover on confirmed bars (FIX: was using shift(0)/shift(1)) ──
-        bull_cross = (ema_f_s1 > ema_s_s1) & (ema_f_s2 <= ema_s_s2)
-        bear_cross = (ema_f_s1 < ema_s_s1) & (ema_f_s2 >= ema_s_s2)
+    def get_signals(self) -> pd.DataFrame:
+        df  = self.df
+        cfg = self.cfg
+        mode = cfg.strategy
 
-        # ── Trend signals (EMA + RSI + MACD + Volume + not volatile) ──
-        long_trend  = bull_cross & (rsi_s1 >= self.rsi_min) & (rsi_s1 < 70) & macd_bull & vol_ok & not_volatile
-        short_trend = bear_cross & (rsi_s1 <= (100 - self.rsi_min)) & (rsi_s1 > 30) & macd_bear & vol_ok & not_volatile
+        if mode == "trend":
+            go_long, go_short = df["trend_long"], df["trend_short"]
+        elif mode == "mean_reversion":
+            go_long, go_short = df["mr_long"], df["mr_short"]
+        elif mode == "breakout":
+            go_long, go_short = df["br_long"], df["br_short"]
+        else:  # composite
+            go_long, go_short = df["comp_long"], df["comp_short"]
 
-        # ── MeanReversion signals (Bollinger Bands + RSI extremes) ──
-        # Only valid when trend signals are not active (regime distinction)
-        long_mr  = (~bull_cross) & (df["close"].shift(1) <= bbl_s1) & (rsi_s1 < 33) & not_volatile
-        short_mr = (~bear_cross) & (df["close"].shift(1) >= bbu_s1) & (rsi_s1 > 67) & not_volatile
+        df["signal"] = 0
+        df.loc[go_long,  "signal"] =  1
+        df.loc[go_short, "signal"] = -1
 
-        # Combine: trend takes priority over mean-reversion
-        long_entry  = long_trend  | long_mr
-        short_entry = short_trend | short_mr
+        df["sl_long"]  = df["close"] - df["atr"] * cfg.atr_sl_mult
+        df["tp1_long"] = df["close"] + df["atr"] * cfg.atr_tp1_mult
+        df["tp2_long"] = df["close"] + df["atr"] * cfg.atr_tp2_mult
 
-        # Exits: opposite EMA cross or RSI extreme
-        long_exit   = bear_cross | (rsi_s1 > 75)
-        short_exit  = bull_cross | (rsi_s1 < 25)
-
-        df["long_entry"]  = long_entry.fillna(False)
-        df["short_entry"] = short_entry.fillna(False)
-        df["long_exit"]   = long_exit.fillna(False)
-        df["short_exit"]  = short_exit.fillna(False)
-        df["atr"]         = atr_s1
-        df["bbl"]         = bbl_s1
-        df["bbu"]         = bbu_s1
-        df["bbm"]         = bbm_s1
+        df["sl_short"]  = df["close"] + df["atr"] * cfg.atr_sl_mult
+        df["tp1_short"] = df["close"] - df["atr"] * cfg.atr_tp1_mult
+        df["tp2_short"] = df["close"] - df["atr"] * cfg.atr_tp2_mult
 
         return df
 
-    # ── Simulation ───────────────────────────────────────────────────────────────────
 
-    def _simulate(self, df: pd.DataFrame, long_only: bool = True) -> tuple[list, list]:
-        """
-        Event-driven simulation on top of vectorized signals.
-        Returns (trades_list, equity_curve_list).
+# ─── Event-driven backtester ─────────────────────────────────────────────────
 
-        Implements full TP1→breakeven→TP2→trailing logic:
-          - TP1 at atr_tp_mult*ATR/2   (40% partial close → SL moves to breakeven)
-          - TP2 at atr_tp_mult*ATR     (40% of remainder)
-          - Trailing stop on last 20%  (1.5% below peak for longs)
-        """
-        opens = df["open"].values
-        n     = len(opens)
-        equity = self.initial_capital
-        trades: list = []
-        equity_curve = [equity]
-        pos = None  # active position dict or None
+class EventBacktester:
+    """
+    Bar-by-bar event backtester with:
+    - Fixed-fractional position sizing (risk_per_trade % of equity at SL distance)
+    - TP1 (40 %) → move SL to breakeven
+    - TP2 (40 % of rest)
+    - Trailing stop on remaining 20 %
+    - Commission + slippage simulation
+    """
 
-        fee = self.fees + self.slippage  # total round-trip cost per side
+    def __init__(self, df: pd.DataFrame, cfg: BacktestConfig):
+        self.df    = df
+        self.cfg   = cfg
+        self.equity = cfg.initial_capital
+        self.trades: list[dict] = []
+        self.equity_curve: list[float] = [cfg.initial_capital]
 
-        for i in range(1, n - 1):   # start at 1; execute on open[i+1]
-            exec_price = opens[i + 1]   # FIX: execution on NEXT open
+    def run(self) -> BacktestResult:
+        df    = self.df
+        cfg   = self.cfg
+        pos   = None  # active position dict or None
+        peak  = cfg.initial_capital
+        max_dd = 0.0
 
-            # ─ Manage open position ──────────────────────────────────────────
-            if pos:
-                hi  = df["high"].values[i]
-                lo  = df["low"].values[i]
-                sl  = pos["sl"]
-                tp1 = pos["tp1"]
-                tp2 = pos["tp2"]
-                trl = pos.get("trail")
-                side = pos["side"]
+        for i in range(1, len(df)):
+            row  = df.iloc[i]
+            prev = df.iloc[i - 1]
 
-                # Update trailing stop
-                if trl is not None:
-                    if side == "long":
-                        trl = max(trl, df["high"].values[i] * 0.985)
-                    else:
-                        trl = min(trl, df["low"].values[i] * 1.015)
-                    pos["trail"] = trl
-
-                exit_p = None; exit_r = None
-
-                if side == "long":
-                    if not pos.get("t1") and hi >= tp1:
-                        # TP1 partial close at 40%
-                        pnl40 = (tp1 * (1 - fee) - pos["entry"] * (1 + fee)) * pos["size"] * 0.40
-                        equity += pnl40
-                        pos["size"] *= 0.60
-                        pos["t1"]   = True
-                        pos["sl"]   = pos["entry"]   # move to breakeven
-                        sl          = pos["entry"]
-                    if pos.get("t1") and hi >= tp2:
-                        exit_p = tp2; exit_r = "TP2"
-                    elif lo <= sl:
-                        exit_p = sl;  exit_r = "SL" if not pos.get("t1") else "BE"
-                    elif trl is not None and lo <= trl:
-                        exit_p = trl; exit_r = "TRAIL"
-                    elif df["long_exit"].values[i]:
-                        exit_p = exec_price; exit_r = "SIGNAL"
-                else:  # short
-                    if not pos.get("t1") and lo <= tp1:
-                        pnl40 = (pos["entry"] * (1 - fee) - tp1 * (1 + fee)) * pos["size"] * 0.40
-                        equity += pnl40
-                        pos["size"] *= 0.60
-                        pos["t1"]   = True
-                        pos["sl"]   = pos["entry"]
-                        sl          = pos["entry"]
-                    if pos.get("t1") and lo <= tp2:
-                        exit_p = tp2; exit_r = "TP2"
-                    elif hi >= sl:
-                        exit_p = sl;  exit_r = "SL" if not pos.get("t1") else "BE"
-                    elif trl is not None and hi >= trl:
-                        exit_p = trl; exit_r = "TRAIL"
-                    elif df["short_exit"].values[i]:
-                        exit_p = exec_price; exit_r = "SIGNAL"
-
-                if exit_p:
-                    if side == "long":
-                        pnl = (exit_p * (1 - fee) - pos["entry"] * (1 + fee)) * pos["size"]
-                    else:
-                        pnl = (pos["entry"] * (1 - fee) - exit_p * (1 + fee)) * pos["size"]
-                    equity += pnl
-                    trades.append({
-                        "entry_price": pos["entry"], "exit_price": exit_p,
-                        "side": side, "pnl": pnl, "reason": exit_r,
-                        "equity": equity, "bars_held": i - pos["entry_i"],
-                    })
+            # Manage open position
+            if pos is not None:
+                pos, closed = self._manage_position(pos, row)
+                if closed:
+                    self.trades.append(closed)
                     pos = None
+                    peak = max(peak, self.equity)
+                    dd   = (peak - self.equity) / peak * 100
+                    max_dd = max(max_dd, dd)
 
-            equity_curve.append(equity)
-            if pos:
-                continue
+            # Open new position on signal (only if flat)
+            if pos is None and prev["signal"] != 0:
+                pos = self._open_position(prev, row, prev["signal"])
 
-            # ─ New entry signal ─────────────────────────────────────────────
-            atr_val = df["atr"].values[i]
-            if atr_val <= 0 or np.isnan(atr_val):
-                continue
+            self.equity_curve.append(self.equity)
 
-            for side, signal_col, exit_col in [
-                ("long",  "long_entry",  "long_exit"),
-                ("short", "short_entry", "short_exit"),
-            ]:
-                if side == "short" and long_only:
-                    continue
-                if not df[signal_col].values[i]:
-                    continue
+        # Force-close any open position at last bar
+        if pos is not None:
+            last = df.iloc[-1]
+            pnl  = self._close_fill(pos, last["close"], "end_of_data", 1.0)
+            self.equity += pnl
+            self.trades.append({**pos, "exit_price": last["close"],
+                                "pnl": pnl, "reason": "end_of_data",
+                                "close_i": len(df) - 1})
 
-                if side == "long":
-                    sl  = exec_price - self.atr_sl_mult * atr_val
-                    tp1 = exec_price + (self.atr_tp_mult / 2) * atr_val  # TP1 = half of TP2
-                    tp2 = exec_price + self.atr_tp_mult * atr_val
-                    trl = exec_price * 0.985
-                else:
-                    sl  = exec_price + self.atr_sl_mult * atr_val
-                    tp1 = exec_price - (self.atr_tp_mult / 2) * atr_val
-                    tp2 = exec_price - self.atr_tp_mult * atr_val
-                    trl = exec_price * 1.015
+        return self._compute_metrics(max_dd)
 
-                sl_dist = abs(exec_price - sl)
-                if sl_dist <= 0:
-                    continue
+    def _open_position(self, signal_row: pd.Series, entry_row: pd.Series, direction: int) -> dict:
+        cfg         = self.cfg
+        entry_price = entry_row["open"] * (1 + cfg.slippage_pct * direction)
+        sl          = signal_row["sl_long"]  if direction == 1 else signal_row["sl_short"]
+        tp1         = signal_row["tp1_long"] if direction == 1 else signal_row["tp1_short"]
+        tp2         = signal_row["tp2_long"] if direction == 1 else signal_row["tp2_short"]
 
-                # RR check: TP1 must be at least 1.5x SL distance
-                rr = abs(tp1 - exec_price) / sl_dist
-                if rr < 1.5:
-                    continue
+        risk_amount = self.equity * cfg.risk_per_trade
+        sl_dist     = abs(entry_price - sl)
+        if sl_dist < 1e-9:
+            sl_dist = entry_price * 0.01
 
-                # Min notional
-                risk_amount = equity * self.risk_per_trade
-                size = risk_amount / sl_dist
-                if size * exec_price < 10:
-                    continue
-
-                pos = {
-                    "side": side, "entry": exec_price,
-                    "sl": sl, "tp1": tp1, "tp2": tp2,
-                    "size": size, "t1": False,
-                    "trail": trl, "entry_i": i,
-                }
-                break  # one position at a time
-
-        return trades, equity_curve
-
-    # ── Run ───────────────────────────────────────────────────────────────────────
-
-    def run(self, long_only: bool = True) -> dict:
-        """Run backtest and return metrics dict."""
-        if self._df is None:
-            raise RuntimeError("Load data first.")
-
-        df  = self._compute_signals()
-        trades, equity_curve = self._simulate(df, long_only)
-
-        slug     = f"{self.symbol}_{self.timeframe}"
-        csv_path = RESULTS_DIR / f"{slug}_trades.csv"
-
-        if not trades:
-            print("No trades generated. Check your data and parameters.")
-            return {"total_trades": 0}
-
-        t = pd.DataFrame(trades)
-        t.to_csv(str(csv_path), index=False)
-
-        metrics = self._calc_metrics(t, equity_curve)
-        self._save_html_report(df, t, equity_curve, slug)
-        self._print_summary(metrics)
-        return metrics
-
-    def _calc_metrics(self, t: pd.DataFrame, equity_curve: list) -> dict:
-        wins  = t[t.pnl > 0]
-        loses = t[t.pnl <= 0]
-        gp    = wins.pnl.sum()
-        gl    = abs(loses.pnl.sum())
-        pf    = round(gp / gl, 3) if gl > 0 else 999.0
-
-        ec   = np.array(equity_curve)
-        peak = np.maximum.accumulate(ec)
-        dd   = (peak - ec) / np.maximum(peak, 1e-9)
-        max_dd = float(dd.max())
-
-        returns = np.diff(ec) / np.maximum(ec[:-1], 1e-9)
-        sharpe  = float(returns.mean() / returns.std() * np.sqrt(252 * 96)) if returns.std() > 0 else 0
+        qty = risk_amount / sl_dist
+        cost = entry_price * qty * cfg.commission_pct
+        self.equity -= cost
 
         return {
-            "symbol":         self.symbol,
-            "timeframe":      self.timeframe,
-            "total_trades":   len(t),
-            "win_rate":       round(len(wins) / len(t), 3),
-            "profit_factor":  pf,
-            "sharpe_ratio":   round(sharpe, 3),
-            "max_drawdown":   round(max_dd, 3),
-            "total_return":   round((ec[-1] - self.initial_capital) / self.initial_capital, 3),
-            "final_equity":   round(float(ec[-1]), 2),
-            "expectancy_usd": round(float(t.pnl.mean()), 2),
-            "avg_win_usd":    round(float(wins.pnl.mean()), 2) if len(wins) else 0,
-            "avg_loss_usd":   round(float(loses.pnl.mean()), 2) if len(loses) else 0,
-            "exit_reasons":   t.reason.value_counts().to_dict(),
-            "csv_path":       str(RESULTS_DIR / f"{self.symbol}_{self.timeframe}_trades.csv"),
-            "html_path":      str(RESULTS_DIR / f"{self.symbol}_{self.timeframe}.html"),
+            "direction":    direction,
+            "entry_price":  entry_price,
+            "qty":          qty,
+            "qty_remaining": qty,
+            "sl":           sl,
+            "tp1":          tp1,
+            "tp2":          tp2,
+            "tp1_hit":      False,
+            "tp2_hit":      False,
+            "be_moved":     False,
+            "entry_i":      entry_row.name,
+            "open_equity":  self.equity,
         }
 
-    def _save_html_report(self, df, t, equity_curve, slug):
-        if not HAS_PLOTLY:
-            print("Install plotly for HTML report: pip install plotly")
-            return
-        fig = make_subplots(
-            rows=3, cols=1,
-            shared_xaxes=True,
-            row_heights=[0.5, 0.25, 0.25],
-            subplot_titles=("Price + Signals", "Equity Curve", "Drawdown"),
+    def _manage_position(self, pos: dict, row: pd.Series) -> tuple[Optional[dict], Optional[dict]]:
+        cfg = self.cfg
+        d   = pos["direction"]
+        lo, hi = row["low"], row["high"]
+
+        # SL hit
+        sl_hit = (d == 1 and lo <= pos["sl"]) or (d == -1 and hi >= pos["sl"])
+        if sl_hit:
+            pnl = self._close_fill(pos, pos["sl"], "stop_loss", 1.0)
+            self.equity += pnl
+            return None, {**pos, "exit_price": pos["sl"], "pnl": pnl, "reason": "stop_loss",
+                          "close_i": row.name}
+
+        # TP1 hit
+        if not pos["tp1_hit"]:
+            tp1_hit = (d == 1 and hi >= pos["tp1"]) or (d == -1 and lo <= pos["tp1"])
+            if tp1_hit:
+                close_qty = pos["qty"] * 0.40
+                pnl = self._close_fill(pos, pos["tp1"], "tp1", close_qty / pos["qty"])
+                self.equity += pnl
+                pos["qty_remaining"] -= close_qty
+                pos["tp1_hit"] = True
+                pos["sl"] = pos["entry_price"]  # move to breakeven
+
+        # TP2 hit
+        if pos["tp1_hit"] and not pos["tp2_hit"]:
+            tp2_hit = (d == 1 and hi >= pos["tp2"]) or (d == -1 and lo <= pos["tp2"])
+            if tp2_hit:
+                close_qty = pos["qty"] * 0.40
+                pnl = self._close_fill(pos, pos["tp2"], "tp2", close_qty / pos["qty"])
+                self.equity += pnl
+                pos["qty_remaining"] -= close_qty
+                pos["tp2_hit"] = True
+
+        # Trailing stop on remaining 20 % after TP2
+        if pos["tp2_hit"]:
+            atr = row.get("atr", abs(pos["tp1"] - pos["entry_price"]) / 2)
+            new_sl = row["close"] - d * atr * cfg.atr_sl_mult * 0.8
+            if d == 1 and new_sl > pos["sl"]:
+                pos["sl"] = new_sl
+            elif d == -1 and new_sl < pos["sl"]:
+                pos["sl"] = new_sl
+
+        return pos, None
+
+    def _close_fill(self, pos: dict, price: float, reason: str, fraction: float) -> float:
+        cfg      = self.cfg
+        fill     = price * (1 - cfg.slippage_pct * pos["direction"])
+        qty      = pos["qty_remaining"] * fraction
+        gross    = (fill - pos["entry_price"]) * qty * pos["direction"]
+        cost     = fill * qty * cfg.commission_pct
+        return gross - cost
+
+    def _compute_metrics(self, max_dd: float) -> BacktestResult:
+        cfg    = self.cfg
+        trades = self.trades
+        curve  = self.equity_curve
+
+        total_return  = (self.equity - cfg.initial_capital) / cfg.initial_capital * 100
+        wins          = [t for t in trades if t["pnl"] > 0]
+        losses        = [t for t in trades if t["pnl"] <= 0]
+        win_rate      = len(wins) / len(trades) * 100 if trades else 0.0
+        gross_profit  = sum(t["pnl"] for t in wins)
+        gross_loss    = abs(sum(t["pnl"] for t in losses))
+        profit_factor = gross_profit / gross_loss if gross_loss > 0 else float("inf")
+
+        avg_win  = np.mean([t["pnl"] / cfg.initial_capital * 100 for t in wins])  if wins   else 0.0
+        avg_loss = np.mean([t["pnl"] / cfg.initial_capital * 100 for t in losses]) if losses else 0.0
+        best     = max((t["pnl"] for t in trades), default=0.0)
+        worst    = min((t["pnl"] for t in trades), default=0.0)
+        expectancy = (win_rate / 100 * avg_win) + ((1 - win_rate / 100) * avg_loss)
+
+        returns   = pd.Series(curve).pct_change().dropna()
+        sharpe    = (returns.mean() / returns.std() * np.sqrt(252 * 24)) if returns.std() > 0 else 0.0
+        neg_ret   = returns[returns < 0]
+        sortino   = (returns.mean() / neg_ret.std() * np.sqrt(252 * 24)) if len(neg_ret) > 0 else 0.0
+        calmar    = total_return / max_dd if max_dd > 0 else float("inf")
+
+        avg_bars  = np.mean([t["close_i"] - t["entry_i"] for t in trades]) if trades else 0.0
+        r_mult    = [(t["pnl"] / (abs(t["entry_price"] - t["sl"]) * t["qty"]))
+                     for t in trades if abs(t.get("entry_price", 0) - t.get("sl", 0)) > 0]
+
+        return BacktestResult(
+            symbol=cfg.symbol, interval=cfg.interval,
+            start=cfg.start, end=cfg.end, strategy=cfg.strategy,
+            initial_capital=cfg.initial_capital, final_equity=self.equity,
+            total_return_pct=round(total_return, 2),
+            max_drawdown_pct=round(max_dd, 2),
+            sharpe_ratio=round(float(sharpe), 3),
+            sortino_ratio=round(float(sortino), 3),
+            calmar_ratio=round(float(calmar), 3),
+            win_rate=round(win_rate, 2),
+            profit_factor=round(profit_factor, 3),
+            expectancy=round(float(expectancy), 4),
+            total_trades=len(trades), winning_trades=len(wins), losing_trades=len(losses),
+            avg_win_pct=round(float(avg_win), 3), avg_loss_pct=round(float(avg_loss), 3),
+            best_trade_pct=round(best / cfg.initial_capital * 100, 3),
+            worst_trade_pct=round(worst / cfg.initial_capital * 100, 3),
+            avg_holding_bars=round(float(avg_bars), 1),
+            r_multiples=[round(r, 3) for r in r_mult],
+            equity_curve=curve,
         )
-        # Price candles
-        fig.add_trace(go.Candlestick(
-            x=df.index, open=df.open, high=df.high, low=df.low, close=df.close,
-            name="Price", increasing_line_color="#26a69a", decreasing_line_color="#ef5350"
-        ), row=1, col=1)
-        # Entry markers
-        longs  = t[t.side == "long"]
-        shorts = t[t.side == "short"]
-        if len(longs):
-            fig.add_trace(go.Scatter(
-                x=df.index[longs.index.astype(int) % len(df) if len(longs) else []],
-                y=longs.entry_price, mode="markers",
-                marker=dict(symbol="triangle-up", size=8, color="#26a69a"),
-                name="Long Entry"
-            ), row=1, col=1)
-        # Equity curve
-        eq_idx = df.index[:len(equity_curve)]
-        fig.add_trace(go.Scatter(
-            x=eq_idx, y=equity_curve[:len(eq_idx)],
-            line=dict(color="#4f98a3", width=1.5), name="Equity"
-        ), row=2, col=1)
-        # Drawdown
-        ec = np.array(equity_curve[:len(eq_idx)])
-        peak = np.maximum.accumulate(ec)
-        dd   = (peak - ec) / np.maximum(peak, 1e-9)
-        fig.add_trace(go.Scatter(
-            x=eq_idx, y=-dd[:len(eq_idx)] * 100,
-            fill="tozeroy", line=dict(color="#ef5350"), name="Drawdown %"
-        ), row=3, col=1)
-        fig.update_layout(
-            title=f"Nexus Trader Backtest — {self.symbol} {self.timeframe}",
-            template="plotly_dark",
-            height=900,
-            xaxis_rangeslider_visible=False,
-        )
-        html_path = RESULTS_DIR / f"{slug}.html"
-        fig.write_html(str(html_path))
-        print(f"HTML report saved: {html_path}")
-
-    def _print_summary(self, m: dict) -> None:
-        sep = "=" * 62
-        print(f"\n{sep}")
-        print(f"  Nexus Trader Backtest — {m['symbol']} {m['timeframe']}")
-        print(sep)
-        print(f"  Total Trades     : {m['total_trades']}")
-        print(f"  Win Rate         : {m['win_rate']:.1%}")
-        print(f"  Profit Factor    : {m['profit_factor']:.2f}  (>1.2 = profitable)")
-        print(f"  Sharpe Ratio     : {m['sharpe_ratio']:.2f}  (>0.8 = acceptable)")
-        print(f"  Max Drawdown     : {m['max_drawdown']:.1%}  (<15% = safe)")
-        print(f"  Total Return     : {m['total_return']:.1%}")
-        print(f"  Final Equity     : ${m['final_equity']:>10,.2f}")
-        print(f"  Expectancy/trade : ${m['expectancy_usd']:>8.2f}")
-        print(f"  Exit reasons     : {m['exit_reasons']}")
-        print(f"  CSV              : {m['csv_path']}")
-        print(f"  HTML Report      : {m['html_path']}")
-        print(f"{sep}\n")
-
-    # ── Walk-forward optimizer ─────────────────────────────────────────────────────
-
-    def optimize(self, long_only: bool = True, top_n: int = 5) -> List[dict]:
-        """
-        Grid search over PARAM_GRID. Ranks by Sharpe * profit_factor.
-        Returns list of top_n param sets with their metrics.
-
-        Walk-forward logic:
-          - Train on first 70% of data
-          - Validate on last 30%
-          - Only params that perform on BOTH sets are reported
-        """
-        if self._df is None:
-            raise RuntimeError("Load data first.")
-
-        n     = len(self._df)
-        train = self._df.iloc[:int(n * 0.70)].copy()
-        valid = self._df.iloc[int(n * 0.70):].copy()
-
-        grid  = self.PARAM_GRID
-        keys  = list(grid.keys())
-        combos = list(product(*[grid[k] for k in keys]))
-        print(f"Optimizing {len(combos)} parameter combinations on {len(train)} train / {len(valid)} val candles...")
-
-        results = []
-        for combo in combos:
-            params = dict(zip(keys, combo))
-            if params["ema_fast"] >= params["ema_slow"]:
-                continue
-            try:
-                eng = BacktestEngine(
-                    symbol=self.symbol, timeframe=self.timeframe,
-                    ema_fast=params["ema_fast"], ema_slow=params["ema_slow"],
-                    atr_sl_mult=params["atr_sl_mult"], atr_tp_mult=params["atr_tp_mult"],
-                    rsi_min=params["rsi_min"], vol_mult=params["vol_mult"],
-                    initial_capital=self.initial_capital, fees=self.fees,
-                )
-                eng._df = train
-                df_t = eng._compute_signals()
-                tr_t, ec_t = eng._simulate(df_t, long_only)
-                if len(tr_t) < 20: continue  # too few trades
-                m_t = eng._calc_metrics(pd.DataFrame(tr_t), ec_t)
-                if m_t["profit_factor"] < 1.0: continue  # unprofitable on train
-
-                eng._df = valid
-                df_v = eng._compute_signals()
-                tr_v, ec_v = eng._simulate(df_v, long_only)
-                if len(tr_v) < 5: continue
-                m_v = eng._calc_metrics(pd.DataFrame(tr_v), ec_v)
-
-                score = m_v["sharpe_ratio"] * m_v["profit_factor"]
-                results.append({"params": params, "train": m_t, "valid": m_v, "score": score})
-            except Exception:
-                continue
-
-        results.sort(key=lambda x: x["score"], reverse=True)
-        top = results[:top_n]
-
-        # Save best params
-        if top:
-            best = top[0]
-            slug = f"{self.symbol}_{self.timeframe}"
-            p_path = RESULTS_DIR / f"{slug}_params.json"
-            with open(p_path, "w") as f:
-                json.dump(best["params"], f, indent=2)
-            print(f"\nBest params saved to {p_path}")
-            print(f"Best score (Sharpe x PF): {best['score']:.3f}")
-            print(f"Train → PF={best['train']['profit_factor']:.2f}  "
-                  f"Sharpe={best['train']['sharpe_ratio']:.2f}  "
-                  f"WR={best['train']['win_rate']:.1%}")
-            print(f"Valid → PF={best['valid']['profit_factor']:.2f}  "
-                  f"Sharpe={best['valid']['sharpe_ratio']:.2f}  "
-                  f"WR={best['valid']['win_rate']:.1%}")
-            print(f"Best params: {best['params']}")
-
-        return top
 
 
-# ── CLI ────────────────────────────────────────────────────────────────────────────
+# ─── OHLCV fetcher (Binance public endpoint — no API key required) ────────────
 
-async def _main():
-    parser = argparse.ArgumentParser(description="Nexus Trader Backtest + Optimizer")
-    parser.add_argument("--symbol",   default="BTCUSDT")
-    parser.add_argument("--tf",       default="15m", dest="timeframe")
-    parser.add_argument("--days",     default=365, type=int)
-    parser.add_argument("--testnet",  default=False, action=argparse.BooleanOptionalAction,
-                        help="Use Binance testnet (no real history — mainnet recommended)")
-    parser.add_argument("--futures",  default=False, action=argparse.BooleanOptionalAction)
-    parser.add_argument("--optimize", default=False, action=argparse.BooleanOptionalAction,
-                        help="Run walk-forward parameter optimization")
-    parser.add_argument("--csv",      default=None,  help="Load from CSV instead of Binance")
-    parser.add_argument("--capital",  default=10000, type=float)
+async def fetch_ohlcv(symbol: str, interval: str, start: str, end: str) -> pd.DataFrame:
+    """Download historical klines from Binance."""
+    import httpx
+
+    testnet = os.getenv("TESTNET", "false").lower() == "true"
+    base    = "https://testnet.binance.vision" if testnet else "https://api.binance.com"
+    url     = f"{base}/api/v3/klines"
+
+    start_ms = int(datetime.strptime(start, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+    end_ms   = int(datetime.strptime(end,   "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+
+    all_rows: list[list] = []
+    cursor   = start_ms
+    limit    = 1000
+
+    async with httpx.AsyncClient(timeout=30) as client:
+        while cursor < end_ms:
+            params = {"symbol": symbol, "interval": interval,
+                      "startTime": cursor, "endTime": end_ms, "limit": limit}
+            resp = await client.get(url, params=params)
+            resp.raise_for_status()
+            data = resp.json()
+            if not data:
+                break
+            all_rows.extend(data)
+            cursor = data[-1][0] + 1
+            if len(data) < limit:
+                break
+            logger.info("Fetched %d candles (total %d)", len(data), len(all_rows))
+
+    if not all_rows:
+        raise ValueError(f"No data returned for {symbol} {interval} {start}→{end}")
+
+    df = pd.DataFrame(all_rows, columns=[
+        "timestamp", "open", "high", "low", "close", "volume",
+        "close_time", "quote_volume", "trades", "taker_buy_base",
+        "taker_buy_quote", "ignore",
+    ])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
+    df.set_index("timestamp", inplace=True)
+    for col in ["open", "high", "low", "close", "volume"]:
+        df[col] = df[col].astype(float)
+    return df[["open", "high", "low", "close", "volume"]]
+
+
+# ─── Report writer ────────────────────────────────────────────────────────────
+
+def save_report(result: BacktestResult, output_dir: Path) -> None:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    tag = f"{result.symbol}_{result.interval}_{result.strategy}_{result.start[:7]}_{result.end[:7]}"
+
+    # JSON summary
+    summary = {k: v for k, v in result.__dict__.items() if k not in ("equity_curve", "r_multiples")}
+    (output_dir / f"{tag}_summary.json").write_text(json.dumps(summary, indent=2))
+
+    # Equity curve CSV
+    pd.Series(result.equity_curve, name="equity").to_csv(output_dir / f"{tag}_equity.csv")
+
+    # R-multiple distribution CSV
+    pd.Series(result.r_multiples, name="r_multiple").to_csv(output_dir / f"{tag}_r_multiples.csv")
+
+    # Console report
+    print("\n" + "═" * 60)
+    print(f"  NEXUS TRADER BACKTEST — {result.symbol} {result.interval} ({result.strategy})")
+    print("═" * 60)
+    print(f"  Period           : {result.start} → {result.end}")
+    print(f"  Initial Capital  : ${result.initial_capital:,.2f}")
+    print(f"  Final Equity     : ${result.final_equity:,.2f}")
+    print(f"  Total Return     : {result.total_return_pct:+.2f}%")
+    print(f"  Max Drawdown     : {result.max_drawdown_pct:.2f}%")
+    print(f"  Sharpe Ratio     : {result.sharpe_ratio:.3f}")
+    print(f"  Sortino Ratio    : {result.sortino_ratio:.3f}")
+    print(f"  Calmar Ratio     : {result.calmar_ratio:.3f}")
+    print("-" * 60)
+    print(f"  Total Trades     : {result.total_trades}")
+    print(f"  Win Rate         : {result.win_rate:.1f}%")
+    print(f"  Profit Factor    : {result.profit_factor:.3f}")
+    print(f"  Expectancy       : {result.expectancy:.4f}")
+    print(f"  Avg Win          : {result.avg_win_pct:+.3f}%")
+    print(f"  Avg Loss         : {result.avg_loss_pct:+.3f}%")
+    print(f"  Best Trade       : {result.best_trade_pct:+.3f}%")
+    print(f"  Worst Trade      : {result.worst_trade_pct:+.3f}%")
+    print(f"  Avg Holding      : {result.avg_holding_bars:.1f} bars")
+    print("═" * 60)
+    print(f"  Reports saved → {output_dir / tag}_*.json/csv")
+    print()
+
+
+# ─── CLI entry point ──────────────────────────────────────────────────────────
+
+async def main_async(cfg: BacktestConfig) -> None:
+    logger.info("Fetching OHLCV data for %s %s %s→%s", cfg.symbol, cfg.interval, cfg.start, cfg.end)
+    df = await fetch_ohlcv(cfg.symbol, cfg.interval, cfg.start, cfg.end)
+    logger.info("Downloaded %d candles", len(df))
+
+    gen    = SignalGenerator(df, cfg)
+    df_sig = gen.get_signals()
+
+    bt     = EventBacktester(df_sig, cfg)
+    result = bt.run()
+
+    save_report(result, Path("backtesting/reports"))
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Nexus Trader Backtester")
+    parser.add_argument("--symbol",           default="BTCUSDT")
+    parser.add_argument("--interval",         default="15m")
+    parser.add_argument("--start",            default="2024-01-01")
+    parser.add_argument("--end",              default="2024-12-31")
+    parser.add_argument("--strategy",         default="composite",
+                        choices=["trend", "mean_reversion", "breakout", "composite"])
+    parser.add_argument("--initial-capital",  type=float, default=10_000.0)
+    parser.add_argument("--risk-per-trade",   type=float, default=0.01)
+    parser.add_argument("--commission",        type=float, default=0.0005)
     args = parser.parse_args()
 
-    engine = BacktestEngine(
-        symbol=args.symbol,
-        timeframe=args.timeframe,
-        initial_capital=args.capital,
+    cfg = BacktestConfig(
+        symbol=args.symbol, interval=args.interval,
+        start=args.start, end=args.end, strategy=args.strategy,
+        initial_capital=args.initial_capital,
+        risk_per_trade=args.risk_per_trade,
+        commission_pct=args.commission,
     )
-
-    if args.csv:
-        engine.load_from_csv(args.csv)
-    else:
-        await engine.load_from_binance(days=args.days, testnet=args.testnet)
-
-    if args.optimize:
-        engine.optimize(long_only=not args.futures)
-    else:
-        engine.run(long_only=not args.futures)
+    asyncio.run(main_async(cfg))
 
 
 if __name__ == "__main__":
-    asyncio.run(_main())
+    main()
