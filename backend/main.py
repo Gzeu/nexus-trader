@@ -1,8 +1,6 @@
 """
 main.py – Uvicorn entry point.
-
-Fix: configures structlog JSON renderer at startup so all logs are structured
-from the first line. Was missing — default structlog config outputs plain text.
+Configures structlog at startup before any module imports the logger.
 """
 from __future__ import annotations
 
@@ -12,13 +10,13 @@ import structlog
 
 
 def _configure_logging() -> None:
-    """Configure structlog for JSON output (production) or console (dev)."""
+    """Configure structlog: JSON in production, coloured console otherwise."""
     from backend.config import get_settings
     settings = get_settings()
 
-    renderer = (
+    renderer: structlog.types.Processor = (
         structlog.processors.JSONRenderer()
-        if settings.environment == "production"
+        if settings.is_production
         else structlog.dev.ConsoleRenderer(colors=True)
     )
 
@@ -40,6 +38,6 @@ def _configure_logging() -> None:
 
 _configure_logging()
 
-from backend.api.app import create_app  # noqa: E402 (after logging config)
+from backend.api.app import create_app  # noqa: E402  (intentional: after logging init)
 
 app = create_app()

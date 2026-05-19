@@ -19,18 +19,25 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ── Exchange ────────────────────────────────────────────────────────────────────
+    # ── Environment ───────────────────────────────────────────────────────
+    environment: str = Field(
+        default="development",
+        pattern="^(development|staging|production)$",
+        description="Runtime environment: development | staging | production",
+    )
+
+    # ── Exchange ──────────────────────────────────────────────────────────────────
     binance_api_key: str = Field(default="", description="Binance API key")
     binance_api_secret: str = Field(default="", description="Binance API secret")
     testnet: bool = Field(default=True, description="Use Binance testnet")
     dry_run: bool = Field(default=True, description="Simulate orders, never send real ones")
 
-    # ── Mode ───────────────────────────────────────────────────────────────────────
+    # ── Mode ──────────────────────────────────────────────────────────────────────
     market_mode: str = Field(default="spot", pattern="^(spot|futures)$")
     futures_enabled: bool = Field(default=False)
     default_leverage: int = Field(default=1, ge=1, le=125)
 
-    # ── Risk ──────────────────────────────────────────────────────────────────────
+    # ── Risk ─────────────────────────────────────────────────────────────────────
     risk_per_trade: float = Field(default=0.01, gt=0, le=0.05)
     max_positions: int = Field(default=5, ge=1, le=20)
     max_daily_loss: float = Field(default=0.03, gt=0, le=0.20)
@@ -39,7 +46,7 @@ class Settings(BaseSettings):
     cooldown_minutes: int = Field(default=20, ge=0)
     max_consecutive_losses: int = Field(default=3, ge=1)
 
-    # ── Volatility / Spread filters ─────────────────────────────────────────────
+    # ── Volatility / Spread filters ────────────────────────────────────────────
     atr_max_pct: float = Field(default=0.05, gt=0)
     spread_max_pct: float = Field(default=0.002, gt=0)
 
@@ -51,7 +58,7 @@ class Settings(BaseSettings):
     exchange_info_ttl_seconds: int = Field(default=1800, ge=60)
     max_retries: int = Field(default=3, ge=1)
 
-    # ── Automation ──────────────────────────────────────────────────────────────
+    # ── Automation ────────────────────────────────────────────────────────────
     automation_interval_sec: int = Field(default=60, ge=5)
     strategy_interval_seconds: int = Field(default=60, ge=5)
     strategy_timeframe: str = Field(default="15m")
@@ -59,24 +66,24 @@ class Settings(BaseSettings):
     symbol_whitelist: str = Field(default="BTCUSDT,ETHUSDT")
     symbol_blacklist: str = Field(default="")
 
-    # ── Journal ───────────────────────────────────────────────────────────────────
+    # ── Journal ──────────────────────────────────────────────────────────────────
     journal_csv_path: str = Field(default="journal/trades.csv")
     journal_db_path: str = Field(default="journal/trades.db")
 
-    # ── Telegram ──────────────────────────────────────────────────────────────────
+    # ── Telegram ───────────────────────────────────────────────────────────────
     telegram_bot_token: str = Field(default="")
     telegram_chat_id: str = Field(default="")
 
-    # ── Redis ──────────────────────────────────────────────────────────────────────
+    # ── Redis ──────────────────────────────────────────────────────────────────
     redis_url: str = Field(default="")
 
-    # ── Server ────────────────────────────────────────────────────────────────────
+    # ── Server ───────────────────────────────────────────────────────────────────
     host: str = Field(default="0.0.0.0")
     port: int = Field(default=8000)
     secret_key: str = Field(default="change_me")
     log_level: str = Field(default="INFO")
 
-    # ── Derived helpers ────────────────────────────────────────────────────────────
+    # ── Derived helpers ──────────────────────────────────────────────────────────
     @property
     def symbols_list(self) -> List[str]:
         return [s.strip().upper() for s in self.symbols.split(",") if s.strip()]
@@ -89,9 +96,18 @@ class Settings(BaseSettings):
     def allowed_symbols(self) -> List[str]:
         return [s for s in self.symbols_list if s not in self.blacklist_set]
 
+    @property
+    def is_production(self) -> bool:
+        return self.environment == "production"
+
     @field_validator("market_mode")
     @classmethod
     def normalize_mode(cls, v: str) -> str:
+        return v.lower()
+
+    @field_validator("environment")
+    @classmethod
+    def normalize_env(cls, v: str) -> str:
         return v.lower()
 
 
