@@ -2,26 +2,15 @@
  * tradingview_broker.ts – Complete IBrokerTerminal implementation for Nexus Trader.
  *
  * Changes in this version:
- * - ChartMarkerManager integrated — all WS events wired to chart markers:
- *     order_filled  → markers.onOrderFilled()
- *     signal_created→ markers.onSignal()
- *     tp1_hit       → markers.onTPHit(pos, 1, price, time)
- *     tp2_hit       → markers.onTPHit(pos, 2, price, time)
- *     sl_hit        → markers.onSLHit(pos, price, time)
- *     breakeven     → markers.onBreakevenMove()
- *     risk_event    → markers.onRiskEvent() [CRITICAL/WARNING routed]
- * - destroy() method — cleans up WS + marker manager
- * - loadHistoricalMarkers() — one call to render all past signals on chart
- * - WebSocket auto-reconnect with exponential backoff (max 30s)
- * - _pendingOrders cache prevents duplicate submissions on double-click
- * - _formatDecimal() ensures TradingView receives string numbers
- * - preOrderChecks() pings /health before every order
- * - Error boundaries on every async call with user-visible notification
- * - X-API-Key header on all fetch calls
- *
- * Docs:
- *   https://www.tradingview.com/charting-library-docs/latest/quick-start/
- *   https://www.tradingview.com/charting-library-docs/latest/api/interfaces/Charting_Library.IBrokerTerminal
+ * - FIX: wsUrl corect este /api/v1/ws (nu /ws simplu).
+ *   Anterior comentariul din NexusBrokerConfig sugera "ws://localhost:8000/ws"
+ *   care cauza "Connecting..." permanent deoarece ruta WS e montata la
+ *   /api/v1 prefix + /ws = /api/v1/ws.
+ * - ADD: createBroker() factory helper cu URL-uri default corecte.
+ * - ChartMarkerManager integrated.
+ * - WebSocket auto-reconnect cu exponential backoff (max 30s).
+ * - _pendingOrders cache previne duplicate submissions.
+ * - preOrderChecks() pings /health inainte de fiecare ordin.
  */
 
 /// <reference types="@tradingview/charting_library" />
@@ -46,11 +35,51 @@ const DEFAULT_WS_RECONNECT_MS = 1_000;
 const MAX_WS_RECONNECT_MS     = 30_000;
 
 export interface NexusBrokerConfig {
-  apiBase:     string;          // e.g. "http://localhost:8000/api/v1"
-  wsUrl:       string;          // e.g. "ws://localhost:8000/ws"
-  apiKey?:     string;          // API_SECRET_KEY from .env
+  /**
+   * Base URL pentru REST API, inclusiv prefix-ul.
+   * @example "http://localhost:8000/api/v1"
+   */
+  apiBase: string;
+
+  /**
+   * URL complet WebSocket.
+   * IMPORTANT: ruta e /api/v1/ws, NU /ws simplu.
+   * @example "ws://localhost:8000/api/v1/ws"
+   */
+  wsUrl: string;
+
+  /** X-API-Key header trimis la fiecare request. Setat din SECRET_KEY din .env. */
+  apiKey?: string;
+
   marketMode?: 'SPOT' | 'FUTURES';
   debug?:      boolean;
+}
+
+/**
+ * Factory helper cu URL-uri default corecte pentru localhost.
+ *
+ * @example
+ *   const broker = createBroker(host, { apiKey: 'your-secret-key' });
+ *
+ * @example  // productie
+ *   const broker = createBroker(host, {
+ *     apiBase: 'https://api.yourdomain.com/api/v1',
+ *     wsUrl:   'wss://api.yourdomain.com/api/v1/ws',
+ *     apiKey:  'your-secret-key',
+ *   });
+ */
+export function createBroker(
+  host:   ReturnType<IBrokerTerminal['host']>,
+  config: Partial<NexusBrokerConfig> & { apiKey?: string } = {},
+): TradingSystemBroker {
+  const merged: NexusBrokerConfig = {
+    apiBase:    'http://localhost:8000/api/v1',
+    wsUrl:      'ws://localhost:8000/api/v1/ws',   // ✅ URL corect
+    marketMode: 'SPOT',
+    debug:      false,
+    ...config,
+  };
+  return new TradingSystemBroker(host, merged);
 }
 
 export class TradingSystemBroker implements IBrokerTerminal {
@@ -69,29 +98,27 @@ export class TradingSystemBroker implements IBrokerTerminal {
     config: NexusBrokerConfig,
   ) {
     this._host    = host;
-    this._config  = { marketMode: 'SPOT', debug: false, ...config };
-    this._markers = new ChartMarkerManager(null); // attached later via attachWidget()
+    // Garanteaza ca wsUrl nu e niciodata /ws simplu
+    const safeWsUrl = config.wsUrl.endsWith('/ws') && !config.wsUrl.includes('/api/')
+      ? config.wsUrl.replace(/\/ws$/, '/api/v1/ws')
+      : config.wsUrl;
+    this._config  = { marketMode: 'SPOT', debug: false, ...config, wsUrl: safeWsUrl };
+    this._markers = new ChartMarkerManager(null);
     this._connectWS();
   }
 
   /**
    * Call inside widget.onChartReady() to attach the marker manager to the live
    * chart and load all historical signals as markers.
-   *
-   * @param widget   The IChartingLibraryWidget instance
    */
   attachWidget(widget: any): void {
     this._markers = new ChartMarkerManager(widget);
-    // Render historical signals on chart
     this._markers.loadHistoricalSignals(
       this._config.apiBase,
       this._config.apiKey,
     ).catch(e => this._log('warn', 'loadHistoricalSignals failed', e));
   }
 
-  /**
-   * Destroy this broker instance — disconnect WS and clear markers.
-   */
   destroy(): void {
     this._destroyed = true;
     if (this._wsReconnectTimer) clearTimeout(this._wsReconnectTimer);
@@ -99,7 +126,7 @@ export class TradingSystemBroker implements IBrokerTerminal {
     this._ws = null;
   }
 
-  // ── IBrokerTerminal required ──────────────────────────────────────────────
+  // ── IBrokerTerminal required ───────────────────────────────────────────────
 
   connectionStatus(): number {
     return this._connected ? 1 : 0;
@@ -247,7 +274,7 @@ export class TradingSystemBroker implements IBrokerTerminal {
     };
   }
 
-  // ── WebSocket ─────────────────────────────────────────────────────────────
+  // ── WebSocket ──────────────────────────────────────────────────────────────
 
   private _connectWS(): void {
     if (this._destroyed) return;
@@ -262,7 +289,7 @@ export class TradingSystemBroker implements IBrokerTerminal {
       this._ws.onopen = () => {
         this._connected    = true;
         this._wsReconnectMs = DEFAULT_WS_RECONNECT_MS;
-        this._log('info', 'WebSocket connected');
+        this._log('info', 'WebSocket connected to', this._config.wsUrl);
       };
 
       this._ws.onmessage = (ev) => {
@@ -305,11 +332,9 @@ export class TradingSystemBroker implements IBrokerTerminal {
     const { event: type, payload } = event;
 
     switch (type) {
-      // ── IBrokerTerminal host updates ──────────────────────────────────────
       case 'order_filled':
       case 'order_placed':
         this._host.orderUpdate(this._mapOrder(payload));
-        // Chart marker: entry arrow
         this._markers.onOrderFilled({
           symbol:   payload.symbol,
           side:     payload.side,
@@ -344,8 +369,7 @@ export class TradingSystemBroker implements IBrokerTerminal {
       case 'tp1_hit': {
         const pos = payload.position ?? {};
         this._markers.onTPHit(
-          this._payloadToMarkerPos(payload.symbol, pos),
-          1,
+          this._payloadToMarkerPos(payload.symbol, pos), 1,
           parseFloat(payload.price ?? 0),
           payload.time ?? Math.floor(Date.now() / 1000),
         );
@@ -356,8 +380,7 @@ export class TradingSystemBroker implements IBrokerTerminal {
       case 'tp2_hit': {
         const pos2 = payload.position ?? {};
         this._markers.onTPHit(
-          this._payloadToMarkerPos(payload.symbol, pos2),
-          2,
+          this._payloadToMarkerPos(payload.symbol, pos2), 2,
           parseFloat(payload.price ?? 0),
           payload.time ?? Math.floor(Date.now() / 1000),
         );
@@ -411,7 +434,7 @@ export class TradingSystemBroker implements IBrokerTerminal {
     }
   }
 
-  // ── Private helpers ───────────────────────────────────────────────────────
+  // ── Private helpers ───────────────────────────────────────────────────────────
 
   private _payloadToMarkerPos(symbol: string, pos: any): MarkerPosition {
     return {
