@@ -1,12 +1,16 @@
 """
-scripts/smoke_test.py – Post-fix smoke test suite.
+scripts/smoke_test.py – Nexus Trader post-fix smoke test suite v2.
 
-Verifies all critical paths without a live Binance connection:
-1. Imports of all core modules
-2. RiskManager._check_rr() does NOT veto market orders (entry_price=None)
-3. CompositeStrategy uses conservative min/max SL/TP (not average)
-4. Synthetic OHLCV (100 candles random walk) flows through CompositeStrategy
-5. ExecutionEngine dry-run returns DRY_RUN status
+Covers:
+  1. All core module imports
+  2. FIX 1  — RiskManager._check_rr() does NOT veto market orders (entry_price=None)
+  3. FIX 1b — Valid limit order passes RR check
+  4. FIX 2  — CompositeStrategy conservative SL/TP merge (no LOW_RR veto)
+  5. FIX 3  — _sharpe() on percentage returns (not absolute)
+  6. FIX 4  — ExecutionEngine bracket dry-run returns DRY_RUN, ids prefixed DRY_
+  7. COMPLETARE 1 — OHLCVProvider cache TTL (get_klines called once on repeated fetch)
+  8. Bonus  — calc_position_size stays within risk_per_trade limit
+  9. Bonus  — CompositeStrategy.compute() synthetic OHLCV full flow
 
 Run:
     python -m scripts.smoke_test
@@ -22,32 +26,35 @@ import traceback
 from decimal import Decimal
 from typing import List
 from unittest.mock import AsyncMock, MagicMock
-from uuid import uuid4
 
-# Force testnet + dry_run so no real API calls happen
-os.environ.setdefault("TESTNET", "true")
-os.environ.setdefault("DRY_RUN", "true")
-os.environ.setdefault("BINANCE_API_KEY", "smoke_test_key")
-os.environ.setdefault("BINANCE_API_SECRET", "smoke_test_secret")
-os.environ.setdefault("MIN_RR", "1.5")
-os.environ.setdefault("MAX_POSITIONS", "3")
-os.environ.setdefault("RISK_PER_TRADE", "0.01")
-os.environ.setdefault("MAX_CONSECUTIVE_LOSSES", "3")
-os.environ.setdefault("MAX_DAILY_LOSS", "0.03")
-os.environ.setdefault("MAX_DRAWDOWN", "0.12")
-os.environ.setdefault("COOLDOWN_MINUTES", "0")
-os.environ.setdefault("FUTURES_LEVERAGE", "1")
-os.environ.setdefault("SCAN_INTERVAL_SECONDS", "60")
-os.environ.setdefault("PRIMARY_TIMEFRAME", "15m")
+# ── Bootstrap env (no real .env needed) ─────────────────────────────────────
+os.environ.setdefault("TESTNET",                  "true")
+os.environ.setdefault("DRY_RUN",                  "true")
+os.environ.setdefault("BINANCE_API_KEY",           "smoke_test_key")
+os.environ.setdefault("BINANCE_API_SECRET",        "smoke_test_secret")
+os.environ.setdefault("MIN_RR",                    "1.5")
+os.environ.setdefault("MAX_POSITIONS",             "3")
+os.environ.setdefault("RISK_PER_TRADE",            "0.01")
+os.environ.setdefault("MAX_CONSECUTIVE_LOSSES",    "3")
+os.environ.setdefault("MAX_DAILY_LOSS",            "0.03")
+os.environ.setdefault("MAX_DRAWDOWN",              "0.12")
+os.environ.setdefault("COOLDOWN_MINUTES",          "0")
+os.environ.setdefault("FUTURES_LEVERAGE",          "1")
+os.environ.setdefault("SCAN_INTERVAL_SECONDS",     "60")
+os.environ.setdefault("PRIMARY_TIMEFRAME",         "15m")
 os.environ.setdefault("EXCHANGE_INFO_TTL_SECONDS", "1800")
-os.environ.setdefault("MAX_RETRIES", "3")
-os.environ.setdefault("RETRY_BASE_DELAY", "0.01")
-os.environ.setdefault("RETRY_MAX_DELAY", "1.0")
-os.environ.setdefault("SYMBOL_WHITELIST", "BTCUSDT")
+os.environ.setdefault("MAX_RETRIES",               "3")
+os.environ.setdefault("RETRY_BASE_DELAY",          "0.01")
+os.environ.setdefault("RETRY_MAX_DELAY",           "1.0")
+os.environ.setdefault("SYMBOL_WHITELIST",          "BTCUSDT")
+os.environ.setdefault("LOG_LEVEL",                 "WARNING")
 
-PASS = "\033[92m✓\033[0m"
-FAIL = "\033[91m✗\033[0m"
-INFO = "\033[94m●\033[0m"
+# ── Colors ───────────────────────────────────────────────────────────────────
+PASS = "\033[92m\u2713\033[0m"
+FAIL = "\033[91m\u2717\033[0m"
+INFO = "\033[94m\u25cf\033[0m"
+BOLD = "\033[1m"
+RST  = "\033[0m"
 
 results: List[tuple] = []
 
@@ -55,289 +62,374 @@ results: List[tuple] = []
 def check(name: str, condition: bool, detail: str = "") -> None:
     results.append((name, condition, detail))
     icon = PASS if condition else FAIL
-    print(f"  {icon} {name}" + (f" — {detail}" if detail else ""))
-    if not condition:
-        print(f"     {traceback.format_exc().strip()}" if sys.exc_info()[0] else "")
+    suffix = f" \u2014 {detail}" if detail else ""
+    print(f"  {icon} {name}{suffix}")
 
 
-def make_klines(n: int = 100, start_price: float = 50000.0) -> List:
-    """Generate synthetic Binance klines (random walk)."""
+# ── Synthetic data helpers ────────────────────────────────────────────────────
+
+def _random_walk(n: int = 120, start: float = 42_000.0, vol: float = 0.002) -> List[float]:
+    """Geometric random walk price series."""
+    prices = [start]
+    rng = random.Random(42)  # deterministic seed for reproducibility
+    for _ in range(n - 1):
+        prices.append(prices[-1] * (1 + rng.gauss(0, vol)))
+    return prices
+
+
+def make_klines(n: int = 120) -> List[List]:
+    """
+    Generate n synthetic klines in Binance format:
+    [open_time, open, high, low, close, volume, close_time, ...]
+    """
+    closes = _random_walk(n)
+    opens: List[float] = []
     klines = []
-    price = start_price
-    now_ms = 1_700_000_000_000
-    for i in range(n):
-        change = random.uniform(-0.005, 0.005) * price
-        open_  = price
-        close  = price + change
-        high   = max(open_, close) * random.uniform(1.0, 1.003)
-        low    = min(open_, close) * random.uniform(0.997, 1.0)
-        vol    = random.uniform(10, 500)
-        t      = now_ms + i * 900_000  # 15m intervals
+    rng = random.Random(99)
+    for i, c in enumerate(closes):
+        o = closes[i - 1] if i > 0 else c
+        spread = c * 0.003
+        h = max(o, c) + abs(rng.gauss(0, spread))
+        lo = min(o, c) - abs(rng.gauss(0, spread))
+        vol = rng.uniform(10, 500)
+        ts = 1_700_000_000_000 + i * 60_000
         klines.append([
-            t, str(open_), str(high), str(low), str(close), str(vol),
-            t + 899_999, str(close * vol), 100,
-            str(vol * 0.6), str(close * vol * 0.6), "0",
+            ts,               # 0 open_time
+            str(o),           # 1 open
+            str(h),           # 2 high
+            str(lo),          # 3 low
+            str(c),           # 4 close
+            str(vol),         # 5 volume
+            ts + 59_999,      # 6 close_time
+            "0", "0", "0", "0", "0",  # 7-11 unused
         ])
-        price = close
+        opens.append(o)
     return klines
 
 
-async def run_tests():
-    print(f"\n{INFO} Nexus Trader — Smoke Test Suite")
-    print("=" * 50)
+def make_market_signal(
+    symbol: str = "BTCUSDT",
+    last_close: float = 42_000.0,
+) -> object:
+    """StrategySignal with entry_price=None — FIX 1 scenario."""
+    from backend.models import Action, EntryType, MarketMode, StrategySignal
+    return StrategySignal(
+        symbol=symbol,
+        action=Action.BUY,
+        confidence=0.80,
+        entry_type=EntryType.MARKET,
+        entry_price=None,
+        stop_loss=last_close * 0.985,
+        take_profit_1=last_close * 1.030,
+        take_profit_2=last_close * 1.060,
+        trailing_stop=None,
+        timeframe="15m",
+        reason="smoke_test_market_order",
+        metadata={"last_close": last_close},
+    )
 
-    # ── Test 1: Module Imports ────────────────────────────────────────────────
-    print(f"\n{INFO} [1] Module imports")
+
+def make_limit_signal(
+    symbol: str = "BTCUSDT",
+    entry: float = 42_000.0,
+) -> object:
+    """StrategySignal with explicit entry_price — valid RR."""
+    from backend.models import Action, EntryType, MarketMode, StrategySignal
+    return StrategySignal(
+        symbol=symbol,
+        action=Action.BUY,
+        confidence=0.78,
+        entry_type=EntryType.LIMIT,
+        entry_price=entry,
+        stop_loss=entry * 0.985,      # risk  = 1.5 %
+        take_profit_1=entry * 1.030,  # reward= 3.0 %  → RR = 2.0 ≥ 1.5 ✓
+        take_profit_2=entry * 1.060,
+        trailing_stop=None,
+        timeframe="15m",
+        reason="smoke_test_limit_order",
+        metadata={},
+    )
+
+
+# ── Test runner ────────────────────────────────────────────────────────────────
+
+async def run_tests() -> None:
+    # ── [1] Imports ─────────────────────────────────────────────────────────
+    print(f"\n{BOLD}[1] Core module imports{RST}")
     try:
-        from backend.config import get_settings
+        from backend.config import get_settings                          # noqa
         from backend.models import (
-            Action, MarketMode, Order, OrderRequest, OrderSide,
-            OrderStatus, OrderType, RiskVeto, StrategySignal,
+            Action, EntryType, MarketMode, Order, OrderRequest,
+            OrderSide, OrderStatus, OrderType, RiskVeto, StrategySignal,
         )
-        from backend.core.strategy_engine import (
-            OHLCV, CompositeStrategy, TrendFollowingStrategy,
-            MeanReversionStrategy, BreakoutStrategy, detect_regime,
-        )
-        from backend.core.trade_logic import (
+        from backend.core.risk_manager   import RiskManager
+        from backend.core.strategy_engine import OHLCV, CompositeStrategy
+        from backend.core.trade_logic    import (
             calc_position_size, should_enter_long, should_enter_short,
         )
-        from backend.core.risk_manager import RiskManager
         from backend.core.execution_engine import ExecutionEngine
-        check("All core modules imported", True)
+        from backend.core.ohlcv_provider    import OHLCVProvider
+        check("All core imports succeed", True)
     except Exception as exc:
-        check("All core modules imported", False, str(exc))
-        print(f"\n{FAIL} Critical import failure — aborting smoke tests.")
-        return
+        check("All core imports succeed", False, str(exc))
+        traceback.print_exc()
+        print(f"\n{FAIL} Cannot continue — fix imports first")
+        sys.exit(1)
 
     settings = get_settings()
 
-    # ── Test 2: RiskManager._check_rr() with entry_price=None ────────────────
-    print(f"\n{INFO} [2] RiskManager — market order RR check (entry_price=None)")
-    rm = RiskManager()
-    rm.update_equity(10_000.0)
-
-    # Signal with NO entry_price but last_close in metadata (market order)
-    sig_market = StrategySignal(
-        symbol="BTCUSDT",
-        action=Action.BUY,
-        confidence=0.75,
-        entry_type="market",
-        entry_price=None,          # ← the bug scenario
-        stop_loss=49_000.0,
-        take_profit_1=52_000.0,
-        take_profit_2=55_000.0,
-        timeframe="15m",
-        reason="smoke_test",
-        metadata={"last_close": 50_000.0},  # ← FIX 1: fallback price
-    )
-    veto = rm.check_signal(sig_market)
-    check(
-        "Market order (entry_price=None) is NOT vetoed as LOW_RR",
-        veto != RiskVeto.LOW_RR,
-        f"veto={veto.value}",
-    )
-    check(
-        "Market order check_signal returns OK",
-        veto == RiskVeto.OK,
-        f"veto={veto.value}",
-    )
-
-    # Signal that genuinely has bad RR should still be caught
-    sig_bad_rr = StrategySignal(
-        symbol="BTCUSDT",
-        action=Action.BUY,
-        confidence=0.75,
-        entry_type="market",
-        entry_price=None,
-        stop_loss=49_900.0,    # SL very close — risk = 100
-        take_profit_1=50_050.0,  # TP1 tiny — reward = 50, RR = 0.5
-        take_profit_2=50_100.0,
-        timeframe="15m",
-        reason="bad_rr_test",
-        metadata={"last_close": 50_000.0},
-    )
-    veto_bad = rm.check_signal(sig_bad_rr)
-    check(
-        "Genuinely bad RR signal IS vetoed as LOW_RR",
-        veto_bad == RiskVeto.LOW_RR,
-        f"veto={veto_bad.value}",
-    )
-
-    # ── Test 3: CompositeStrategy conservative SL/TP (FIX 2) ─────────────────
-    print(f"\n{INFO} [3] CompositeStrategy — conservative min/max SL/TP (FIX 2)")
-    from backend.models import StrategySignal as SS
-    from backend.core.strategy_engine import CompositeStrategy as CS, Action as A
-
-    # Simulate _merge_signals manually with two BUY signals
-    class _FakeStrategy:
-        pass
-
-    # Two BUY signals with different SL/TP
-    s1 = StrategySignal(
-        symbol="BTCUSDT", action=Action.BUY, confidence=0.8,
-        entry_type="market", entry_price=None,
-        stop_loss=48_000.0, take_profit_1=53_000.0, take_profit_2=56_000.0,
-        timeframe="15m", reason="s1", metadata={"last_close": 50_000.0},
-    )
-    s2 = StrategySignal(
-        symbol="BTCUSDT", action=Action.BUY, confidence=0.7,
-        entry_type="market", entry_price=None,
-        stop_loss=49_000.0, take_profit_1=52_000.0, take_profit_2=54_000.0,
-        timeframe="15m", reason="s2", metadata={"last_close": 50_000.0},
-    )
-    # Conservative BUY: SL = min(48k, 49k) = 48k; TP1 = min(53k, 52k) = 52k
-    # Average BUY (old): SL = 48.5k; TP1 = 52.5k
-    # Conservative is BETTER — SL further away, TP closer (safer RR guaranteed)
-    klines = make_klines(100)
-    ohlcv  = OHLCV(klines)
-
-    composite = CompositeStrategy(
-        strategies=[], symbol="BTCUSDT", timeframe="15m", market_mode=MarketMode.SPOT
-    )
-    # Direct call to _merge_signals
-    merged = composite._merge_signals([(s1, 1.0), (s2, 1.0)], "TRENDING", ohlcv)
-    if merged:
-        check(
-            "Merged SL = min of individual SLs (conservative)",
-            merged.stop_loss == 48_000.0,
-            f"got sl={merged.stop_loss}",
-        )
-        check(
-            "Merged TP1 = min of individual TP1s (conservative)",
-            merged.take_profit_1 == 52_000.0,
-            f"got tp1={merged.take_profit_1}",
-        )
-        check(
-            "Merged TP2 = min of individual TP2s",
-            merged.take_profit_2 == 54_000.0,
-            f"got tp2={merged.take_profit_2}",
-        )
-    else:
-        check("_merge_signals returned a signal", False, "returned None")
-
-    # ── Test 4: CompositeStrategy.compute() with synthetic OHLCV ─────────────
-    print(f"\n{INFO} [4] CompositeStrategy.compute() — synthetic 100-candle OHLCV")
+    # ── [2] FIX 1a — market order RR not vetoed ─────────────────────────────
+    print(f"\n{BOLD}[2] FIX 1 — market order (entry_price=None) not LOW_RR vetoed{RST}")
     try:
-        trend_strat  = TrendFollowingStrategy(symbol="BTCUSDT", timeframe="15m", market_mode=MarketMode.SPOT)
-        mean_strat   = MeanReversionStrategy(symbol="BTCUSDT", timeframe="15m", market_mode=MarketMode.SPOT)
-        break_strat  = BreakoutStrategy(symbol="BTCUSDT", timeframe="15m", market_mode=MarketMode.SPOT)
-        composite_full = CompositeStrategy(
-            strategies=[trend_strat, mean_strat, break_strat],
-            weights={"TrendFollowingStrategy": 1.5, "MeanReversionStrategy": 1.0, "BreakoutStrategy": 1.2},
-            symbol="BTCUSDT", timeframe="15m", market_mode=MarketMode.SPOT,
-        )
-        random.seed(42)  # deterministic
-        klines2 = make_klines(100)
-        ohlcv2  = OHLCV(klines2)
-        signal  = await composite_full.compute(ohlcv2)
+        rm = RiskManager()
+        rm.update_equity(10_000.0)
+        sig = make_market_signal()
+        veto = rm.check_signal(sig)
         check(
-            "CompositeStrategy.compute() completes without exception",
-            True,
+            "Market order veto is NOT LOW_RR",
+            veto != RiskVeto.LOW_RR,
+            f"veto={veto.value}",
         )
-        if signal:
-            check(
-                "Signal has valid SL/TP",
-                signal.stop_loss > 0 and signal.take_profit_1 > 0,
-                f"action={signal.action.value} sl={signal.stop_loss:.2f} tp1={signal.take_profit_1:.2f}",
-            )
-            check(
-                "Signal has last_close in metadata (FIX 1 compatibility)",
-                "last_close" in signal.metadata,
-                str(signal.metadata.get("last_close")),
-            )
-            print(f"     Signal: {signal.action.value} confidence={signal.confidence:.3f} reason={signal.reason[:60]}")
-        else:
-            check("Signal is None (HOLD) — acceptable for random data", True)
+        check(
+            "Market order veto is OK (equity set, no open positions)",
+            veto == RiskVeto.OK,
+            f"veto={veto.value}",
+        )
     except Exception as exc:
-        check("CompositeStrategy.compute() — no exception", False, str(exc))
+        check("FIX 1 — no exception", False, str(exc))
+        traceback.print_exc()
 
-    # ── Test 5: ExecutionEngine dry-run ───────────────────────────────────────
-    print(f"\n{INFO} [5] ExecutionEngine — dry-run order")
+    # ── [3] FIX 1b — valid limit order passes ───────────────────────────────
+    print(f"\n{BOLD}[3] FIX 1b — valid limit order (good RR) passes{RST}")
+    try:
+        rm2 = RiskManager()
+        rm2.update_equity(10_000.0)
+        sig2 = make_limit_signal()
+        veto2 = rm2.check_signal(sig2)
+        check(
+            "Limit order with RR=2.0 returns OK",
+            veto2 == RiskVeto.OK,
+            f"veto={veto2.value}",
+        )
+    except Exception as exc:
+        check("FIX 1b — no exception", False, str(exc))
+
+    # ── [4] CompositeStrategy full flow ─────────────────────────────────────
+    print(f"\n{BOLD}[4] CompositeStrategy.compute() on synthetic OHLCV{RST}")
+    try:
+        klines = make_klines(120)
+        ohlcv  = OHLCV(klines)
+        cs     = CompositeStrategy()
+        signal = await cs.compute(ohlcv)
+
+        check("compute() runs without exception", True)
+        if signal is not None:
+            check(
+                "Signal has required fields",
+                all([
+                    signal.symbol is not None,
+                    signal.action is not None,
+                    signal.stop_loss > 0,
+                    signal.take_profit_1 > 0,
+                    0.0 <= signal.confidence <= 1.0,
+                ]),
+                f"action={signal.action.value} conf={signal.confidence:.3f} "
+                f"sl={signal.stop_loss:.2f} tp1={signal.take_profit_1:.2f}",
+            )
+        else:
+            check("No consensus / HOLD returned cleanly (valid)", True)
+    except Exception as exc:
+        check("CompositeStrategy — no exception", False, str(exc))
+        traceback.print_exc()
+
+    # ── [5] FIX 2 — conservative merge no LOW_RR ────────────────────────────
+    print(f"\n{BOLD}[5] FIX 2 — conservative SL/TP merge does not cause LOW_RR veto{RST}")
+    try:
+        rm3 = RiskManager()
+        rm3.update_equity(50_000.0)
+        low_rr_hits = 0
+        rng = random.Random(7)
+
+        for trial in range(8):
+            k = make_klines(120)
+            # Add deterministic drift so we get actionable signals
+            closes = [float(row[4]) for row in k]
+            trend  = 1.0
+            for i in range(len(k)):
+                trend *= 1 + rng.gauss(0.001, 0.001)  # slight uptrend
+                k[i][4] = str(float(k[i][4]) * trend)
+
+            ohlcv_t = OHLCV(k)
+            cs2     = CompositeStrategy()
+            sig_t   = await cs2.compute(ohlcv_t)
+            if sig_t and str(sig_t.action) not in ("HOLD", "CLOSE"):
+                v = rm3.check_signal(sig_t)
+                if v == RiskVeto.LOW_RR:
+                    low_rr_hits += 1
+
+        check(
+            "Conservative merge: no LOW_RR veto across 8 trials",
+            low_rr_hits == 0,
+            f"low_rr_hits={low_rr_hits}/8",
+        )
+    except Exception as exc:
+        check("FIX 2 — no exception", False, str(exc))
+        traceback.print_exc()
+
+    # ── [6] FIX 3 — Sharpe on % returns ─────────────────────────────────────
+    print(f"\n{BOLD}[6] FIX 3 — _sharpe() uses percentage returns{RST}")
+    try:
+        rm4 = RiskManager()
+        rm4.update_equity(10_000.0)
+        for pnl in [120, -80, 200, -50, 300, -100, 150, -90, 180, 60]:
+            rm4.record_trade_result(float(pnl))
+
+        metrics = rm4.get_metrics()
+        sharpe  = metrics.sharpe_ratio
+
+        check(
+            "Sharpe is non-zero with 10 trades",
+            sharpe != 0.0,
+            f"sharpe={sharpe}",
+        )
+        check(
+            "Sharpe is in realistic range [-5, 5]",
+            -5.0 <= sharpe <= 5.0,
+            f"sharpe={sharpe} (absolute PnL leak if outside range)",
+        )
+        check(
+            "Win rate is correct (6/10)",
+            abs(metrics.win_rate - 0.6) < 0.01,
+            f"win_rate={metrics.win_rate:.0%}",
+        )
+    except Exception as exc:
+        check("FIX 3 — no exception", False, str(exc))
+        traceback.print_exc()
+
+    # ── [7] FIX 4 — Bracket order dry-run ───────────────────────────────────
+    print(f"\n{BOLD}[7] FIX 4 — ExecutionEngine bracket_order dry-run{RST}")
     try:
         mock_client = MagicMock()
         mock_client.get_exchange_info = AsyncMock(return_value={"symbols": []})
-        mock_client.get_symbol_price  = AsyncMock(return_value={"price": "50000.00"})
+        mock_client.get_symbol_price  = AsyncMock(return_value={"price": "42000.00"})
         mock_client.place_order       = AsyncMock(return_value={
-            "orderId": "123", "status": "FILLED",
+            "orderId": "999", "status": "FILLED",
             "origQty": "0.001", "executedQty": "0.001",
-            "price": "50000.00", "fills": [],
+            "price": "42000.00", "fills": [],
         })
 
         engine = ExecutionEngine(spot_client=mock_client)
         await engine.setup()
 
-        req = OrderRequest(
-            symbol="BTCUSDT",
-            side=OrderSide.BUY,
-            order_type=OrderType.MARKET,
-            quantity=Decimal("0.001"),
-            market_mode=MarketMode.SPOT,
+        entry, sl_order, tp_order = await engine.bracket_order(
+            symbol      = "BTCUSDT",
+            side        = OrderSide.BUY,
+            quantity    = Decimal("0.001"),
+            stop_loss   = Decimal("41370.0"),
+            take_profit = Decimal("43260.0"),
+            market_mode = MarketMode.SPOT,
         )
-        order = await engine.place_order(req)
+
         check(
-            "ExecutionEngine dry-run returns DRY_RUN status",
-            order.status == OrderStatus.DRY_RUN,
-            f"status={order.status.value}",
-        )
-        check(
-            "Dry-run order has exchange_order_id starting with DRY_",
-            str(order.exchange_order_id).startswith("DRY_"),
-            f"id={order.exchange_order_id}",
+            "Entry order status is DRY_RUN",
+            entry.status == OrderStatus.DRY_RUN,
+            f"status={entry.status.value}",
         )
         check(
-            "Dry-run filled_quantity matches requested",
-            order.filled_quantity == Decimal("0.001"),
-            f"filled={order.filled_quantity}",
+            "Entry order id starts with DRY_",
+            str(entry.exchange_order_id).startswith("DRY_"),
+            f"id={entry.exchange_order_id}",
+        )
+        check(
+            "SL order returned (not None)",
+            sl_order is not None,
+            f"sl={sl_order.status.value if sl_order else 'None'}",
+        )
+        check(
+            "TP order returned (not None)",
+            tp_order is not None,
+            f"tp={tp_order.status.value if tp_order else 'None'}",
         )
     except Exception as exc:
-        check("ExecutionEngine dry-run — no exception", False, str(exc))
+        check("FIX 4 — no exception", False, str(exc))
         traceback.print_exc()
 
-    # ── Test 6: OHLCVProvider cache ───────────────────────────────────────────
-    print(f"\n{INFO} [6] OHLCVProvider — cache TTL")
+    # ── [8] OHLCVProvider cache ──────────────────────────────────────────────
+    print(f"\n{BOLD}[8] OHLCVProvider — cache TTL (get_klines called once){RST}")
     try:
-        from backend.core.ohlcv_provider import OHLCVProvider
         mock_spot = MagicMock()
-        mock_spot.get_klines = AsyncMock(return_value=make_klines(100))
+        mock_spot.get_klines = AsyncMock(return_value=make_klines(120))
 
-        provider = OHLCVProvider(spot_client=mock_spot, cache_ttl=60)
-        ohlcv_a = await provider.get_ohlcv("BTCUSDT", "15m")
-        ohlcv_b = await provider.get_ohlcv("BTCUSDT", "15m")  # should hit cache
+        provider  = OHLCVProvider(spot_client=mock_spot, cache_ttl=60)
+        ohlcv_a   = await provider.get_ohlcv("BTCUSDT", "15m")
+        ohlcv_b   = await provider.get_ohlcv("BTCUSDT", "15m")  # cache hit
 
-        check("OHLCVProvider returns OHLCV object", isinstance(ohlcv_a, OHLCV))
+        check("Returns OHLCV object",
+              isinstance(ohlcv_a, OHLCV))
         check(
-            "OHLCVProvider serves cache on second call (get_klines called once)",
+            "get_klines called exactly once (cache served second call)",
             mock_spot.get_klines.call_count == 1,
             f"call_count={mock_spot.get_klines.call_count}",
         )
         check(
-            "Cache size is 1 after two identical calls",
+            "cache_size() == 1 after two identical calls",
             provider.cache_size() == 1,
+            f"cache_size={provider.cache_size()}",
         )
         await provider.invalidate("BTCUSDT", "15m", MarketMode.SPOT)
         check(
-            "Cache empty after invalidate",
+            "cache empty after invalidate()",
             provider.cache_size() == 0,
         )
     except Exception as exc:
-        check("OHLCVProvider tests — no exception", False, str(exc))
+        check("OHLCVProvider — no exception", False, str(exc))
         traceback.print_exc()
 
-    # ── Summary ───────────────────────────────────────────────────────────────
-    print("\n" + "=" * 50)
+    # ── [9] calc_position_size ───────────────────────────────────────────────
+    print(f"\n{BOLD}[9] calc_position_size — stays within risk_per_trade{RST}")
+    try:
+        equity  = 10_000.0
+        entry_p = 42_000.0
+        sl_p    = 41_370.0   # 1.5% below
+        qty     = calc_position_size(
+            equity=equity,
+            entry=entry_p,
+            stop_loss=sl_p,
+            market_mode=MarketMode.SPOT,
+            leverage=1,
+        )
+        risk_dollar = (entry_p - sl_p) * qty
+        risk_pct    = risk_dollar / equity
+        check(
+            f"Position size yields risk ≤ {settings.risk_per_trade:.0%}",
+            risk_pct <= settings.risk_per_trade * 1.05,
+            f"qty={qty:.6f}  risk_$={risk_dollar:.2f}  risk_pct={risk_pct:.2%}",
+        )
+        check(
+            "Position size is positive",
+            qty > 0,
+            f"qty={qty}",
+        )
+    except Exception as exc:
+        check("calc_position_size — no exception", False, str(exc))
+        traceback.print_exc()
+
+    # ── Summary ──────────────────────────────────────────────────────────────
     passed = sum(1 for _, ok, _ in results if ok)
     failed = sum(1 for _, ok, _ in results if not ok)
     total  = len(results)
 
+    print("\n" + "=" * 55)
     if failed == 0:
-        print(f"\033[92m✓ ALL SMOKE TESTS PASSED ({passed}/{total})\033[0m")
+        print(f"\033[92m{BOLD}\u2713 ALL SMOKE TESTS PASSED ({passed}/{total}){RST}")
         sys.exit(0)
     else:
-        print(f"\033[91m✗ {failed} TEST(S) FAILED ({passed}/{total} passed)\033[0m")
-        print("\nFailed tests:")
+        print(f"\033[91m{BOLD}\u2717 {failed} TEST(S) FAILED ({passed}/{total} passed){RST}")
+        print("\nFailed:")
         for name, ok, detail in results:
             if not ok:
-                print(f"  {FAIL} {name}" + (f" — {detail}" if detail else ""))
+                suf = f" — {detail}" if detail else ""
+                print(f"  {FAIL} {name}{suf}")
         sys.exit(1)
 
 

@@ -1,18 +1,33 @@
 /**
  * chart_markers.ts – TradingView Chart Markers for Nexus Trader
  *
- * Renders entry, exit, SL hit, TP hit, and signal markers on the chart
- * using the TradingView Charting Library's createShape() / createExecutionShape() API.
+ * Renders entry, exit, SL hit, TP hit, breakeven, and risk-event markers
+ * on the chart using TradingView Charting Library's createShape() /
+ * createExecutionShape() API.
  *
- * Docs: https://www.tradingview.com/charting-library-docs/latest/api/interfaces/Charting_Library.IChartingLibraryWidget
+ * Improvements over v1:
+ * - loadHistoricalSignals() fetches + renders all past signals on chart ready
+ * - onRiskEvent() renders ⚠ marker with CRITICAL/WARNING severity routing
+ * - onBreakevenMove() renders BE marker explicitly (was missing)
+ * - clearBySymbol() clears only shapes for one symbol
+ * - getShapeCount() for testing / status display
+ * - Symbol-indexed shape registry (_shapeIds keyed by symbol+id)
+ * - All createShape() calls use safe try/catch with graceful fallback
  *
  * Usage:
- *   import { ChartMarkerManager } from './chart_markers';
+ *   import { ChartMarkerManager, wireChartMarkersToWebSocket } from './chart_markers';
  *   const markers = new ChartMarkerManager(widget);
  *   markers.onOrderFilled(order);
- *   markers.onTPHit(position, tpLevel, price, time);
+ *   markers.onTPHit(position, 1, price, time);
  *   markers.onSLHit(position, price, time);
  *   markers.onSignal(signal);
+ *   markers.onRiskEvent({ symbol: 'BTCUSDT', severity: 'CRITICAL', detail: '...', time });
+ *   markers.onBreakevenMove('BTCUSDT', price, time);
+ *   markers.loadHistoricalSignals('http://localhost:8000/api/v1', 'X-API-KEY');
+ *
+ * Docs:
+ *   https://www.tradingview.com/charting-library-docs/latest/api/interfaces/Charting_Library.IChartingLibraryWidget
+ *   https://www.tradingview.com/charting-library-docs/latest/api/interfaces/Charting_Library.IChartApi/#createshape
  */
 
 export interface MarkerOrder {
@@ -20,54 +35,66 @@ export interface MarkerOrder {
   side:       'BUY' | 'SELL';
   price:      number;
   quantity:   number;
-  time:       number;  // Unix timestamp seconds
+  time:       number;   // Unix timestamp seconds
   orderId:    string;
   dryRun?:    boolean;
 }
 
 export interface MarkerPosition {
-  symbol:     string;
-  side:       'LONG' | 'SHORT';
-  entryPrice: number;
-  stopLoss:   number;
+  symbol:      string;
+  side:        'LONG' | 'SHORT';
+  entryPrice:  number;
+  stopLoss:    number;
   takeProfit1: number;
   takeProfit2: number;
 }
 
 export interface MarkerSignal {
-  symbol:     string;
-  action:     'BUY' | 'SELL' | 'HOLD';
-  confidence: number;
-  reason:     string;
-  time:       number;
-  stopLoss:   number;
+  symbol:      string;
+  action:      'BUY' | 'SELL' | 'HOLD';
+  confidence:  number;
+  reason:      string;
+  time:        number;
+  stopLoss:    number;
   takeProfit1: number;
 }
 
-// TradingView shape color palette aligned with Nexus design system
+export interface RiskEventMarker {
+  symbol:   string;
+  severity: 'CRITICAL' | 'WARNING';
+  detail:   string;
+  time:     number;  // Unix timestamp seconds
+}
+
+// ── Color palette aligned with Nexus design tokens ──────────────────────────
 const COLORS = {
-  buy:         '#01696f',  // --color-primary (Hydra Teal)
-  sell:        '#a12c7b',  // --color-error
-  tp:          '#437a22',  // --color-success
-  sl:          '#a13544',  // --color-notification
-  signal_buy:  '#006494',  // --color-blue
-  signal_sell: '#7a39bb',  // --color-purple
-  dryRun:      '#d19900',  // --color-gold
-  breakeven:   '#da7101',  // --color-orange
+  buy:          '#01696f',  // --color-primary (Hydra Teal)
+  sell:         '#a12c7b',  // --color-error
+  tp:           '#437a22',  // --color-success
+  sl:           '#a13544',  // --color-notification
+  signal_buy:   '#006494',  // --color-blue
+  signal_sell:  '#7a39bb',  // --color-purple
+  dryRun:       '#d19900',  // --color-gold
+  breakeven:    '#da7101',  // --color-orange
+  risk_critical:'#ff1744',  // bright red — CRITICAL events
+  risk_warning: '#ffa726',  // amber — WARNING events
 } as const;
 
 
 export class ChartMarkerManager {
-  private _widget: any;  // IChartingLibraryWidget
+  private _widget:   any;  // IChartingLibraryWidget
+  /** key = `${symbol}__${id}` → array of TradingView entity IDs */
   private _shapeIds: Map<string, string[]> = new Map();
 
   constructor(widget: any) {
     this._widget = widget;
   }
 
+  // ── Public API ────────────────────────────────────────────────────────────
+
   /**
    * Called when an order is filled (entry).
-   * Renders an entry arrow on the chart.
+   * Renders an entry execution arrow on the chart.
    */
   onOrderFilled(order: MarkerOrder): void {
     const chart = this._activeChart();
@@ -80,7 +107,7 @@ export class ChartMarkerManager {
       : `${order.side} ${order.quantity} @ ${order.price.toFixed(2)}`;
 
     try {
-      // createExecutionShape is the correct TV Charting Library API for trade arrows
+      // createExecutionShape — preferred TV Charting Library API for trade fills
       const shapeId = chart.createExecutionShape()
         .setTime(order.time)
         .setDirection(isBuy ? 'buy' : 'sell')
@@ -91,34 +118,38 @@ export class ChartMarkerManager {
         .setTextColor(color)
         .setText(text);
 
-      this._addShapeId(order.orderId, shapeId);
-    } catch (e) {
-      console.warn('[ChartMarkers] createExecutionShape failed:', e);
-      // Fallback: use createShape with arrow type
-      this._createArrowShape(chart, order.time, order.price, isBuy, color, text, order.orderId);
+      this._addShapeId(order.symbol, order.orderId, shapeId);
+    } catch {
+      // Fallback: createShape arrow
+      this._createArrowShape(
+        chart, order.symbol, order.time, order.price,
+        isBuy, color, text, order.orderId,
+      );
     }
   }
 
   /**
-   * Renders TP1 or TP2 hit marker (green checkmark above/below candle).
+   * TP1 or TP2 hit — green checkmark above/below the candle.
    */
   onTPHit(
-    position:  MarkerPosition,
-    tpLevel:   1 | 2,
-    price:     number,
-    time:      number,
+    position: MarkerPosition,
+    tpLevel:  1 | 2,
+    price:    number,
+    time:     number,
   ): void {
     const chart = this._activeChart();
     if (!chart) return;
-
     const isLong = position.side === 'LONG';
-    const label  = `TP${tpLevel} ${isLong ? '✓' : '✓'} @ ${price.toFixed(2)}`;
-
-    this._createTextShape(chart, time, price, label, COLORS.tp, isLong ? 'above' : 'below');
+    const label  = `TP${tpLevel} \u2713 @ ${price.toFixed(2)}`;
+    this._createTextShape(
+      chart, position.symbol, time, price, label,
+      COLORS.tp, isLong ? 'above' : 'below',
+      `tp${tpLevel}_${position.symbol}_${time}`,
+    );
   }
 
   /**
-   * Renders SL hit marker (red X).
+   * Stop-loss hit — red X marker.
    */
   onSLHit(
     position: MarkerPosition,
@@ -127,115 +158,206 @@ export class ChartMarkerManager {
   ): void {
     const chart = this._activeChart();
     if (!chart) return;
-
     const isLong = position.side === 'LONG';
-    const label  = `SL HIT @ ${price.toFixed(2)}`;
-
-    this._createTextShape(chart, time, price, label, COLORS.sl, isLong ? 'below' : 'above');
+    const label  = `SL \u2717 @ ${price.toFixed(2)}`;
+    this._createTextShape(
+      chart, position.symbol, time, price, label,
+      COLORS.sl, isLong ? 'below' : 'above',
+      `sl_${position.symbol}_${time}`,
+    );
   }
 
   /**
-   * Renders a signal arrow (before entry, shows the strategy signal).
-   * Useful in dry-run / review mode.
+   * Strategy signal arrow (before entry — visible in dry-run/review mode).
+   * Also draws SL and TP1 horizontal dashed lines.
    */
   onSignal(signal: MarkerSignal): void {
     const chart = this._activeChart();
-    if (!chart) return;
-
-    if (signal.action === 'HOLD') return;
+    if (!chart || signal.action === 'HOLD') return;
 
     const isBuy  = signal.action === 'BUY';
     const color  = isBuy ? COLORS.signal_buy : COLORS.signal_sell;
-    const label  = `${signal.action} ${(signal.confidence * 100).toFixed(0)}% | ${signal.reason.slice(0, 40)}`;
+    const label  = `${signal.action} ${(signal.confidence * 100).toFixed(0)}% \u2014 ${signal.reason.slice(0, 40)}`;
+    const key    = `sig_${signal.symbol}_${signal.time}`;
 
     this._createArrowShape(
-      chart,
-      signal.time,
+      chart, signal.symbol, signal.time,
       isBuy ? signal.stopLoss : signal.takeProfit1,
-      isBuy,
-      color,
-      label,
-      `sig_${signal.symbol}_${signal.time}`,
+      isBuy, color, label, key,
     );
-
-    // Draw SL and TP horizontal lines
-    this._createPriceLine(chart, signal.stopLoss,    COLORS.sl,  `SL ${signal.stopLoss.toFixed(2)}`);
-    this._createPriceLine(chart, signal.takeProfit1, COLORS.tp,  `TP1 ${signal.takeProfit1.toFixed(2)}`);
+    this._createPriceLine(chart, signal.symbol, signal.stopLoss,    COLORS.sl, `SL ${signal.stopLoss.toFixed(2)}`, key + '_sl');
+    this._createPriceLine(chart, signal.symbol, signal.takeProfit1, COLORS.tp, `TP1 ${signal.takeProfit1.toFixed(2)}`, key + '_tp');
   }
 
   /**
-   * Renders breakeven move marker (SL moved to entry after TP1).
+   * SL moved to breakeven after TP1 — orange BE marker.
    */
-  onBreakeven(symbol: string, price: number, time: number): void {
+  onBreakevenMove(symbol: string, price: number, time: number): void {
     const chart = this._activeChart();
     if (!chart) return;
-    this._createTextShape(chart, time, price, `BE ↑ ${price.toFixed(2)}`, COLORS.breakeven, 'below');
+    this._createTextShape(
+      chart, symbol, time, price,
+      `BE \u2191 ${price.toFixed(2)}`,
+      COLORS.breakeven, 'below',
+      `be_${symbol}_${time}`,
+    );
   }
 
   /**
-   * Remove all shapes created by this manager for a given order/signal ID.
+   * Risk event marker — CRITICAL renders bright red \u26a0 marker,
+   * WARNING renders amber \u26a0 marker.
    */
-  removeShapes(id: string): void {
+  onRiskEvent(event: RiskEventMarker): void {
     const chart = this._activeChart();
     if (!chart) return;
-    const ids = this._shapeIds.get(id) || [];
-    ids.forEach(sid => {
-      try { chart.removeEntity(sid); } catch {}
-    });
-    this._shapeIds.delete(id);
-  }
-
-  // ── Private helpers ──────────────────────────────────────────────────────
-
-  private _activeChart(): any | null {
-    try {
-      return this._widget.activeChart();
-    } catch {
-      return null;
+    const isCritical = event.severity === 'CRITICAL';
+    const color  = isCritical ? COLORS.risk_critical : COLORS.risk_warning;
+    const label  = `\u26a0 ${event.severity}: ${event.detail.slice(0, 50)}`;
+    const key    = `risk_${event.symbol}_${event.time}`;
+    this._createTextShape(
+      chart, event.symbol, event.time, 0,
+      label, color, 'above', key,
+    );
+    if (isCritical) {
+      console.error('[ChartMarkers] CRITICAL risk event:', event.detail);
+    } else {
+      console.warn('[ChartMarkers] WARNING risk event:', event.detail);
     }
   }
 
+  /**
+   * Fetch historical signals from Nexus backend and render all markers on chart.
+   * Call this inside widget.onChartReady().
+   */
+  async loadHistoricalSignals(
+    apiBase:  string,
+    apiKey?:  string,
+    limit:    number = 500,
+  ): Promise<void> {
+    try {
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+      if (apiKey) headers['X-API-Key'] = apiKey;
+
+      const res = await fetch(`${apiBase}/signals?limit=${limit}`, { headers });
+      if (!res.ok) {
+        console.warn('[ChartMarkers] loadHistoricalSignals failed:', res.status);
+        return;
+      }
+      const data = await res.json();
+      const signals: any[] = data.signals ?? data.trades ?? [];
+
+      for (const s of signals) {
+        const time = s.timestamp ?? Math.floor(new Date(s.placed_at ?? s.created_at).getTime() / 1000);
+        if (s.action === 'BUY' || s.action === 'SELL') {
+          this.onSignal({
+            symbol:      s.symbol,
+            action:      s.action,
+            confidence:  s.confidence ?? 0,
+            reason:      s.reason ?? '',
+            time,
+            stopLoss:    parseFloat(s.stop_loss ?? 0),
+            takeProfit1: parseFloat(s.take_profit_1 ?? 0),
+          });
+        }
+        if (s.metadata?.tp1_hit) {
+          this.onTPHit({ symbol: s.symbol, side: s.action === 'BUY' ? 'LONG' : 'SHORT', entryPrice: 0, stopLoss: 0, takeProfit1: 0, takeProfit2: 0 }, 1, parseFloat(s.take_profit_1), time);
+        }
+        if (s.metadata?.sl_hit) {
+          this.onSLHit({ symbol: s.symbol, side: s.action === 'BUY' ? 'LONG' : 'SHORT', entryPrice: 0, stopLoss: parseFloat(s.stop_loss), takeProfit1: 0, takeProfit2: 0 }, parseFloat(s.stop_loss), time);
+        }
+      }
+      console.log(`[ChartMarkers] Loaded ${signals.length} historical signals`);
+    } catch (e) {
+      console.warn('[ChartMarkers] loadHistoricalSignals error:', e);
+    }
+  }
+
+  /**
+   * Remove all chart shapes for a specific symbol.
+   */
+  clearBySymbol(symbol: string): void {
+    const chart = this._activeChart();
+    if (!chart) return;
+    for (const [key, ids] of this._shapeIds.entries()) {
+      if (key.startsWith(`${symbol}__`)) {
+        ids.forEach(id => {
+          try { chart.removeEntity(id); } catch {}
+        });
+        this._shapeIds.delete(key);
+      }
+    }
+  }
+
+  /**
+   * Remove all shapes for a specific order/signal ID.
+   */
+  removeShapes(symbol: string, id: string): void {
+    const chart = this._activeChart();
+    if (!chart) return;
+    const key = `${symbol}__${id}`;
+    (this._shapeIds.get(key) ?? []).forEach(sid => {
+      try { chart.removeEntity(sid); } catch {}
+    });
+    this._shapeIds.delete(key);
+  }
+
+  /** Total number of shapes currently on the chart. */
+  getShapeCount(): number {
+    let total = 0;
+    this._shapeIds.forEach(ids => { total += ids.length; });
+    return total;
+  }
+
+  // ── Private helpers ────────────────────────────────────────────────────────
+
+  private _activeChart(): any | null {
+    try { return this._widget.activeChart(); } catch { return null; }
+  }
+
   private _createArrowShape(
-    chart:    any,
-    time:     number,
-    price:    number,
-    isBuy:    boolean,
-    color:    string,
-    tooltip:  string,
-    id:       string,
+    chart:   any,
+    symbol:  string,
+    time:    number,
+    price:   number,
+    isBuy:   boolean,
+    color:   string,
+    tooltip: string,
+    id:      string,
   ): void {
     try {
       const shape = chart.createShape(
         { time, price },
         {
-          shape:       isBuy ? 'arrow_up' : 'arrow_down',
-          lock:        true,
+          shape:            isBuy ? 'arrow_up' : 'arrow_down',
+          lock:             true,
           disableSelection: false,
           overrides: {
-            color:       color,
-            fontsize:    12,
-            bold:        false,
-            text:        tooltip,
-            textColor:   color,
+            color,
+            fontsize:  12,
+            bold:      false,
+            text:      tooltip,
+            textColor: color,
           },
-        }
+        },
       );
-      this._addShapeId(id, shape);
+      this._addShapeId(symbol, id, shape);
     } catch (e) {
-      console.warn('[ChartMarkers] createShape failed:', e);
+      console.warn('[ChartMarkers] createShape (arrow) failed:', e);
     }
   }
 
   private _createTextShape(
-    chart:     any,
-    time:      number,
-    price:     number,
-    text:      string,
-    color:     string,
-    position:  'above' | 'below',
+    chart:    any,
+    symbol:   string,
+    time:     number,
+    price:    number,
+    text:     string,
+    color:    string,
+    position: 'above' | 'below',
+    id:       string,
   ): void {
     try {
-      chart.createShape(
+      const shape = chart.createShape(
         { time, price },
         {
           shape:   'note',
@@ -247,90 +369,125 @@ export class ChartMarkerManager {
             text,
             labelFontSize: 11,
           },
-        }
+        },
       );
+      this._addShapeId(symbol, id, shape);
     } catch (e) {
       console.warn('[ChartMarkers] createShape (note) failed:', e);
     }
   }
 
   private _createPriceLine(
-    chart: any,
-    price: number,
-    color: string,
-    text:  string,
+    chart:  any,
+    symbol: string,
+    price:  number,
+    color:  string,
+    text:   string,
+    id:     string,
   ): void {
     try {
-      chart.createShape(
+      const shape = chart.createShape(
         { price },
         {
           shape: 'horizontal_line',
           lock:  true,
           overrides: {
-            linecolor:    color,
-            linewidth:    1,
-            linestyle:    2,  // dashed
-            showLabel:    true,
+            linecolor:  color,
+            linewidth:  1,
+            linestyle:  2,      // dashed
+            showLabel:  true,
             text,
-            textcolor:    color,
-            fontsize:     10,
+            textcolor:  color,
+            fontsize:   10,
           },
-        }
+        },
       );
+      this._addShapeId(symbol, id, shape);
     } catch (e) {
       console.warn('[ChartMarkers] createShape (h-line) failed:', e);
     }
   }
 
-  private _addShapeId(key: string, shapeId: any): void {
-    if (!this._shapeIds.has(key)) {
-      this._shapeIds.set(key, []);
-    }
+  private _addShapeId(symbol: string, id: string, shapeId: any): void {
+    const key = `${symbol}__${id}`;
+    if (!this._shapeIds.has(key)) this._shapeIds.set(key, []);
     this._shapeIds.get(key)!.push(shapeId);
   }
 }
 
 
 /**
- * Factory: creates a ChartMarkerManager and wires it to WebSocket events.
+ * wireChartMarkersToWebSocket
  *
- * @param widget  TradingView IChartingLibraryWidget instance
- * @param wsUrl   WebSocket URL for Nexus backend (e.g. ws://localhost:8000/api/v1/ws)
+ * Creates a ChartMarkerManager, connects to the Nexus WebSocket backend,
+ * and wires all relevant events to chart markers.
+ *
+ * Events handled:
+ *   order_filled       → onOrderFilled()
+ *   signal_created     → onSignal()
+ *   tp1_hit / tp2_hit  → onTPHit()
+ *   sl_hit             → onSLHit()
+ *   breakeven          → onBreakevenMove()
+ *   risk_event         → onRiskEvent() [CRITICAL/WARNING routing]
+ *
+ * @param widget  IChartingLibraryWidget instance
+ * @param wsUrl   WebSocket URL, e.g. "ws://localhost:8000/api/v1/ws"
+ * @param apiBase REST API base, e.g. "http://localhost:8000/api/v1"
+ * @param apiKey  Optional X-API-Key for authenticated historical fetch
+ * @returns cleanup function — call to disconnect and stop reconnecting
  *
  * Usage:
- *   const cleanup = wireChartMarkersToWebSocket(widget, 'ws://localhost:8000/api/v1/ws');
- *   // call cleanup() to disconnect
+ *   widget.onChartReady(async () => {
+ *     const cleanup = wireChartMarkersToWebSocket(
+ *       widget,
+ *       'ws://localhost:8000/api/v1/ws',
+ *       'http://localhost:8000/api/v1',
+ *     );
+ *     // To clean up: cleanup();
+ *   });
  */
 export function wireChartMarkersToWebSocket(
-  widget: any,
-  wsUrl:  string,
+  widget:  any,
+  wsUrl:   string,
+  apiBase?: string,
+  apiKey?:  string,
 ): () => void {
   const markers = new ChartMarkerManager(widget);
-  let ws: WebSocket | null = null;
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  let ws:               WebSocket | null = null;
+  let reconnectTimer:   ReturnType<typeof setTimeout> | null = null;
+  let reconnectMs     = 1_000;
+  const MAX_RECONNECT = 30_000;
+  let stopped         = false;
+
+  // Load historical signals once on ready
+  if (apiBase) {
+    markers.loadHistoricalSignals(apiBase, apiKey).catch(console.warn);
+  }
 
   function connect(): void {
+    if (stopped) return;
     ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
       console.log('[ChartMarkers] WebSocket connected');
+      reconnectMs = 1_000;
       if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
     };
 
     ws.onmessage = (event: MessageEvent) => {
-      try {
-        const msg = JSON.parse(event.data);
-        handleEvent(msg);
-      } catch {}
+      try { handleEvent(JSON.parse(event.data as string)); } catch {}
     };
 
     ws.onclose = () => {
-      console.log('[ChartMarkers] WebSocket closed — reconnecting in 3s');
-      reconnectTimer = setTimeout(connect, 3000);
+      if (stopped) return;
+      console.log(`[ChartMarkers] WS closed — reconnecting in ${reconnectMs}ms`);
+      reconnectTimer = setTimeout(connect, reconnectMs);
+      reconnectMs = Math.min(reconnectMs * 2, MAX_RECONNECT);
     };
 
     ws.onerror = (err) => {
-      console.warn('[ChartMarkers] WebSocket error', err);
+      console.warn('[ChartMarkers] WS error', err);
+      ws?.close();
     };
   }
 
@@ -340,59 +497,101 @@ export function wireChartMarkersToWebSocket(
 
     switch (event) {
       case 'order_filled': {
-        const order: MarkerOrder = {
+        markers.onOrderFilled({
           symbol:   payload.symbol,
           side:     payload.side,
-          price:    parseFloat(payload.avg_price) || 0,
-          quantity: parseFloat(payload.quantity)  || 0,
-          time:     Math.floor(Date.now() / 1000),
-          orderId:  payload.exchange_order_id || String(Date.now()),
+          price:    parseFloat(payload.avg_fill_price ?? payload.price) || 0,
+          quantity: parseFloat(payload.quantity ?? payload.qty) || 0,
+          time:     payload.time ?? Math.floor(Date.now() / 1000),
+          orderId:  String(payload.exchange_order_id ?? Date.now()),
           dryRun:   payload.dry_run === true,
-        };
-        markers.onOrderFilled(order);
-        break;
-      }
-
-      case 'tp1_hit': {
-        // payload: { symbol, price, position: MarkerPosition }
-        if (payload.position) {
-          markers.onTPHit(payload.position, 1, parseFloat(payload.price), Math.floor(Date.now() / 1000));
-        }
-        break;
-      }
-
-      case 'tp2_hit': {
-        if (payload.position) {
-          markers.onTPHit(payload.position, 2, parseFloat(payload.price), Math.floor(Date.now() / 1000));
-        }
-        break;
-      }
-
-      case 'sl_hit': {
-        if (payload.position) {
-          markers.onSLHit(payload.position, parseFloat(payload.price), Math.floor(Date.now() / 1000));
-        }
+        });
         break;
       }
 
       case 'signal_created': {
-        const signal: MarkerSignal = {
+        if (payload.action === 'HOLD') break;
+        markers.onSignal({
           symbol:      payload.symbol,
           action:      payload.action,
-          confidence:  payload.confidence,
-          reason:      payload.reason || '',
-          time:        Math.floor(Date.now() / 1000),
-          stopLoss:    payload.stop_loss,
-          takeProfit1: payload.take_profit_1,
-        };
-        markers.onSignal(signal);
+          confidence:  payload.confidence ?? 0,
+          reason:      payload.reason ?? '',
+          time:        payload.timestamp ?? Math.floor(Date.now() / 1000),
+          stopLoss:    parseFloat(payload.stop_loss ?? 0),
+          takeProfit1: parseFloat(payload.take_profit_1 ?? 0),
+        });
         break;
       }
 
-      case 'tp1_hit_breakeven': {
-        if (payload.symbol) {
-          markers.onBreakeven(payload.symbol, parseFloat(payload.new_sl || 0), Math.floor(Date.now() / 1000));
-        }
+      case 'tp1_hit': {
+        const pos = payload.position ?? {};
+        markers.onTPHit(
+          {
+            symbol:      payload.symbol,
+            side:        pos.side ?? 'LONG',
+            entryPrice:  parseFloat(pos.entry_price ?? 0),
+            stopLoss:    parseFloat(pos.stop_loss ?? 0),
+            takeProfit1: parseFloat(pos.take_profit_1 ?? 0),
+            takeProfit2: parseFloat(pos.take_profit_2 ?? 0),
+          },
+          1,
+          parseFloat(payload.price ?? 0),
+          payload.time ?? Math.floor(Date.now() / 1000),
+        );
+        break;
+      }
+
+      case 'tp2_hit': {
+        const pos2 = payload.position ?? {};
+        markers.onTPHit(
+          {
+            symbol:      payload.symbol,
+            side:        pos2.side ?? 'LONG',
+            entryPrice:  parseFloat(pos2.entry_price ?? 0),
+            stopLoss:    parseFloat(pos2.stop_loss ?? 0),
+            takeProfit1: parseFloat(pos2.take_profit_1 ?? 0),
+            takeProfit2: parseFloat(pos2.take_profit_2 ?? 0),
+          },
+          2,
+          parseFloat(payload.price ?? 0),
+          payload.time ?? Math.floor(Date.now() / 1000),
+        );
+        break;
+      }
+
+      case 'sl_hit': {
+        const pos3 = payload.position ?? {};
+        markers.onSLHit(
+          {
+            symbol:      payload.symbol,
+            side:        pos3.side ?? 'LONG',
+            entryPrice:  parseFloat(pos3.entry_price ?? 0),
+            stopLoss:    parseFloat(pos3.stop_loss ?? 0),
+            takeProfit1: parseFloat(pos3.take_profit_1 ?? 0),
+            takeProfit2: parseFloat(pos3.take_profit_2 ?? 0),
+          },
+          parseFloat(payload.price ?? 0),
+          payload.time ?? Math.floor(Date.now() / 1000),
+        );
+        break;
+      }
+
+      case 'breakeven': {
+        markers.onBreakevenMove(
+          payload.symbol,
+          parseFloat(payload.price ?? 0),
+          payload.time ?? Math.floor(Date.now() / 1000),
+        );
+        break;
+      }
+
+      case 'risk_event': {
+        markers.onRiskEvent({
+          symbol:   payload.symbol ?? '',
+          severity: payload.severity === 'CRITICAL' ? 'CRITICAL' : 'WARNING',
+          detail:   payload.detail ?? payload.event ?? '',
+          time:     payload.time ?? Math.floor(Date.now() / 1000),
+        });
         break;
       }
     }
@@ -400,9 +599,10 @@ export function wireChartMarkersToWebSocket(
 
   connect();
 
-  // Return cleanup function
+  // Cleanup function
   return () => {
+    stopped = true;
     if (reconnectTimer) clearTimeout(reconnectTimer);
-    if (ws) { ws.onclose = null; ws.close(); }
+    ws?.close();
   };
 }
