@@ -300,6 +300,23 @@ TELEGRAM_CHAT_ID=
 
 ## Known Fixes (Changelog)
 
+### v3.2.0 — 2026-05-19
+
+**TradingView chart fixes applied in [commit 7d6b825](https://github.com/Gzeu/nexus-trader/commit/7d6b825ea02de536ea9a7f248b061db6d61568ab):**
+
+#### `TradingChart.tsx`
+
+- **FIX — MACD race condition at mount**  
+  The MACD `useEffect` previously checked `candleDataRef.current.length >= 35` at activation time, which silently no-oped if called before `loadData` completed. A stable `populateMACDPaneRef` callback ref now decouples mounting order from data availability: `loadData` calls `populateMACDPaneRef.current?.()` after writing to the candle ref, and the MACD effect calls the same function immediately on mount. Whichever runs second wins — the pane always populates exactly once with complete data.
+
+- **FIX — `barSpacing` TypeScript-safe cast**  
+  `(ts.options() as { barSpacing: number }).barSpacing` failed under `strict` mode because LWC v4 types `ts.options()` as `DeepPartial<TimeScaleOptions>`. Replaced with a `Record<string, unknown>` cast and `Number()` coercion with `|| 8` fallback — safe across all LWC versions and resilient to `undefined` if the property is ever removed from the public API.
+
+- **FIX — `fetch24hChange` NaN guard**  
+  `await res.json() as { priceChangePercent: string }` asserted a type without validating the shape. On an invalid symbol or Binance API error, `d.priceChangePercent` was `undefined`, making `parseFloat(undefined)` → `NaN`, which then propagated to `.toFixed(2)` and crashed the badge renderer. The response is now typed as `Record<string, unknown>`, parsed with `parseFloat(String(d?.priceChangePercent ?? ''))`, and gated by `isFinite()` — returning `null` (no badge) instead of `NaN` on any unexpected payload.
+
+---
+
 ### v1.1.0 — 2026-05-19
 
 **Critical bug fixes applied in [commit f83f983](https://github.com/Gzeu/nexus-trader/commit/f83f983cb4828fd35529275ac182f03869727f68):**
