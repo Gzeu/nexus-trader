@@ -1,18 +1,9 @@
 """
 routes.py – All HTTP REST endpoints for Nexus Trader v3.
 
-Fixes / improvements over v1:
-- /health returns HealthResponse model (typed, not bare dict)
-- /health includes uptime_seconds, last_reconcile, binance_reachable
-- /emergency_stop calls risk._pause() with pause_type="manual" (correct signature)
-- /emergency_stop also broadcasts WS event EMERGENCY_STOP
-- /resume_trading only restarts automation if it was previously running
-- /cancel_all accepts symbol as query param (was path param — wrong for REST)
-- /place_order uses PlaceOrderBody from models (not inline class)
-- /place_order checks risk before executing (was missing risk gate)
-- /reconcile endpoint added (manual trigger)
-- /positions returns PositionState (serialized Decimal — not raw model with Decimal)
-- All 500 errors log the full exception with stack context
+Changelog v3.1:
+- /balance endpoint added (BalanceSummary: Spot + Futures + unrealized PnL)
+- All imports from backend.models (models_extra removed)
 """
 from __future__ import annotations
 
@@ -23,6 +14,10 @@ import structlog
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 
 from backend.models import (
+    AccountInfo,
+    AssetBalance,
+    BalanceSummary,
+    FuturesAsset,
     HealthResponse,
     MarketMode,
     OrderRequest,
@@ -51,13 +46,12 @@ def require_ready(ctx) -> None:
         )
 
 
-# ── Health ────────────────────────────────────────────────────────────────
+# ── Health ───────────────────────────────────────────────────────────────────
 
 @router.get("/health", response_model=HealthResponse)
 async def health(request: Request, ctx=Depends(get_ctx)):
     reconciled = bool(ctx.portfolio and ctx.portfolio.is_ready)
 
-    # Quick Binance reachability ping (non-blocking, 2s timeout)
     binance_ok = True
     try:
         import asyncio
@@ -79,11 +73,11 @@ async def health(request: Request, ctx=Depends(get_ctx)):
         binance_reachable=binance_ok,
         last_reconcile=ctx.portfolio._last_reconcile if ctx.portfolio else None,
         uptime_seconds=uptime,
-        version="3.0.0",
+        version="3.1.0",
     )
 
 
-# ── Metrics ─────────────────────────────────────────────────────────────────
+# ── Metrics ───────────────────────────────────────────────────────────────────
 
 @router.get("/analytics")
 async def analytics(ctx=Depends(get_ctx)):
@@ -95,7 +89,32 @@ async def analytics(ctx=Depends(get_ctx)):
     return {**risk_metrics, **portfolio_summary}
 
 
-# ── Signals / Journal ───────────────────────────────────────────────────────
+# ── Balance ──────────────────────────────────────────────────────────────────
+
+@router.get("/balance", response_model=BalanceSummary)
+async def get_balance(ctx=Depends(get_ctx)):
+    """
+    Aggregated USDT balance summary: Spot + Futures + unrealized PnL.
+    Returns immediately from cache if portfolio not yet reconciled.
+    Never raises 500 — falls back to cached equity on Binance errors.
+    """
+    if not ctx.portfolio:
+        raise HTTPException(503, "Portfolio not initialized")
+    return (await ctx.portfolio.get_balance_summary()).model_dump(mode="json")
+
+
+@router.get("/account", response_model=AccountInfo)
+async def get_account_full(ctx=Depends(get_ctx)):
+    """
+    Full account snapshot: all spot balances + all futures assets.
+    Slower than /balance — makes two live Binance calls.
+    """
+    if not ctx.portfolio:
+        raise HTTPException(503, "Portfolio not initialized")
+    return (await ctx.portfolio.get_account_info()).model_dump(mode="json")
+
+
+# ── Signals / Journal ────────────────────────────────────────────────────────────
 
 @router.get("/signals")
 async def list_signals(
@@ -106,7 +125,7 @@ async def list_signals(
     return {"count": len(trades), "trades": trades}
 
 
-# ── Order placement ──────────────────────────────────────────────────────────
+# ── Order placement ──────────────────────────────────────────────────────────────
 
 @router.post("/place_order")
 async def place_order(body: PlaceOrderBody, ctx=Depends(get_ctx)):
@@ -126,7 +145,6 @@ async def place_order(body: PlaceOrderBody, ctx=Depends(get_ctx)):
         OrderType.LIMIT if body.price is not None else OrderType.MARKET
     )
 
-    # Auto-size if quantity not provided
     from decimal import Decimal
     if body.quantity:
         qty = Decimal(str(body.quantity))
@@ -154,7 +172,6 @@ async def place_order(body: PlaceOrderBody, ctx=Depends(get_ctx)):
         order = await ctx.execution.place_order(request)
         await ctx.journal.log_order(order)
 
-        # Broadcast to TradingView
         if ctx.ws_broadcast:
             await ctx.ws_broadcast(
                 WSEventType.ORDER_PLACED,
@@ -167,7 +184,7 @@ async def place_order(body: PlaceOrderBody, ctx=Depends(get_ctx)):
         raise HTTPException(500, str(exc))
 
 
-# ── Kill switches ─────────────────────────────────────────────────────────────
+# ── Kill switches ───────────────────────────────────────────────────────────────────
 
 @router.post("/emergency_stop")
 async def emergency_stop(ctx=Depends(get_ctx)):
@@ -194,7 +211,7 @@ async def emergency_stop(ctx=Depends(get_ctx)):
 async def resume_trading(ctx=Depends(get_ctx)):
     ctx.risk.resume()
     if ctx.automation and not ctx.automation.running:
-        ctx.automation.start()  # sync — do NOT await
+        ctx.automation.start()
     log.info("trading_resumed")
     return {"status": "resumed"}
 
@@ -239,7 +256,6 @@ async def close_all(ctx=Depends(get_ctx)):
     for sym, pos in list(ctx.portfolio.positions.items()):
         try:
             from decimal import Decimal
-            from backend.models import OrderRequest, OrderSide, OrderType, MarketMode
             close_side = (
                 OrderSide.SELL
                 if str(pos.side) in ("LONG", "BUY")
@@ -263,7 +279,7 @@ async def close_all(ctx=Depends(get_ctx)):
     return {"results": results}
 
 
-# ── Portfolio / Account ───────────────────────────────────────────────────────
+# ── Positions ───────────────────────────────────────────────────────────────────
 
 @router.get("/positions")
 async def get_positions(ctx=Depends(get_ctx)):
@@ -275,16 +291,10 @@ async def get_positions(ctx=Depends(get_ctx)):
     ]
 
 
-@router.get("/account")
-async def get_account(ctx=Depends(get_ctx)):
-    if not ctx.portfolio or not ctx.portfolio.account:
-        raise HTTPException(503, "Account not synced yet")
-    return ctx.portfolio.account.model_dump(mode="json")
-
-
-# ── Pine Script webhook receiver ─────────────────────────────────────────────────
+# ── Pine Script webhook ───────────────────────────────────────────────────────────
 
 from pydantic import BaseModel as _BaseModel
+
 
 class PineScriptAlert(_BaseModel):
     """Expected JSON payload from TradingView Pine Script alert webhook."""
@@ -295,7 +305,6 @@ class PineScriptAlert(_BaseModel):
     take_profit: Optional[float] = None
     timeframe: Optional[str] = None
     comment: Optional[str] = None
-    # Optional HMAC secret verification field
     secret: Optional[str] = None
 
 
@@ -303,13 +312,11 @@ class PineScriptAlert(_BaseModel):
 async def pine_webhook(alert: PineScriptAlert, ctx=Depends(get_ctx)):
     """
     Receive Pine Script alerts from TradingView and convert to orders.
-    Protect this endpoint with a shared secret in production.
 
-    TradingView Pine Script alert message template:
-    {"symbol":"{{ticker}}","action":"BUY","price":{{close}},
-     "stop_loss":{{strategy.order.price}},"comment":"{{strategy.order.comment}}"}
+    TradingView alert message template:
+      {"symbol":"{{ticker}}","action":"BUY","price":{{close}},
+       "stop_loss":{{strategy.order.price}},"comment":"{{strategy.order.comment}}"}
     """
-    # Optional shared secret check
     if ctx.settings.api_secret_key and ctx.settings.environment == "production":
         if alert.secret != ctx.settings.api_secret_key:
             raise HTTPException(401, "Invalid webhook secret")
@@ -318,19 +325,12 @@ async def pine_webhook(alert: PineScriptAlert, ctx=Depends(get_ctx)):
     if ctx.risk.paused:
         raise HTTPException(403, f"Trading paused: {ctx.risk.pause_reason}")
 
-    log.info(
-        "pine_webhook_received",
-        symbol=alert.symbol,
-        action=alert.action,
-        price=alert.price,
-    )
+    log.info("pine_webhook_received", symbol=alert.symbol, action=alert.action, price=alert.price)
 
     if alert.action.upper() == "CLOSE":
         pos = ctx.portfolio.get_position(alert.symbol.upper())
         if not pos:
             return {"status": "no_position", "symbol": alert.symbol}
-        from decimal import Decimal
-        from backend.models import OrderRequest, OrderType, MarketMode
         close_side = (
             OrderSide.SELL if str(pos.side) in ("LONG", "BUY") else OrderSide.BUY
         )
