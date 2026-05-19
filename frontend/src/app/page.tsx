@@ -15,6 +15,12 @@ import { SettingsPanel }    from '@/components/settings/SettingsPanel';
 
 type Tab = 'overview' | 'balance' | 'positions' | 'signals' | 'settings';
 
+/** Helper: safely format a number or return a fallback string. */
+function fmt(value: number | null | undefined, decimals = 2, prefix = '', suffix = ''): string {
+  if (value == null || !isFinite(value)) return '—';
+  return `${prefix}${value.toFixed(decimals)}${suffix}`;
+}
+
 const TABS: { id: Tab; label: string; icon: JSX.Element }[] = [
   { id: 'overview',  label: 'Overview',  icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg> },
   { id: 'balance',   label: 'Balance',   icon: <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg> },
@@ -68,7 +74,6 @@ export default function DashboardPage() {
           >
             {t.icon}
             {t.label}
-            {/* Badges on tabs */}
             {t.id === 'positions' && positions.length > 0 && (
               <span className="badge badge-blue" style={{ fontSize: 10, padding: '1px 6px' }}>{positions.length}</span>
             )}
@@ -93,31 +98,48 @@ export default function DashboardPage() {
               <KpiGrid account={account} metrics={metrics} loading={loading} />
             </section>
 
-            <section style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: 16 }}
-              className="animate-fade-up">
+            <section
+              style={{ display: 'grid', gridTemplateColumns: '1fr 340px', gap: 16 }}
+              className="animate-fade-up"
+            >
+              {/* Equity Curve card */}
               <div className="card" style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
                   <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--purple)" strokeWidth="2">
                     <polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>
                   </svg>
                   <span style={{ fontWeight: 600, fontSize: 'var(--text-sm)' }}>Equity Curve</span>
-                  {metrics && <span className="badge badge-muted" style={{ marginLeft: 'auto' }}>{metrics.total_trades} trades</span>}
+                  {metrics?.total_trades != null && (
+                    <span className="badge badge-muted" style={{ marginLeft: 'auto' }}>
+                      {metrics.total_trades} trades
+                    </span>
+                  )}
                 </div>
+
                 <EquityCurve data={metrics?.equity_curve ?? []} width={600} height={100} />
+
                 <div style={{ display: 'flex', gap: 20, paddingTop: 4, borderTop: '1px solid var(--border)' }}>
                   {[
-                    { label: 'Expectancy',   value: metrics ? `$${metrics.expectancy.toFixed(2)}` : '—' },
-                    { label: 'Max DD',       value: metrics ? `${(metrics.max_drawdown*100).toFixed(2)}%` : '—' },
-                    { label: 'Consec. Loss', value: String(metrics?.consecutive_losses ?? '—') },
+                    { label: 'Expectancy',   value: fmt(metrics?.expectancy,            2, '$') },
+                    { label: 'Max DD',       value: fmt(metrics?.max_drawdown != null ? (metrics.max_drawdown * 100) : null, 2, '', '%') },
+                    { label: 'Consec. Loss', value: metrics?.consecutive_losses != null ? String(metrics.consecutive_losses) : '—' },
                   ].map(item => (
                     <div key={item.label} style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
-                      <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-faint)', letterSpacing: '0.07em', textTransform: 'uppercase' }}>{item.label}</span>
-                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-sm)', fontWeight: 600 }}>{item.value}</span>
+                      <span style={{
+                        fontSize: 'var(--text-xs)', color: 'var(--text-faint)',
+                        letterSpacing: '0.07em', textTransform: 'uppercase',
+                      }}>
+                        {item.label}
+                      </span>
+                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-sm)', fontWeight: 600 }}>
+                        {item.value}
+                      </span>
                     </div>
                   ))}
                 </div>
               </div>
 
+              {/* Right column: Emergency + Account */}
               <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                 <EmergencyControls
                   isPaused={health?.is_paused ?? false}
@@ -127,23 +149,33 @@ export default function DashboardPage() {
                   onCloseAll={closeAll}
                 />
                 <div className="card" style={{ padding: '14px 16px', display: 'flex', flexDirection: 'column', gap: 8 }}>
-                  <div style={{ fontSize: 'var(--text-xs)', color: 'var(--text-faint)', letterSpacing: '0.07em', textTransform: 'uppercase', marginBottom: 2 }}>Account</div>
-                  {loading ? [1,2,3].map(i => <div key={i} className="skeleton" style={{ height: 12 }} />) : [
-                    { label: 'Equity',    value: account ? `$${account.total_equity.toFixed(2)}` : '—' },
-                    { label: 'Available', value: account ? `$${account.available_balance.toFixed(2)}` : '—' },
-                    { label: 'Margin',    value: account ? `$${account.used_margin.toFixed(2)}` : '—' },
-                  ].map(row => (
-                    <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                      <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>{row.label}</span>
-                      <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-sm)', fontWeight: 600 }}>{row.value}</span>
-                    </div>
-                  ))}
+                  <div style={{
+                    fontSize: 'var(--text-xs)', color: 'var(--text-faint)',
+                    letterSpacing: '0.07em', textTransform: 'uppercase', marginBottom: 2,
+                  }}>
+                    Account
+                  </div>
+                  {loading
+                    ? [1, 2, 3].map(i => <div key={i} className="skeleton" style={{ height: 12 }} />)
+                    : [
+                        { label: 'Equity',    value: fmt(account?.total_equity,       2, '$') },
+                        { label: 'Available', value: fmt(account?.available_balance,  2, '$') },
+                        { label: 'Margin',    value: fmt(account?.used_margin,        2, '$') },
+                      ].map(row => (
+                        <div key={row.label} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                          <span style={{ fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>{row.label}</span>
+                          <span style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-sm)', fontWeight: 600 }}>
+                            {row.value}
+                          </span>
+                        </div>
+                      ))
+                  }
                 </div>
               </div>
             </section>
 
             <section className="animate-fade-up" style={{ animationDelay: '80ms' }}>
-              <PositionsTable positions={positions.slice(0,5)} loading={loading} />
+              <PositionsTable positions={positions.slice(0, 5)} loading={loading} />
             </section>
           </>
         )}
