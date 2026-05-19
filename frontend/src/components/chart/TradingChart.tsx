@@ -1,17 +1,26 @@
 'use client'
 /**
- * TradingChart.tsx — v3.3
+ * TradingChart.tsx — v3.4
  * ─────────────────────────────────────────────────────────────────────────────
- * FIX 4 — lightweight-charts v4 API migration
- *   v4 removed the deprecated chart.addCandlestickSeries() / addLineSeries() /
- *   addHistogramSeries() shorthand methods in favour of the explicit
- *   chart.addSeries(SeriesType, options) overload.
- *   All series creation calls are updated to the v4 API:
- *     chart.addCandlestickSeries(opts)  →  chart.addSeries(CandlestickSeries, opts)
- *     chart.addLineSeries(opts)         →  chart.addSeries(LineSeries, opts)
- *     chart.addHistogramSeries(opts)    →  chart.addSeries(HistogramSeries, opts)
+ * FIX 5 (2026-05-20) — Race condition + Binance connectivity
  *
- * FIX 1–3 from v3.2 are retained (MACD race, barSpacing cast, NaN guard).
+ * FIX 5a: Race condition — candleRef.current was null when loadData ran.
+ *         useEffect([]) order is not guaranteed in React Strict Mode (Next.js 14
+ *         double-invokes effects). Solution: chart init effect exposes a
+ *         "ready" callback via chartReadyCbRef; loadData subscribes to it
+ *         instead of polling candleRef directly.
+ *
+ * FIX 5b: Binance REST geo-block (Romania + other regions block api.binance.com).
+ *         fetchCandles now tries api1 → api2 → api3 → api.binance.com in order,
+ *         returning on first success. Same for fetch24hChange.
+ *
+ * FIX 5c: Binance WS port 9443 is blocked by some ISPs/firewalls.
+ *         createBinanceWS tries wss://stream.binance.com:9443 first, then
+ *         wss://stream.binance.com:443 as fallback.
+ *
+ * FIX 5d: Error message shown in toolbar with full detail (was silently swallowed).
+ *
+ * FIX 1–4 from v3.2/v3.3 retained.
  */
 
 import { useEffect, useRef, useState, useCallback } from 'react'
@@ -94,6 +103,133 @@ const C = {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Binance REST — FIX 5b: multi-host failover for geo-blocked regions
+// ─────────────────────────────────────────────────────────────────────────────
+const BINANCE_HOSTS = [
+  'https://api1.binance.com',
+  'https://api2.binance.com',
+  'https://api3.binance.com',
+  'https://api.binance.com',
+]
+
+async function binanceFetch(path: string): Promise<Response> {
+  let lastErr: unknown
+  for (const host of BINANCE_HOSTS) {
+    try {
+      const res = await fetch(`${host}${path}`, { signal: AbortSignal.timeout(8000) })
+      if (res.ok) return res
+      // 4xx is definitive — no point trying other hosts
+      if (res.status >= 400 && res.status < 500) return res
+    } catch (e) {
+      lastErr = e
+    }
+  }
+  throw lastErr ?? new Error('All Binance hosts unreachable')
+}
+
+async function fetchCandles(symbol: string, interval: string, limit = 500): Promise<Candle[]> {
+  const res = await binanceFetch(`/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`)
+  if (!res.ok) throw new Error(`Binance klines HTTP ${res.status}`)
+  const raw = await res.json() as number[][]
+  return raw.map(k => ({
+    time: (k[0] / 1000) as Time,
+    open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5],
+  }))
+}
+
+/** FIX 3 — NaN guard + FIX 5b failover */
+async function fetch24hChange(symbol: string): Promise<number | null> {
+  try {
+    const res = await binanceFetch(`/api/v3/ticker/24hr?symbol=${symbol}`)
+    if (!res.ok) return null
+    const d = await res.json() as Record<string, unknown>
+    const pct = parseFloat(String(d?.priceChangePercent ?? ''))
+    return isFinite(pct) ? pct : null
+  } catch {
+    return null
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Binance WS — FIX 5c: port 9443 → 443 fallback
+// ─────────────────────────────────────────────────────────────────────────────
+const BINANCE_WS_URLS = (stream: string) => [
+  `wss://stream.binance.com:9443/ws/${stream}`,
+  `wss://stream.binance.com:443/ws/${stream}`,
+]
+
+function createBinanceWS(
+  stream: string,
+  onMessage: (data: string) => void,
+  onLive: () => void,
+) {
+  let stopped = false
+  let ws: WebSocket
+  let urlIdx = 0
+  let retries = 0
+
+  function connect() {
+    const url = BINANCE_WS_URLS(stream)[urlIdx % BINANCE_WS_URLS(stream).length]
+    ws = new WebSocket(url)
+    ws.onopen    = () => { retries = 0; onLive() }
+    ws.onmessage = ev => onMessage(ev.data as string)
+    ws.onclose   = () => {
+      if (stopped) return
+      // Alternate between URL variants on each retry
+      urlIdx++
+      const delay = Math.min(1000 * 2 ** Math.min(retries, 6), 30_000)
+      retries++
+      setTimeout(connect, delay)
+    }
+    ws.onerror = () => ws.close()
+  }
+  connect()
+  return { stop() { stopped = true; ws?.close() } }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Generic WS (backend)
+// ─────────────────────────────────────────────────────────────────────────────
+function createAutoWS(
+  getUrl: () => string,
+  onMessage: (data: string) => void,
+  maxRetries = 10,
+) {
+  let stopped = false, retries = 0
+  let ws: WebSocket
+  function connect() {
+    ws = new WebSocket(getUrl())
+    ws.onmessage = ev => onMessage(ev.data as string)
+    ws.onclose   = () => {
+      if (stopped || retries >= maxRetries) return
+      const delay = Math.min(1000 * 2 ** retries, 30_000); retries++
+      setTimeout(connect, delay)
+    }
+    ws.onerror = () => ws.close()
+  }
+  connect()
+  return { stop() { stopped = true; ws?.close() } }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Utils
+// ─────────────────────────────────────────────────────────────────────────────
+function fmtTime(unixSec: number): string {
+  return new Date(unixSec * 1000).toLocaleString('en-US', {
+    month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
+  })
+}
+function fmtVol(v: number): string {
+  if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M'
+  if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K'
+  return v.toFixed(0)
+}
+
+const CHIP_COLORS: Record<string, string> = {
+  EMA: C.ema9, BB: C.blue, VOL: C.textMuted, RSI: C.rsi, MACD: C.teal,
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Indicator math
 // ─────────────────────────────────────────────────────────────────────────────
 function calcEMA(closes: number[], period: number): number[] {
@@ -114,7 +250,7 @@ function calcRSI(closes: number[], period = 14): number[] {
   out.push(avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss))
   for (let i = period + 1; i < closes.length; i++) {
     const d = closes[i] - closes[i - 1]
-    avgGain = (avgGain * (period - 1) + Math.max(d,  0)) / period
+    avgGain = (avgGain * (period - 1) + Math.max(d, 0)) / period
     avgLoss = (avgLoss * (period - 1) + Math.max(-d, 0)) / period
     out.push(avgLoss === 0 ? 100 : 100 - 100 / (1 + avgGain / avgLoss))
   }
@@ -124,17 +260,16 @@ function calcRSI(closes: number[], period = 14): number[] {
 function calcMACD(closes: number[]): {
   macd: number[]; signal: number[]; hist: number[]; startIdx: number
 } {
-  const fast      = calcEMA(closes, 12)
-  const slow      = calcEMA(closes, 26)
-  const macdFull  = fast.map((v, i) => v - slow[i])
+  const fast     = calcEMA(closes, 12)
+  const slow     = calcEMA(closes, 26)
+  const macdFull = fast.map((v, i) => v - slow[i])
   const macdSlice = macdFull.slice(26)
-  const sigFull   = calcEMA(macdSlice, 9)
+  const sigFull  = calcEMA(macdSlice, 9)
   const sigOffset = 8
-  const signal    = sigFull.slice(sigOffset)
-  const macd      = macdSlice.slice(sigOffset)
-  const hist      = macd.map((m, i) => m - signal[i])
-  const startIdx  = 26 + sigOffset
-  return { macd, signal, hist, startIdx }
+  const signal   = sigFull.slice(sigOffset)
+  const macd     = macdSlice.slice(sigOffset)
+  const hist     = macd.map((m, i) => m - signal[i])
+  return { macd, signal, hist, startIdx: 26 + sigOffset }
 }
 
 function calcBB(closes: number[], period = 20, mult = 2): {
@@ -145,87 +280,9 @@ function calcBB(closes: number[], period = 20, mult = 2): {
     const slice = closes.slice(i - period + 1, i + 1)
     const avg = slice.reduce((a, b) => a + b, 0) / period
     const std = Math.sqrt(slice.reduce((a, b) => a + (b - avg) ** 2, 0) / period)
-    middle.push(avg)
-    upper.push(avg + mult * std)
-    lower.push(avg - mult * std)
+    middle.push(avg); upper.push(avg + mult * std); lower.push(avg - mult * std)
   }
   return { upper, middle, lower, startIdx: period - 1 }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Binance REST
-// ─────────────────────────────────────────────────────────────────────────────
-async function fetchCandles(symbol: string, interval: string, limit = 500): Promise<Candle[]> {
-  const res = await fetch(
-    `https://api.binance.com/api/v3/klines?symbol=${symbol}&interval=${interval}&limit=${limit}`
-  )
-  if (!res.ok) throw new Error(`Binance klines ${res.status}`)
-  const raw = await res.json() as number[][]
-  return raw.map(k => ({
-    time: (k[0] / 1000) as Time,
-    open: +k[1], high: +k[2], low: +k[3], close: +k[4], volume: +k[5],
-  }))
-}
-
-/**
- * FIX 3 — NaN guard on priceChangePercent.
- */
-async function fetch24hChange(symbol: string): Promise<number | null> {
-  try {
-    const res = await fetch(`https://api.binance.com/api/v3/ticker/24hr?symbol=${symbol}`)
-    if (!res.ok) return null
-    const d = await res.json() as Record<string, unknown>
-    const pct = parseFloat(String(d?.priceChangePercent ?? ''))
-    return isFinite(pct) ? pct : null
-  } catch {
-    return null
-  }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// WS auto-reconnect
-// ─────────────────────────────────────────────────────────────────────────────
-function createAutoWS(
-  getUrl: () => string,
-  onMessage: (data: string) => void,
-  maxRetries = 10,
-) {
-  let stopped = false, retries = 0
-  let ws: WebSocket
-  function connect() {
-    ws = new WebSocket(getUrl())
-    ws.onmessage = ev => onMessage(ev.data as string)
-    ws.onclose   = () => {
-      if (stopped || retries >= maxRetries) return
-      const delay = Math.min(1000 * 2 ** retries, 30_000); retries++
-      setTimeout(connect, delay)
-    }
-    ws.onerror = () => ws.close()
-  }
-  connect()
-  return { get ws() { return ws }, stop() { stopped = true; ws?.close() } }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Utils
-// ─────────────────────────────────────────────────────────────────────────────
-function fmtTime(unixSec: number): string {
-  return new Date(unixSec * 1000).toLocaleString('en-US', {
-    month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', hour12: false,
-  })
-}
-function fmtVol(v: number): string {
-  if (v >= 1e6) return (v / 1e6).toFixed(2) + 'M'
-  if (v >= 1e3) return (v / 1e3).toFixed(1) + 'K'
-  return v.toFixed(0)
-}
-
-const CHIP_COLORS: Record<string, string> = {
-  EMA:  C.ema9,
-  BB:   C.blue,
-  VOL:  C.textMuted,
-  RSI:  C.rsi,
-  MACD: C.teal,
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -261,14 +318,18 @@ export function TradingChart({
   const macdSigRef    = useRef<ISeriesApi<'Line'> | null>(null)
   const macdHistRef   = useRef<ISeriesApi<'Histogram'> | null>(null)
 
-  const binanceWSRef  = useRef<ReturnType<typeof createAutoWS> | null>(null)
+  const binanceWSRef  = useRef<ReturnType<typeof createBinanceWS> | null>(null)
   const backendWSRef  = useRef<ReturnType<typeof createAutoWS> | null>(null)
   const markersRef    = useRef<SeriesMarker<Time>[]>([])
   const candleDataRef = useRef<Candle[]>([])
   const priceLineRefs = useRef<ReturnType<ISeriesApi<'Candlestick'>['createPriceLine']>[]>([])
 
-  // FIX 1 — stable MACD populate ref (v3.2)
+  // FIX 1 — stable MACD populate ref
   const populateMACDPaneRef = useRef<(() => void) | null>(null)
+
+  // FIX 5a — chart-ready callback: loadData subscribes here instead of
+  // checking candleRef directly (avoids race condition in React Strict Mode)
+  const chartReadyCbRef = useRef<((candle: ISeriesApi<'Candlestick'>) => void) | null>(null)
 
   const [symbol,     setSymbol]     = useState(initSymbol)
   const [timeframe,  setTimeframe]  = useState(initTimeframe)
@@ -308,7 +369,7 @@ export function TradingChart({
       handleScroll: true, handleScale: true,
     })
 
-    // FIX 4 — LWC v4 API: chart.addSeries(SeriesType, options)
+    // FIX 4 — LWC v4 API
     const candles = chart.addSeries(CandlestickSeries, {
       upColor: C.green, downColor: C.red,
       borderUpColor: C.green, borderDownColor: C.red,
@@ -338,9 +399,18 @@ export function TradingChart({
       })
     })
 
-    chartRef.current   = chart;    candleRef.current   = candles; volumeRef.current = volume
-    ema9Ref.current    = ema9;     ema21Ref.current    = ema21
-    bbUpperRef.current = bbUpper;  bbMiddleRef.current = bbMiddle; bbLowerRef.current = bbLower
+    chartRef.current    = chart
+    candleRef.current   = candles
+    volumeRef.current   = volume
+    ema9Ref.current     = ema9
+    ema21Ref.current    = ema21
+    bbUpperRef.current  = bbUpper
+    bbMiddleRef.current = bbMiddle
+    bbLowerRef.current  = bbLower
+
+    // FIX 5a — notify loadData that candleRef is ready
+    chartReadyCbRef.current?.(candles)
+    chartReadyCbRef.current = null
 
     return () => {
       chart.remove()
@@ -353,7 +423,7 @@ export function TradingChart({
   // ── 2. RSI chart ──────────────────────────────────────────────────────────
   useEffect(() => {
     if (!showRsi || !rsiRef.current) return
-    const rsiChart  = createChart(rsiRef.current, {
+    const rsiChart = createChart(rsiRef.current, {
       layout: { background: { type: ColorType.Solid, color: C.bg }, textColor: C.textMuted, fontSize: 10 },
       grid: { vertLines: { color: C.border, style: LineStyle.Dotted }, horzLines: { color: C.border, style: LineStyle.Dotted } },
       crosshair: { mode: CrosshairMode.Normal, vertLine: { color: C.textFaint, width: 1, style: LineStyle.Dashed }, horzLine: { color: C.textFaint, width: 1, style: LineStyle.Dashed } },
@@ -361,7 +431,6 @@ export function TradingChart({
       timeScale: { borderColor: C.border, timeVisible: true, secondsVisible: false, visible: false },
       handleScroll: true, handleScale: false,
     })
-    // FIX 4 — v4 API
     const rsiSeries = rsiChart.addSeries(LineSeries, { color: C.rsi, lineWidth: 1, priceLineVisible: false, lastValueVisible: true })
     rsiSeries.createPriceLine({ price: 70, color: C.red,       lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true,  title: 'OB' })
     rsiSeries.createPriceLine({ price: 30, color: C.green,     lineWidth: 1, lineStyle: LineStyle.Dashed, axisLabelVisible: true,  title: 'OS' })
@@ -381,7 +450,6 @@ export function TradingChart({
   // ── 3. MACD chart — FIX 1: populate via stable ref callback ───────────────
   useEffect(() => {
     if (!showMACD || !macdRef.current) return
-
     const macdChart = createChart(macdRef.current, {
       layout: { background: { type: ColorType.Solid, color: C.bg }, textColor: C.textMuted, fontSize: 10 },
       grid: { vertLines: { color: C.border, style: LineStyle.Dotted }, horzLines: { color: C.border, style: LineStyle.Dotted } },
@@ -390,7 +458,6 @@ export function TradingChart({
       timeScale: { borderColor: C.border, timeVisible: true, secondsVisible: false, visible: false },
       handleScroll: true, handleScale: false,
     })
-    // FIX 4 — v4 API
     const macdLine = macdChart.addSeries(LineSeries,      { color: C.macd,   lineWidth: 1, priceLineVisible: false, lastValueVisible: true })
     const macdSig  = macdChart.addSeries(LineSeries,      { color: C.signal, lineWidth: 1, priceLineVisible: false, lastValueVisible: true })
     const macdHist = macdChart.addSeries(HistogramSeries, { priceScaleId: 'right', priceFormat: { type: 'price', precision: 4 } })
@@ -437,20 +504,31 @@ export function TradingChart({
   useEffect(() => { volumeRef.current?.applyOptions({ visible: showVolume }) }, [showVolume])
 
   // ── 6. Load data + Binance WS ─────────────────────────────────────────────
+  //
+  // FIX 5a: We no longer gate on candleRef.current directly.
+  // Instead we use a Promise that resolves when the chart init effect fires
+  // chartReadyCbRef, guaranteeing the series exist before we call setData.
   const loadData = useCallback(async (sym: string, tf: string) => {
-    if (!candleRef.current) return
     setLoading(true); setError(null); setTooltip(null)
     markersRef.current = []
     priceLineRefs.current.forEach(l => { try { candleRef.current?.removePriceLine(l) } catch {} })
     priceLineRefs.current = []
     binanceWSRef.current?.stop(); setWsLive(false)
 
+    // Wait for candleSeries to be ready (chart init effect may not have run yet)
+    const candles = await new Promise<ISeriesApi<'Candlestick'>>((resolve) => {
+      if (candleRef.current) {
+        resolve(candleRef.current)
+      } else {
+        chartReadyCbRef.current = resolve
+      }
+    })
+
     try {
       const [data, ch] = await Promise.all([fetchCandles(sym, tf), fetch24hChange(sym)])
-      if (!candleRef.current) return
 
       candleDataRef.current = data
-      candleRef.current.setData(data)
+      candles.setData(data)
       volumeRef.current?.setData(data.map(c => ({
         time: c.time, value: c.volume ?? 0,
         color: c.close >= c.open ? C.volGreen : C.volRed,
@@ -472,30 +550,32 @@ export function TradingChart({
         bbLowerRef.current?.setData(data.slice(bb.startIdx).map((c, i)  => ({ time: c.time, value: bb.lower[i]  })))
       }
 
-      // FIX 1: call the MACD populate callback if the pane is already mounted
       populateMACDPaneRef.current?.()
-
       chartRef.current?.timeScale().fitContent()
+
       setChange24h(ch)
       const last = data[data.length - 1]
       if (last) setPrice(last.close)
       setLoading(false)
     } catch (e) {
-      setError(String((e as Error).message ?? e))
+      const msg = e instanceof Error ? e.message : String(e)
+      setError(`Binance: ${msg}`)
       setLoading(false)
+      return  // don't start WS if REST failed
     }
 
+    // ── Binance WS (starts only after successful REST load) ──────────────
     const stream = `${sym.toLowerCase()}@kline_${tf}`
-    const bWS = createAutoWS(
-      () => `wss://stream.binance.com:9443/ws/${stream}`,
+    const bWS = createBinanceWS(
+      stream,
       (raw) => {
         const msg = JSON.parse(raw) as { k: Record<string, unknown> }
         const k = msg.k
         if (!candleRef.current) return
-        const t       = (Number(k.t) / 1000) as Time
-        const open    = +String(k.o), high  = +String(k.h)
-        const low     = +String(k.l), close = +String(k.c)
-        const vol     = +String(k.v), isClosed = Boolean(k.x)
+        const t        = (Number(k.t) / 1000) as Time
+        const open     = +String(k.o), high  = +String(k.h)
+        const low      = +String(k.l), close = +String(k.c)
+        const vol      = +String(k.v), isClosed = Boolean(k.x)
 
         candleRef.current.update({ time: t, open, high, low, close })
         volumeRef.current?.update({ time: t, value: vol, color: close >= open ? C.volGreen : C.volRed })
@@ -523,12 +603,12 @@ export function TradingChart({
             macdHistRef.current?.update({ time: t, value: hv[hv.length - 1], color: hv[hv.length - 1] >= 0 ? C.green : C.red })
           }
         }
-        setWsLive(true)
         setPrice(prev => {
           setPriceDir(prev === null ? null : close > prev ? 'up' : close < prev ? 'down' : null)
           return close
         })
       },
+      () => setWsLive(true),
     )
     binanceWSRef.current = bWS
   }, [])
@@ -599,7 +679,7 @@ export function TradingChart({
     return () => lines.forEach(l => { try { series.removePriceLine(l) } catch {} })
   }, [positions, symbol])
 
-  // ── 9. Shared ResizeObserver ──────────────────────────────────────────────
+  // ── 9. ResizeObserver ─────────────────────────────────────────────────────
   useEffect(() => {
     const ro = new ResizeObserver(() => {
       if (containerRef.current && chartRef.current)
@@ -623,27 +703,10 @@ export function TradingChart({
       const ts = chartRef.current?.timeScale()
       if (!ts) return
       switch (e.key) {
-        case 'ArrowLeft': {
-          const r = ts.getVisibleLogicalRange()
-          if (r) ts.setVisibleLogicalRange({ from: r.from - 5, to: r.to - 5 })
-          e.preventDefault(); break
-        }
-        case 'ArrowRight': {
-          const r = ts.getVisibleLogicalRange()
-          if (r) ts.setVisibleLogicalRange({ from: r.from + 5, to: r.to + 5 })
-          e.preventDefault(); break
-        }
-        case '+': {
-          // FIX 2 — type-safe barSpacing read (v3.2)
-          const cur = Number((ts.options() as Record<string, unknown>).barSpacing) || 8
-          ts.applyOptions({ barSpacing: Math.min(cur + 2, 50) })
-          break
-        }
-        case '-': {
-          const cur = Number((ts.options() as Record<string, unknown>).barSpacing) || 8
-          ts.applyOptions({ barSpacing: Math.max(cur - 2, 2) })
-          break
-        }
+        case 'ArrowLeft': { const r = ts.getVisibleLogicalRange(); if (r) ts.setVisibleLogicalRange({ from: r.from - 5, to: r.to - 5 }); e.preventDefault(); break }
+        case 'ArrowRight': { const r = ts.getVisibleLogicalRange(); if (r) ts.setVisibleLogicalRange({ from: r.from + 5, to: r.to + 5 }); e.preventDefault(); break }
+        case '+': { const cur = Number((ts.options() as Record<string, unknown>).barSpacing) || 8; ts.applyOptions({ barSpacing: Math.min(cur + 2, 50) }); break } // FIX 2
+        case '-': { const cur = Number((ts.options() as Record<string, unknown>).barSpacing) || 8; ts.applyOptions({ barSpacing: Math.max(cur - 2, 2)  }); break } // FIX 2
         case 'r': case 'R': ts.fitContent(); break
         case 'f': case 'F': setFullscreen(f => !f); break
       }
@@ -680,7 +743,7 @@ export function TradingChart({
       onFocus={e => { e.currentTarget.style.boxShadow = `0 0 0 2px ${C.teal}` }}
       onBlur={e  => { e.currentTarget.style.boxShadow = 'none' }}
     >
-      {/* ── Toolbar ────────────────────────────────────────────────────────── */}
+      {/* ── Toolbar ──────────────────────────────────────────────────────── */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px', borderBottom: `1px solid ${C.border}`, background: C.surface, flexWrap: 'wrap' }}>
         <select value={symbol} onChange={e => handleSymbol(e.target.value)}
           style={{ background: C.bg, color: C.text, border: `1px solid ${C.border}`, borderRadius: 4, padding: '3px 8px', fontSize: 12, fontWeight: 700, cursor: 'pointer', outline: 'none' }}>
@@ -729,7 +792,7 @@ export function TradingChart({
         </div>
         <div style={{ marginLeft: 'auto', display: 'flex', alignItems: 'center', gap: 8 }}>
           {loading && <span style={{ fontSize: 11, color: C.textFaint }}>Loading…</span>}
-          {error   && <span style={{ fontSize: 11, color: C.red, maxWidth: 180, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>⚠ {error}</span>}
+          {error   && <span style={{ fontSize: 11, color: C.red, maxWidth: 220, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }} title={error}>⚠ {error}</span>}
           {price != null && !loading && (
             <span style={{ fontFamily: 'monospace', fontSize: 14, fontWeight: 700, color: priceDir === 'up' ? C.green : priceDir === 'down' ? C.red : C.text, transition: 'color 300ms ease' }}>
               {price.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 6 })}
@@ -740,7 +803,8 @@ export function TradingChart({
               {change24h >= 0 ? '+' : ''}{change24h.toFixed(2)}%
             </span>
           )}
-          <span title={wsLive ? 'Live' : 'Connecting…'}
+          <span
+            title={wsLive ? 'Live' : 'Connecting…'}
             style={{ width: 7, height: 7, borderRadius: '50%', background: wsLive ? C.green : C.textFaint, display: 'inline-block', transition: 'background 300ms ease', animation: wsLive ? 'ws-pulse 2s ease-in-out infinite' : 'none' }}
           />
           <button onClick={() => setFullscreen(f => !f)} title={fullscreen ? 'Exit fullscreen (Esc)' : 'Fullscreen (F)'}
@@ -758,12 +822,12 @@ export function TradingChart({
           <div style={{ position: 'absolute', top: 8, left: 12, pointerEvents: 'none', background: C.surface2, border: `1px solid ${C.border}`, borderRadius: 6, padding: '6px 10px', fontSize: 11, color: C.textMuted, lineHeight: 1.6, zIndex: 10 }}>
             <div style={{ color: C.textFaint, marginBottom: 2, fontSize: 10 }}>{tooltip.time}</div>
             <div style={{ display: 'grid', gridTemplateColumns: 'auto auto', gap: '0 12px' }}>
-              <span style={{ color: C.textFaint }}>O</span><span style={{ color: C.text,                                  fontFamily: 'monospace' }}>{tooltip.open.toFixed(2)}</span>
-              <span style={{ color: C.textFaint }}>H</span><span style={{ color: C.green,                                 fontFamily: 'monospace' }}>{tooltip.high.toFixed(2)}</span>
-              <span style={{ color: C.textFaint }}>L</span><span style={{ color: C.red,                                   fontFamily: 'monospace' }}>{tooltip.low.toFixed(2)}</span>
-              <span style={{ color: C.textFaint }}>C</span><span style={{ color: tooltip.change >= 0 ? C.green : C.red,   fontFamily: 'monospace', fontWeight: 700 }}>{tooltip.close.toFixed(2)}</span>
-              <span style={{ color: C.textFaint }}>V</span><span style={{ color: C.textMuted,                             fontFamily: 'monospace' }}>{fmtVol(tooltip.volume)}</span>
-              <span style={{ color: C.textFaint }}>Δ</span><span style={{ color: tooltip.change >= 0 ? C.green : C.red,   fontFamily: 'monospace' }}>{tooltip.change >= 0 ? '+' : ''}{tooltip.change.toFixed(2)}%</span>
+              <span style={{ color: C.textFaint }}>O</span><span style={{ color: C.text,                                fontFamily: 'monospace' }}>{tooltip.open.toFixed(2)}</span>
+              <span style={{ color: C.textFaint }}>H</span><span style={{ color: C.green,                               fontFamily: 'monospace' }}>{tooltip.high.toFixed(2)}</span>
+              <span style={{ color: C.textFaint }}>L</span><span style={{ color: C.red,                                 fontFamily: 'monospace' }}>{tooltip.low.toFixed(2)}</span>
+              <span style={{ color: C.textFaint }}>C</span><span style={{ color: tooltip.change >= 0 ? C.green : C.red, fontFamily: 'monospace', fontWeight: 700 }}>{tooltip.close.toFixed(2)}</span>
+              <span style={{ color: C.textFaint }}>V</span><span style={{ color: C.textMuted,                           fontFamily: 'monospace' }}>{fmtVol(tooltip.volume)}</span>
+              <span style={{ color: C.textFaint }}>Δ</span><span style={{ color: tooltip.change >= 0 ? C.green : C.red, fontFamily: 'monospace' }}>{tooltip.change >= 0 ? '+' : ''}{tooltip.change.toFixed(2)}%</span>
             </div>
           </div>
         )}
