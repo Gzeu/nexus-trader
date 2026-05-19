@@ -1,64 +1,81 @@
-'use client'
-
-import { useState, useCallback } from 'react'
-import { api } from '@/lib/api'
-import { usePolling } from './usePolling'
-import { useWebSocket } from './useWebSocket'
-import type { AccountInfo, HealthResponse, Position, StrategySignal, RiskMetrics, WSEvent } from '@/types'
+/** ─── Nexus Trader — Dashboard data hook ───────────────────────────────── */
+'use client';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import { api } from '@/lib/api';
+import { useWebSocket } from './useWebSocket';
+import type {
+  AccountInfo, HealthStatus, Position,
+  RiskMetrics, StrategySignal, WSEvent,
+} from '@/types/trading';
 
 export interface DashboardState {
-  health:    HealthResponse | null
-  account:   AccountInfo   | null
-  positions: Position[]
-  signals:   StrategySignal[]
-  metrics:   RiskMetrics   | null
-  loading:   boolean
-  error:     string | null
-  wsConnected: boolean
+  health:      HealthStatus | null;
+  account:     AccountInfo  | null;
+  metrics:     RiskMetrics  | null;
+  positions:   Position[];
+  signals:     StrategySignal[];
+  loading:     boolean;
+  lastUpdated: Date | null;
+  wsStatus:    import('./useWebSocket').WsStatus;
+  refresh:     () => void;
+  emergencyStop: () => Promise<void>;
+  resumeTrading: () => Promise<void>;
+  cancelAll:   () => Promise<void>;
+  closeAll:    () => Promise<void>;
 }
 
-export function useDashboard() {
-  const [state, setState] = useState<DashboardState>({
-    health: null, account: null, positions: [], signals: [], metrics: null,
-    loading: true, error: null, wsConnected: false,
-  })
+export function useDashboard(): DashboardState {
+  const [health,    setHealth]    = useState<HealthStatus | null>(null);
+  const [account,   setAccount]   = useState<AccountInfo  | null>(null);
+  const [metrics,   setMetrics]   = useState<RiskMetrics  | null>(null);
+  const [positions, setPositions] = useState<Position[]>([]);
+  const [signals,   setSignals]   = useState<StrategySignal[]>([]);
+  const [loading,   setLoading]   = useState(true);
+  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
+  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const refresh = useCallback(async () => {
+  const fetchAll = useCallback(async () => {
     try {
-      const [health, account, positions, signals, metrics] = await Promise.all([
-        api.health(),
-        api.account(),
-        api.positions(),
-        api.signals(30),
-        api.metrics(),
-      ])
-      setState(s => ({ ...s, health, account, positions, signals, metrics, loading: false, error: null }))
-    } catch (e) {
-      setState(s => ({ ...s, loading: false, error: (e as Error).message }))
+      const [h, a, m, p, s] = await Promise.allSettled([
+        api.health(), api.account(), api.metrics(),
+        api.positions(), api.signals(30),
+      ]);
+      if (h.status === 'fulfilled') setHealth(h.value);
+      if (a.status === 'fulfilled') setAccount(a.value);
+      if (m.status === 'fulfilled') setMetrics(m.value);
+      if (p.status === 'fulfilled') setPositions(p.value);
+      if (s.status === 'fulfilled') setSignals(s.value);
+      setLastUpdated(new Date());
+    } finally {
+      setLoading(false);
     }
-  }, [])
+  }, []);
 
-  // Poll every 5 seconds
-  usePolling(refresh, 5_000)
-
-  // WebSocket live updates
-  const handleWS = useCallback((evt: WSEvent) => {
-    if (evt.event === 'position_update' || evt.event === 'order_filled') {
-      void api.positions().then(positions => setState(s => ({ ...s, positions })))
+  const onWsEvent = useCallback((e: WSEvent) => {
+    if (e.event === 'position_opened' || e.event === 'position_closed' ||
+        e.event === 'order_filled'   || e.event === 'tp_hit'          ||
+        e.event === 'signal_created' || e.event === 'risk_event') {
+      void fetchAll();
     }
-    if (evt.event === 'signal_created') {
-      const sig = evt.payload as unknown as StrategySignal
-      setState(s => ({ ...s, signals: [sig, ...s.signals].slice(0, 50) }))
-    }
-    if (evt.event === 'metrics_update') {
-      setState(s => ({ ...s, metrics: evt.payload as unknown as RiskMetrics }))
-    }
-  }, [])
+  }, [fetchAll]);
 
-  const { connected } = useWebSocket(handleWS)
+  const { status: wsStatus } = useWebSocket({ onEvent: onWsEvent });
 
-  // reflect WS connection status
-  useState(() => { setState(s => ({ ...s, wsConnected: connected })) })
+  useEffect(() => {
+    void fetchAll();
+    pollRef.current = setInterval(fetchAll, 15_000);
+    return () => { pollRef.current && clearInterval(pollRef.current); };
+  }, [fetchAll]);
 
-  return { state, refresh }
+  const emergencyStop = async () => { await api.emergencyStop(); await fetchAll(); };
+  const resumeTrading = async () => { await api.resumeTrading(); await fetchAll(); };
+  const cancelAll     = async () => { await api.cancelAll();     await fetchAll(); };
+  const closeAll      = async () => { await api.closeAll();      await fetchAll(); };
+
+  return {
+    health, account, metrics, positions, signals,
+    loading, lastUpdated, wsStatus,
+    refresh: fetchAll,
+    emergencyStop, resumeTrading, cancelAll, closeAll,
+  };
 }

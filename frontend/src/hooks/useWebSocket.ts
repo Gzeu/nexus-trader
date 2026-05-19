@@ -1,58 +1,63 @@
-'use client'
+/** ─── Nexus Trader — WebSocket hook with auto-reconnect ─────────────────── */
+'use client';
+import { useCallback, useEffect, useRef, useState } from 'react';
+import type { WSEvent } from '@/types/trading';
+import { wsUrl } from '@/lib/api';
 
-import { useEffect, useRef, useCallback, useState } from 'react'
-import type { WSEvent } from '@/types'
+export type WsStatus = 'connecting' | 'connected' | 'disconnected' | 'error';
 
-type Handler = (event: WSEvent) => void
+interface Options {
+  onEvent?: (e: WSEvent) => void;
+  maxRetries?: number;
+  baseDelay?: number;
+}
 
-const WS_URL = (process.env.NEXT_PUBLIC_WS_URL ?? 'ws://localhost:8000/ws')
-
-export function useWebSocket(onEvent: Handler) {
-  const wsRef        = useRef<WebSocket | null>(null)
-  const handlerRef   = useRef<Handler>(onEvent)
-  const retryRef     = useRef<ReturnType<typeof setTimeout> | null>(null)
-  const retryCount   = useRef(0)
-  const [connected, setConnected] = useState(false)
-
-  handlerRef.current = onEvent
+export function useWebSocket({ onEvent, maxRetries = 10, baseDelay = 1000 }: Options = {}) {
+  const [status, setStatus] = useState<WsStatus>('disconnected');
+  const wsRef       = useRef<WebSocket | null>(null);
+  const retries     = useRef(0);
+  const retryTimer  = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const onEventRef  = useRef(onEvent);
+  useEffect(() => { onEventRef.current = onEvent; }, [onEvent]);
 
   const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) return
-
-    const ws = new WebSocket(WS_URL)
-    wsRef.current = ws
+    if (wsRef.current?.readyState === WebSocket.OPEN) return;
+    setStatus('connecting');
+    const url = wsUrl();
+    const ws  = new WebSocket(url);
+    wsRef.current = ws;
 
     ws.onopen = () => {
-      setConnected(true)
-      retryCount.current = 0
-    }
+      setStatus('connected');
+      retries.current = 0;
+    };
 
     ws.onmessage = (e) => {
       try {
-        const evt: WSEvent = JSON.parse(e.data)
-        handlerRef.current(evt)
+        const event = JSON.parse(e.data as string) as WSEvent;
+        onEventRef.current?.(event);
       } catch { /* ignore malformed */ }
-    }
+    };
+
+    ws.onerror = () => setStatus('error');
 
     ws.onclose = () => {
-      setConnected(false)
-      wsRef.current = null
-      // Exponential backoff: 1s, 2s, 4s … max 16s
-      const delay = Math.min(1000 * 2 ** retryCount.current, 16_000)
-      retryCount.current++
-      retryRef.current = setTimeout(connect, delay)
-    }
-
-    ws.onerror = () => ws.close()
-  }, [])
+      setStatus('disconnected');
+      if (retries.current < maxRetries) {
+        const delay = Math.min(baseDelay * 2 ** retries.current, 30_000);
+        retries.current++;
+        retryTimer.current = setTimeout(connect, delay);
+      }
+    };
+  }, [maxRetries, baseDelay]);
 
   useEffect(() => {
-    connect()
+    connect();
     return () => {
-      if (retryRef.current) clearTimeout(retryRef.current)
-      wsRef.current?.close()
-    }
-  }, [connect])
+      retryTimer.current && clearTimeout(retryTimer.current);
+      wsRef.current?.close(1000, 'unmount');
+    };
+  }, [connect]);
 
-  return { connected }
+  return { status };
 }
