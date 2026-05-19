@@ -1,6 +1,9 @@
 """
 FastAPI routes — toate endpoint-urile REST ale sistemului.
 "/api/v1/" prefix aplicat in app.py.
+
+FIX: health() citeste dry_run din get_settings() nu din ExecutionEngine
+     (care il citeste intern dar nu il expune ca property public).
 """
 from __future__ import annotations
 
@@ -11,6 +14,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from backend.api.state import AppState, get_state
+from backend.config import get_settings
 from backend.models import Order, Position, StrategySignal
 from backend.models_extra import AccountInfo, BalanceSummary
 
@@ -23,12 +27,14 @@ router = APIRouter()
 @router.get("/health")
 async def health(state: AppState = Depends(get_state)) -> Dict[str, Any]:
     """System health — primul endpoint verificat de healthcheck."""
+    cfg = get_settings()
     return {
         "status": "ok",
         "reconciled": state.portfolio.is_ready,
-        "dry_run": state.execution.dry_run,
+        "dry_run": cfg.dry_run,          # FIX: citit din config, nu din ExecutionEngine
+        "testnet": cfg.testnet,
         "price_cache_ready": state.price_cache.is_ready,
-        "automation_running": state.automation.is_running,
+        "automation_running": state.automation.running,
     }
 
 
