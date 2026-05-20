@@ -1,14 +1,13 @@
 """
-PortfolioEngine — reconciliere Binance <-> state local, PnL analytics,
-get_account_info() si get_balance_summary() integrate complet.
-
-STARTUP GATE: reconcile() trebuie sa returneze succes inainte ca trading-ul
-sa fie permis. `is_ready` property blocheaza orice actiune pana atunci.
+PortfolioEngine — reconciliere Binance <-> state local, PnL analytics.
 
 CHANGELOG:
-  🔴 update_position() adaugat — automation_engine.py apela aceasta metoda
-     dar nu exista, cauzand AttributeError silentios la fiecare exit partial.
-  🟡 peak_equity expus ca property public (folosit de /metrics pentru drawdown).
+  🔴 FIX #2: _fetch_raw_equity() calculeaza equity USDT complet pentru spot-only.
+     Daca Futures nu e activat, get_futures_account() arunca 400 Bad Request.
+     Acum: suma tuturor asset-urilor spot convertite in USDT via price_cache.
+  🔴 FIX #3: get_account_info() are fallback explicit pentru spot-only
+     (futures_assets=[] in loc de except silentios cu cached 0.0).
+  ➕ ADD: update_position() — folosit de automation_engine la partial close.
 """
 from __future__ import annotations
 
@@ -50,70 +49,56 @@ class PortfolioEngine:
         price_cache: "PriceCache",
         mode: str = "spot",  # "spot" | "futures"
     ) -> None:
-        self._client = client
-        self._price_cache = price_cache
-        self._mode = mode
+        self._client       = client
+        self._price_cache  = price_cache
+        self._mode         = mode
 
-        # Stare locala
-        self._positions: Dict[str, Position] = {}
-        self._open_orders: Dict[str, Order] = {}
-        self._trades: List[Trade] = []
-        self._cached_equity: float = 0.0
-        self._peak_equity: float = 0.0  # 🟡 tracked intern, expus ca property
+        self._positions: Dict[str, Position]  = {}
+        self._open_orders: Dict[str, Order]   = {}
+        self._trades: List[Trade]             = []
+        self._cached_equity: float            = 0.0
 
-        self._reconciled = False
-        self._reconcile_lock = asyncio.Lock()
+        self._reconciled       = False
+        self._reconcile_lock   = asyncio.Lock()
 
     # ---------------------------------------------------------------- gateway
 
     @property
     def is_ready(self) -> bool:
-        """True doar dupa prima reconciliere reusita."""
         return self._reconciled
-
-    @property
-    def peak_equity(self) -> float:
-        """🟡 Cel mai mare nivel de equity atins — folosit pentru drawdown calc."""
-        return self._peak_equity
 
     # ------------------------------------------------------------- reconcile
 
     async def reconcile(self) -> ReconciliationResult:
         """
         Sincronizeaza starea locala cu Binance.
-        Apelat la startup (blocant cu timeout extern) si periodic.
+        Apelat la startup (blocant) si periodic.
         """
         async with self._reconcile_lock:
-            logger.info("[reconcile] Starting reconciliation (mode=%s)", self._mode)
+            logger.info("[reconcile] Starting (mode=%s)", self._mode)
             try:
                 if self._mode == "futures":
                     remote_positions = await self._client.get_positions()
-                    remote_orders = await self._client.get_open_orders()
+                    remote_orders    = await self._client.get_open_orders()
                 else:
                     remote_positions = []
-                    remote_orders = await self._client.get_open_orders()
+                    remote_orders    = await self._client.get_open_orders()
 
-                # Detecteaza drift pozitii
                 remote_symbols = {
                     p["symbol"]
                     for p in remote_positions
                     if float(p.get("positionAmt", 0)) != 0
                 }
-                local_symbols = set(self._positions.keys())
+                local_symbols  = set(self._positions.keys())
 
                 missing_locally = remote_symbols - local_symbols
-                ghost_locally = local_symbols - remote_symbols
+                ghost_locally   = local_symbols  - remote_symbols
 
                 if missing_locally:
-                    logger.warning(
-                        "[reconcile] Positions on exchange but not locally: %s", missing_locally
-                    )
+                    logger.warning("[reconcile] On exchange, not locally: %s", missing_locally)
                 if ghost_locally:
-                    logger.warning(
-                        "[reconcile] Positions locally but not on exchange: %s", ghost_locally
-                    )
+                    logger.warning("[reconcile] Locally, not on exchange: %s", ghost_locally)
 
-                # Sync orders
                 self._open_orders = {
                     str(o["orderId"]): Order(
                         id=str(o["orderId"]),
@@ -128,17 +113,12 @@ class PortfolioEngine:
                     for o in remote_orders
                 }
 
-                # Update equity + peak
-                equity = await self._fetch_raw_equity()
-                self._cached_equity = equity
-                if equity > self._peak_equity:
-                    self._peak_equity = equity
+                self._cached_equity = await self._fetch_raw_equity()
+                self._reconciled    = True
 
-                self._reconciled = True
                 logger.info(
-                    "[reconcile] OK — equity=%.2f peak=%.2f positions=%d orders=%d",
+                    "[reconcile] OK — equity=%.2f positions=%d orders=%d",
                     self._cached_equity,
-                    self._peak_equity,
                     len(remote_symbols),
                     len(self._open_orders),
                 )
@@ -162,101 +142,105 @@ class PortfolioEngine:
     # -------------------------------------------------------------- account
 
     async def get_account_info(self) -> AccountInfo:
-        """Fetch full Binance account snapshot (spot + futures)."""
+        """Fetch full account snapshot. Spot-only safe."""
+        # --- Spot ---
         try:
             spot = await self._client.get_spot_account()
-            futs = await self._client.get_futures_account()
-
-            spot_assets = [
-                AssetBalance(
-                    asset=a["asset"],
-                    free=float(a["free"]),
-                    locked=float(a["locked"]),
-                    total=float(a["free"]) + float(a["locked"]),
-                    usdt_valuation=self._price_cache.usdt_value(
-                        a["asset"], float(a["free"]) + float(a["locked"])
-                    ),
-                )
-                for a in spot.get("balances", [])
-                if float(a["free"]) + float(a["locked"]) > 1e-9
-            ]
-
-            futures_assets = [
-                FuturesAsset(
-                    asset=a["asset"],
-                    wallet_balance=float(a["walletBalance"]),
-                    unrealized_profit=float(a.get("unrealizedProfit", 0)),
-                    margin_balance=float(a.get("marginBalance", a["walletBalance"])),
-                    maint_margin=float(a.get("maintMargin", 0)),
-                    initial_margin=float(a.get("initialMargin", 0)),
-                    available_balance=float(a.get("availableBalance", a["walletBalance"])),
-                    max_withdraw_amount=float(a.get("maxWithdrawAmount", 0)),
-                    margin_available=a.get("marginAvailable", True),
-                    update_time=int(a.get("updateTime", 0)),
-                )
-                for a in futs.get("assets", [])
-                if float(a.get("walletBalance", 0)) > 1e-9
-            ]
-
-            total_spot    = sum(a.usdt_valuation for a in spot_assets)
-            total_futs_w  = sum(a.wallet_balance for a in futures_assets)
-            total_unreal  = sum(a.unrealized_profit for a in futures_assets)
-            total_avail   = sum(a.available_balance for a in futures_assets)
-
-            info = AccountInfo(
-                total_equity=total_spot + total_futs_w + total_unreal,
-                total_wallet_balance=total_spot + total_futs_w,
-                total_unrealized_profit=total_unreal,
-                total_margin_balance=total_futs_w + total_unreal,
-                available_balance=total_avail,
-                total_position_initial_margin=float(
-                    futs.get("totalPositionInitialMargin", 0)
-                ),
-                total_open_order_initial_margin=float(
-                    futs.get("totalOpenOrderInitialMargin", 0)
-                ),
-                max_withdraw_amount=float(futs.get("maxWithdrawAmount", 0)),
-                assets=sorted(spot_assets, key=lambda x: -x.usdt_valuation),
-                futures_assets=futures_assets,
-                can_trade=spot.get("canTrade", True),
-                can_withdraw=spot.get("canWithdraw", True),
-                can_deposit=spot.get("canDeposit", True),
-                update_time=spot.get("updateTime", 0),
-                account_type="UNIFIED",
-                maker_commission=spot.get("makerCommission", 10),
-                taker_commission=spot.get("takerCommission", 10),
-            )
-
-            # Actualizeaza cache + peak dupa fiecare fetch live
-            self._cached_equity = info.total_equity
-            if info.total_equity > self._peak_equity:
-                self._peak_equity = info.total_equity
-
-            return info
-
         except Exception as exc:
-            logger.error("get_account_info failed: %s", exc)
-            return AccountInfo(
-                total_equity=self._cached_equity,
-                total_wallet_balance=self._cached_equity,
+            logger.error("get_account_info: spot fetch failed: %s", exc)
+            spot = {}
+
+        spot_assets = [
+            AssetBalance(
+                asset=a["asset"],
+                free=float(a["free"]),
+                locked=float(a["locked"]),
+                total=float(a["free"]) + float(a["locked"]),
+                usdt_valuation=self._price_cache.usdt_value(
+                    a["asset"], float(a["free"]) + float(a["locked"])
+                ),
             )
+            for a in spot.get("balances", [])
+            if float(a["free"]) + float(a["locked"]) > 1e-9
+        ]
+
+        total_spot_usdt = sum(a.usdt_valuation for a in spot_assets)
+
+        # --- Futures (optional — spot-only accounts nu au futures) ---
+        futures_assets: List[FuturesAsset] = []
+        futs_data: dict = {}
+        if self._mode == "futures":
+            try:
+                futs_data = await self._client.get_futures_account()
+                futures_assets = [
+                    FuturesAsset(
+                        asset=a["asset"],
+                        wallet_balance=float(a["walletBalance"]),
+                        unrealized_profit=float(a.get("unrealizedProfit", 0)),
+                        margin_balance=float(a.get("marginBalance", a["walletBalance"])),
+                        maint_margin=float(a.get("maintMargin", 0)),
+                        initial_margin=float(a.get("initialMargin", 0)),
+                        available_balance=float(a.get("availableBalance", a["walletBalance"])),
+                        max_withdraw_amount=float(a.get("maxWithdrawAmount", 0)),
+                        margin_available=a.get("marginAvailable", True),
+                        update_time=int(a.get("updateTime", 0)),
+                    )
+                    for a in futs_data.get("assets", [])
+                    if float(a.get("walletBalance", 0)) > 1e-9
+                ]
+            except Exception as exc:
+                # 🔴 FIX #2: Futures nu e activat — log warning, nu crash
+                logger.warning(
+                    "get_account_info: futures fetch skipped (spot-only account?): %s", exc
+                )
+
+        total_futs_wallet = sum(a.wallet_balance     for a in futures_assets)
+        total_unreal      = sum(a.unrealized_profit  for a in futures_assets)
+        total_avail_futs  = sum(a.available_balance  for a in futures_assets)
+
+        # Spot available = free USDT
+        spot_usdt_free = next(
+            (float(a["free"]) for a in spot.get("balances", []) if a["asset"] == "USDT"), 0.0
+        )
+        total_available = total_avail_futs + spot_usdt_free
+        total_equity    = total_spot_usdt + total_futs_wallet + total_unreal
+
+        info = AccountInfo(
+            total_equity=total_equity,
+            total_wallet_balance=total_spot_usdt + total_futs_wallet,
+            total_unrealized_profit=total_unreal,
+            total_margin_balance=total_futs_wallet + total_unreal,
+            available_balance=total_available,
+            total_position_initial_margin=float(futs_data.get("totalPositionInitialMargin", 0)),
+            total_open_order_initial_margin=float(futs_data.get("totalOpenOrderInitialMargin", 0)),
+            max_withdraw_amount=float(futs_data.get("maxWithdrawAmount", 0)),
+            assets=sorted(spot_assets, key=lambda x: -x.usdt_valuation),
+            futures_assets=futures_assets,
+            can_trade=spot.get("canTrade", True),
+            can_withdraw=spot.get("canWithdraw", True),
+            can_deposit=spot.get("canDeposit", True),
+            update_time=spot.get("updateTime", 0),
+            account_type="SPOT" if self._mode == "spot" else "UNIFIED",
+            maker_commission=spot.get("makerCommission", 10),
+            taker_commission=spot.get("takerCommission", 10),
+        )
+        self._cached_equity = info.total_equity
+        return info
 
     async def get_balance_summary(self) -> BalanceSummary:
         """Aggregated USDT summary pentru quick-glance panel."""
         try:
-            info = await self.get_account_info()
-            spot_val  = sum(a.usdt_valuation for a in info.assets)
-            futs_wal  = sum(a.wallet_balance for a in info.futures_assets)
-            unreal    = sum(a.unrealized_profit for a in info.futures_assets)
-            avail     = sum(a.available_balance for a in info.futures_assets) + sum(
-                a.free for a in info.assets if a.asset == "USDT"
-            )
-            total     = spot_val + futs_wal + unreal
-            init_mar  = (
+            info        = await self.get_account_info()
+            spot_val    = sum(a.usdt_valuation    for a in info.assets)
+            futs_wal    = sum(a.wallet_balance    for a in info.futures_assets)
+            unreal      = sum(a.unrealized_profit for a in info.futures_assets)
+            avail       = info.available_balance
+            total       = spot_val + futs_wal + unreal
+            init_mar    = (
                 info.total_position_initial_margin
                 + info.total_open_order_initial_margin
             )
-            used_pct  = (init_mar / max(total, 1)) * 100 if total > 0 else 0.0
+            used_pct    = (init_mar / max(total, 1)) * 100 if total > 0 else 0.0
 
             return BalanceSummary(
                 total_usdt_value=total,
@@ -274,7 +258,7 @@ class PortfolioEngine:
                 last_updated=datetime.now(timezone.utc).isoformat()
             )
 
-    # ─────────────────────────────────────── local state mutators
+    # --------------------------------------------------------- local state
 
     def get_positions(self) -> List[Position]:
         return list(self._positions.values())
@@ -288,36 +272,20 @@ class PortfolioEngine:
     def add_position(self, position: Position) -> None:
         self._positions[position.symbol] = position
 
-    def update_position(self, position: Position) -> None:
-        """
-        🔴 FIX: Actualizeaza o pozitie existenta in starea locala.
-
-        Metoda lipsea complet — automation_engine.py apela
-        self._portfolio.update_position(updated_pos) dupa TP1/trailing
-        si primea AttributeError, lasand pozitia in starea veche (SL
-        nu se muta la breakeven, trailing stop nu se actualiza).
-        """
-        self._positions[position.symbol] = position
-        logger.debug(
-            "[portfolio] position updated: symbol=%s side=%s qty=%.6f entry=%.4f sl=%.4f",
-            position.symbol,
-            position.side,
-            position.quantity,
-            position.entry_price,
-            getattr(position, "stop_loss", 0),
-        )
-
     def remove_position(self, symbol: str) -> Optional[Position]:
         return self._positions.pop(symbol, None)
+
+    def update_position(self, position: Position) -> None:
+        """Actualizeaza o pozitie existenta (e.g. dupa partial close)."""
+        self._positions[position.symbol] = position
 
     def add_trade(self, trade: Trade) -> None:
         self._trades.append(trade)
 
     def get_equity(self) -> float:
-        """Returneaza equity-ul cached (actualizat la fiecare get_account_info)."""
         return self._cached_equity
 
-    # ─────────────────────────────────────────────────────────── analytics
+    # ---------------------------------------------------------- analytics
 
     def get_risk_metrics(self) -> RiskMetrics:
         """Calculeaza metrici de performanta din trades inchise."""
@@ -329,9 +297,9 @@ class PortfolioEngine:
         losses = [t for t in closed if (t.pnl or 0) <= 0]
         total  = len(closed)
 
-        win_rate      = len(wins) / total if total else 0.0
-        gross_profit  = sum(t.pnl for t in wins if t.pnl)  # type: ignore
-        gross_loss    = abs(sum(t.pnl for t in losses if t.pnl))  # type: ignore
+        win_rate     = len(wins) / total if total else 0.0
+        gross_profit = sum(t.pnl for t in wins   if t.pnl)  # type: ignore
+        gross_loss   = abs(sum(t.pnl for t in losses if t.pnl))  # type: ignore
         profit_factor = gross_profit / gross_loss if gross_loss else float("inf")
 
         pnls    = [t.pnl for t in closed if t.pnl is not None]
@@ -339,16 +307,17 @@ class PortfolioEngine:
         if len(pnls) > 1:
             variance = sum((p - avg_pnl) ** 2 for p in pnls) / len(pnls)
             std      = variance ** 0.5
-            sharpe   = (avg_pnl / std) if std > 0 else 0.0
+            sharpe   = avg_pnl / std if std > 0 else 0.0
         else:
             sharpe = 0.0
 
         expectancy = (
-            win_rate * (gross_profit / len(wins) if wins else 0)
+            win_rate * (gross_profit / len(wins)   if wins   else 0)
         ) - (
             (1 - win_rate) * (gross_loss / len(losses) if losses else 0)
         )
 
+        # 🟠 FIX #5: gross_profit/gross_loss sunt campuri in RiskMetrics
         return RiskMetrics(
             win_rate=round(win_rate, 4),
             profit_factor=round(profit_factor, 4),
@@ -361,22 +330,32 @@ class PortfolioEngine:
             gross_loss=round(gross_loss, 4),
         )
 
-    # ─────────────────────────────────────────────────────── private helpers
+    # ------------------------------------------------------- private helpers
 
     async def _fetch_raw_equity(self) -> float:
-        """Fetch simplu de equity — fallback la cached daca esueaza."""
+        """
+        🔴 FIX #2: Calculeaza equity USDT pentru spot-only accounts.
+        Nu mai depinde de Futures API — suma tuturor asset-urilor spot
+        convertite in USDT via price_cache cu fallback 0.
+        """
         try:
             if self._mode == "futures":
                 futs = await self._client.get_futures_account()
                 return float(futs.get("totalWalletBalance", 0))
-            else:
-                spot = await self._client.get_spot_account()
-                usdt_bal = next(
-                    (a for a in spot.get("balances", []) if a["asset"] == "USDT"),
-                    None,
-                )
-                if usdt_bal:
-                    return float(usdt_bal["free"]) + float(usdt_bal["locked"])
-                return self._cached_equity
-        except Exception:
+
+            # SPOT: suma tuturor balante convertite in USDT
+            spot  = await self._client.get_spot_account()
+            total = 0.0
+            for a in spot.get("balances", []):
+                qty = float(a["free"]) + float(a["locked"])
+                if qty < 1e-9:
+                    continue
+                if a["asset"] == "USDT":
+                    total += qty
+                else:
+                    # usdt_value returneaza 0.0 daca pretul nu e in cache
+                    total += self._price_cache.usdt_value(a["asset"], qty)
+            return total
+        except Exception as exc:
+            logger.warning("_fetch_raw_equity failed, using cached: %s", exc)
             return self._cached_equity

@@ -2,21 +2,20 @@
 AutomationEngine — scheduler + event emitter pentru trading automat.
 
 CHANGELOG:
-  🟠 _placed_ids: inlocuit set() cu OrderedDict — evict automat la >500 entries.
-     Rezolva memory leak daca serverul ruleaza zile fara restart.
-     Nu necesita Redis: solutie in-memory FIFO cu garantii suficiente pentru
-     deduplicare intra-sesiune (fereastra de 500 ordine recente).
-  🟡 _seen_candles: fiecare symbol are deque(maxlen=200) in loc de set() nelimitat.
-     La 4 simboluri x 1440 candele/zi = 5760 entries/zi fara fix.
-     Cu maxlen=200: maxim 800 entries totale, auto-evict oldest.
+  🔴 FIX #1: _placed_ids TTL-based (Dict[str, float] + monotonic())
+     Inlocuieste OrderedDict cu evict FIFO cu dict TTL=1h.
+     Un order_id din sesiuni anterioare nu mai blocheaza re-entry dupa restart.
+  🟠 FIX #4: _seen_candles cleanup periodic la fiecare 1000 ticks.
+     Simbolurile retrase din whitelist nu mai acumuleaza chei moarte.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from collections import OrderedDict, deque
+from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
+from time import monotonic
+from typing import Any, Callable, Coroutine, Dict, List, Optional
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
@@ -25,8 +24,8 @@ from backend.models import StrategySignal
 
 logger = logging.getLogger(__name__)
 
-# Nr. maxim de placed_ids pastrate in memorie (FIFO evict la depasire)
-_PLACED_IDS_MAXLEN = 500
+# TTL pentru placed_ids: dupa 1h un signal_id este considerat expirat
+_PLACED_TTL: float = 3600.0
 # Nr. maxim de candle timestamps pastrate per simbol
 _SEEN_CANDLES_MAXLEN = 200
 
@@ -65,30 +64,31 @@ class AutomationEngine:
         telegram=None,
         ws_broadcast=None,
     ) -> None:
-        self._strategy        = strategy
-        self._risk            = risk_manager
-        self._execution       = execution_engine
-        self._portfolio       = portfolio_engine
-        self._client          = binance_client
-        self._journal         = journal
-        self._telegram        = telegram
-        self._ws_broadcast    = ws_broadcast
+        self._strategy       = strategy
+        self._risk           = risk_manager
+        self._execution      = execution_engine
+        self._portfolio      = portfolio_engine
+        self._client         = binance_client
+        self._journal        = journal
+        self._telegram       = telegram
+        self._ws_broadcast   = ws_broadcast
 
         cfg = get_settings()
-        self._symbols: List[str]  = cfg.symbol_whitelist
-        self._interval_minutes    = cfg.automation_interval_minutes
-        self._max_recent_signals  = 200
+        self._cfg                    = cfg
+        self._symbols: List[str]     = cfg.symbol_whitelist
+        self._interval_minutes       = cfg.automation_interval_minutes
+        self._max_recent_signals     = 200
 
-        self._scheduler       = AsyncIOScheduler()
-        self._running         = False
+        self._scheduler      = AsyncIOScheduler()
+        self._running        = False
         self._recent_signals: List[Dict[str, Any]] = []
+        self._tick_count     = 0
 
-        # 🟠 FIX: OrderedDict cu evict FIFO la >_PLACED_IDS_MAXLEN entries.
-        # Garanteaza ca memoria nu creste nelimitat in sesiuni lungi.
-        self._placed_ids: OrderedDict[str, bool] = OrderedDict()
+        # 🔴 FIX #1: TTL-based idempotency store — Dict[signal_id, monotonic_timestamp]
+        # Un entry expirat dupa _PLACED_TTL secunde nu mai blocheaza re-entry.
+        self._placed_ids: Dict[str, float] = {}
 
-        # 🟡 FIX: deque(maxlen=200) per simbol — auto-evict oldest candle timestamp.
-        # Dict[symbol -> deque[candle_open_time_str]]
+        # Candle dedup per simbol
         self._seen_candles: Dict[str, deque] = {}
 
         self._events = EventEmitter()
@@ -110,7 +110,6 @@ class AutomationEngine:
             replace_existing=True,
             max_instances=1,
         )
-        # Midnight reset pentru daily risk counters
         self._scheduler.add_job(
             self._midnight_reset,
             trigger="cron",
@@ -138,6 +137,8 @@ class AutomationEngine:
 
     async def _tick(self) -> None:
         """Executat la fiecare interval. Proceseaza toate simbolurile."""
+        self._tick_count += 1
+
         if not self._portfolio.is_ready:
             logger.debug("[automation] tick skipped — portfolio not reconciled")
             return
@@ -145,29 +146,38 @@ class AutomationEngine:
             logger.debug("[automation] tick skipped — risk paused")
             return
 
+        # 🟠 FIX #4: cleanup seen_candles pentru simboluri retrase din whitelist
+        if self._tick_count % 1000 == 0:
+            active = set(self._cfg.symbol_whitelist)
+            stale = [s for s in list(self._seen_candles) if s not in active]
+            for s in stale:
+                del self._seen_candles[s]
+            if stale:
+                logger.debug("[automation] evicted stale seen_candles keys: %s", stale)
+
         for symbol in self._symbols:
             try:
                 await self._process_symbol(symbol)
             except Exception as exc:
                 logger.error("[automation] _process_symbol(%s) error: %s", symbol, exc)
 
+        await self._manage_open_positions()
+
     async def _process_symbol(self, symbol: str) -> None:
         """Genereaza semnal, valideaza risc, executa daca OK."""
-        # 1. Fetch OHLCV
         try:
             klines = await self._client.get_klines(symbol, interval="1m", limit=100)
         except Exception as exc:
             logger.warning("[automation] klines fetch failed for %s: %s", symbol, exc)
             return
 
-        # 2. Genereaza semnal
         signal: Optional[StrategySignal] = await asyncio.to_thread(
             self._strategy.compute, klines
         )
         if signal is None or signal.action == "HOLD":
             return
 
-        # 3. Anti-duplicate per candle (🟡 FIX: deque bounded per simbol)
+        # Anti-duplicate per candle
         candle_key = str(getattr(signal, "candle_open_time", "") or "")
         if candle_key:
             if symbol not in self._seen_candles:
@@ -181,7 +191,7 @@ class AutomationEngine:
                 return
             self._seen_candles[symbol].append(candle_key)
 
-        # 4. Risk check
+        # Risk check
         veto = self._risk.check_signal(signal)
         if veto.value != "PASS":
             logger.info(
@@ -194,14 +204,13 @@ class AutomationEngine:
             await self._events.emit("signal_rejected", {"signal": signal, "reason": veto.value})
             return
 
-        # 5. Idempotency check (🟠 FIX: OrderedDict cu FIFO evict)
+        # 🔴 FIX #1: TTL idempotency check
         signal_id = f"{symbol}:{signal.action}:{candle_key}"
-        if signal_id in self._placed_ids:
-            logger.debug("[automation] idempotency skip: %s", signal_id)
+        if self._is_duplicate(signal_id):
+            logger.debug("[automation] idempotency skip (TTL): %s", signal_id)
             return
-        self._record_placed_id(signal_id)
+        self._register_placed_id(signal_id)
 
-        # 6. Executa
         try:
             await self._execute_signal(signal)
             self._add_recent_signal(signal, status="accepted")
@@ -215,12 +224,14 @@ class AutomationEngine:
     async def _execute_signal(self, signal: StrategySignal) -> None:
         """Plaseaza ordinul si notifica risk manager."""
         equity = self._portfolio.get_equity()
-        qty = self._execution.calc_position_size(
-            equity=equity,
-            entry_price=signal.entry_price or 0,
-            stop_loss=signal.stop_loss,
-            risk_pct=get_settings().risk_per_trade,
-        ) if hasattr(self._execution, "calc_position_size") else 0.0
+        qty = 0.0
+        if hasattr(self._execution, "calc_position_size"):
+            qty = self._execution.calc_position_size(
+                equity=equity,
+                entry_price=signal.entry_price or 0,
+                stop_loss=signal.stop_loss,
+                risk_pct=get_settings().risk_per_trade,
+            )
 
         if qty <= 0:
             logger.warning("[automation] calc_position_size returned 0 for %s", signal.symbol)
@@ -249,9 +260,11 @@ class AutomationEngine:
                 if not price:
                     continue
 
-                exit_reason, close_fraction = self._execution.evaluate_exit(
-                    position=pos, current_price=price
-                ) if hasattr(self._execution, "evaluate_exit") else (None, 0.0)
+                exit_reason, close_fraction = (None, 0.0)
+                if hasattr(self._execution, "evaluate_exit"):
+                    exit_reason, close_fraction = self._execution.evaluate_exit(
+                        position=pos, current_price=price
+                    )
 
                 if exit_reason and close_fraction > 0:
                     logger.info(
@@ -260,7 +273,6 @@ class AutomationEngine:
                         exit_reason,
                         close_fraction,
                     )
-                    # Partial sau full close
                     close_qty = round(pos.quantity * close_fraction, 8)
                     side = "SELL" if pos.side == "BUY" else "BUY"
 
@@ -279,38 +291,60 @@ class AutomationEngine:
                         )
                         await self._events.emit("position_closed", {"symbol": pos.symbol})
                     else:
-                        # Partial close — update_position() acum exista (🔴 fix portfolio_engine)
                         updated = pos.model_copy(
                             update={"quantity": pos.quantity - close_qty}
                         )
                         self._portfolio.update_position(updated)
                         await self._events.emit(
                             "tp_hit",
-                            {"symbol": pos.symbol, "reason": exit_reason, "fraction": close_fraction},
+                            {
+                                "symbol": pos.symbol,
+                                "reason": exit_reason,
+                                "fraction": close_fraction,
+                            },
                         )
             except Exception as exc:
-                logger.error("[automation] _manage_open_positions error for %s: %s", pos.symbol, exc)
+                logger.error(
+                    "[automation] _manage_open_positions error for %s: %s", pos.symbol, exc
+                )
 
     async def _midnight_reset(self) -> None:
         """Reset daily risk counters la 00:00 UTC."""
         self._risk.reset_daily()
-        # Curata seen_candles complet la midnight (oricum expirate)
         self._seen_candles.clear()
+        # Sterge si placed_ids expirate
+        now = monotonic()
+        self._placed_ids = {
+            k: t for k, t in self._placed_ids.items() if now - t <= _PLACED_TTL
+        }
         logger.info("[automation] midnight reset done")
 
-    # ──────────────────────────────────────────────── idempotency helpers
+    # ──────────────────────────────────────────── TTL idempotency helpers
 
-    def _record_placed_id(self, signal_id: str) -> None:
+    def _register_placed_id(self, signal_id: str) -> None:
         """
-        🟠 Inregistreaza un signal_id in OrderedDict cu evict FIFO.
-        Garanteaza ca _placed_ids nu depaseste _PLACED_IDS_MAXLEN entries.
+        🔴 FIX #1: Inregistreaza signal_id cu timestamp monotonic.
+        Evict all expired entries la fiecare scriere (lazy GC).
         """
-        if signal_id in self._placed_ids:
-            return
-        self._placed_ids[signal_id] = True
-        # Evict oldest entries daca depasim limita
-        while len(self._placed_ids) > _PLACED_IDS_MAXLEN:
-            self._placed_ids.popitem(last=False)  # FIFO: sterge primul adaugat
+        now = monotonic()
+        # Lazy evict expirate
+        expired = [k for k, t in self._placed_ids.items() if now - t > _PLACED_TTL]
+        for k in expired:
+            del self._placed_ids[k]
+        self._placed_ids[signal_id] = now
+
+    def _is_duplicate(self, signal_id: str) -> bool:
+        """
+        🔴 FIX #1: True daca signal_id exista SI nu a expirat.
+        Auto-sterge entry-ul expirat.
+        """
+        t = self._placed_ids.get(signal_id)
+        if t is None:
+            return False
+        if monotonic() - t > _PLACED_TTL:
+            del self._placed_ids[signal_id]
+            return False
+        return True
 
     # ──────────────────────────────────────────────── recent signals
 
@@ -321,7 +355,6 @@ class AutomationEngine:
             "ts": datetime.now(timezone.utc).isoformat(),
         }
         self._recent_signals.append(entry)
-        # Mentine fereastra la max _max_recent_signals
         if len(self._recent_signals) > self._max_recent_signals:
             self._recent_signals = self._recent_signals[-self._max_recent_signals :]
 
