@@ -81,7 +81,8 @@ uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 curl http://localhost:8000/api/v1/health
 ```
 
-> **Do not go live before running a backtest.** See [Backtesting](#backtesting) below.
+> ⚠️ **Do not go live before running a backtest.** See [Backtesting](#backtesting) below.  
+> ⚠️ **Run at least 24h on testnet with `DRY_RUN=true` before switching to mainnet.**
 
 ---
 
@@ -180,6 +181,8 @@ python -m backtesting.backtest_engine \
 | `GET` | `/api/v1/account` | Balances + equity |
 | `WS` | `/ws` | Live events → TradingView UI |
 
+> `/docs` and `/redoc` are only available when `IS_PRODUCTION=false` (default for local dev).
+
 ---
 
 ## Safety Features
@@ -189,19 +192,20 @@ python -m backtesting.backtest_engine \
 | **DRY_RUN** | All orders simulate — no real exchange calls |
 | **TESTNET** | Routes to Binance testnet URLs |
 | **Startup reconciliation** | Trading blocked until `portfolio.reconcile()` succeeds |
-| **Zero duplicate orders** | Idempotency keys + per-candle deduplication |
+| **Zero duplicate orders** | Idempotency keys (TTL 1h) + per-candle deduplication |
 | **Daily loss limit** | Auto-pause at −3% daily equity |
 | **Max drawdown** | Emergency stop at −12% from peak equity |
 | **SL cooldown** | 15 min lockout after stop-loss hit |
 | **Consecutive losses** | Auto-pause after N consecutive losing trades (configurable) |
 | **Emergency stop** | `POST /api/v1/emergency_stop` + Telegram alert |
 | **Drift detection** | Periodic reconciliation detects Binance ↔ local state divergence |
+| **IS_PRODUCTION guard** | Warns at startup if `/docs` exposed with live trading enabled |
 
 ---
 
 ## Strategy Overview
 
-The `CompositeStrategy` combines three sub-strategies with weighted voting:
+The `CompositeStrategy` combines three sub-strategies with weighted voting (weights auto-normalized to sum=1.0):
 
 | Strategy | Logic | Best Conditions |
 |---|---|---|
@@ -215,7 +219,9 @@ All strategies return a `StrategySignal` with `confidence`, `entry_price`, `stop
 
 ## Risk Management
 
-All risk checks run through `RiskManager.check_signal()` before any order is placed:
+All risk checks run through `RiskManager.check_signal()` before any order is placed.
+
+`open_position_count` is derived authoritatively from `len(_open_symbols)` — the set is idempotent and cannot desync from the actual state.
 
 ```
 1. Is system paused?          → VETO_PAUSED
@@ -231,6 +237,8 @@ All risk checks run through `RiskManager.check_signal()` before any order is pla
 ```
 
 Position sizing uses fixed-fractional Kelly: `size = (equity × RISK_PER_TRADE) / SL_distance`. On Futures, the result is divided by leverage.
+
+`equity` in `RiskManager` is synced explicitly after every fill (entry, partial TP, full close) — drawdown is always calculated against real, up-to-date equity.
 
 ---
 
@@ -274,7 +282,12 @@ BINANCE_API_SECRET=your_secret
 # Safety defaults (change with care)
 DRY_RUN=true           # true = simulate all orders (no real fills)
 TESTNET=true           # true = Binance testnet endpoints
-                       # NOTE: use --no-testnet for backtesting (no historical data on testnet)
+                       # NOTE: use mainnet for backtesting (no historical data on testnet)
+IS_PRODUCTION=false    # ⚠️ Set to true before any live deploy (hides /docs, /redoc)
+
+# Timeouts
+ORDER_TIMEOUT_SECONDS=15      # Per-order asyncio timeout (increase to 30 on slow testnet)
+RECONCILE_TIMEOUT_SECONDS=60  # Startup reconciliation timeout (testnet: 60+, mainnet: 30)
 
 # Risk parameters
 RISK_PER_TRADE=0.01    # 1% risk per trade
@@ -300,9 +313,99 @@ TELEGRAM_CHAT_ID=
 
 ## Known Fixes (Changelog)
 
+### v5.0.0 — 2026-05-20
+
+**Risk engine & automation hardening — [commit a9e0e59](https://github.com/Gzeu/nexus-trader/commit/a9e0e59e628b590c9dee60d84d9c5e7b2863d072)**
+
+#### `backend/core/automation_engine.py`
+
+- **FIX — `risk.update_equity()` called after every fill**  
+  `RiskManager._equity` was never updated during a trading session — drawdown was always calculated against `0`, which caused either a `ZeroDivisionError` or an immediate `VETO_DRAWDOWN` on the first signal. `update_equity()` is now called explicitly after entry order fill, partial TP close, and full close.
+
+- **FIX — Dead code assignment removed**  
+  `order_timeout = cfg = get_settings()` incorrectly assigned the entire `AppSettings` object to `order_timeout` before overwriting it on the next line. Split into `cfg = get_settings()` / `order_timeout = cfg.order_timeout_seconds`.
+
+#### `backend/core/risk_manager.py`
+
+- **FIX — `open_position_count` is now an authoritative property**  
+  `_open_position_count: int` was incremented/decremented manually in `on_position_opened()` and `on_trade_closed()`. A double-call on the same symbol caused the counter to exceed the actual set size. Replaced with `@property open_position_count → len(self._open_symbols)`. `set.add()` and `set.discard()` are idempotent — counter cannot desync.
+
+---
+
+### v4.0.0 — 2026-05-20
+
+**Post-launch fixes round 2 — [commit 7bfb54e](https://github.com/Gzeu/nexus-trader/commit/7bfb54e7b4456cd594e990e37bfa498b11c708b6)**
+
+#### `backend/core/automation_engine.py`
+
+- **FIX — `pos.side` normalization for Futures SHORT**  
+  Binance Futures returns `"SHORT"` (not `"SELL"`) in position responses. The previous `pos.side.upper() == "SELL"` check silently skipped sign inversion on Futures shorts, leaving `consecutive_losses` always at 0 and the risk manager blind to losses. Fixed to `pos.side.upper() in ("SELL", "SHORT")`.
+
+- **FIX — `_midnight_reset()` trim cap added**  
+  `keep = max(2, interval_minutes * 2)` produced `keep=120` at `interval_minutes=60`. Added `_SEEN_CANDLES_KEEP_MAX = 20` module constant and capped with `min(..., _SEEN_CANDLES_KEEP_MAX)`.
+
+- **FIX — `getattr(cfg, ...)` replaced with direct attribute access**  
+  `getattr(cfg, "order_timeout_seconds", 15)` masked any `AttributeError` if the field was ever renamed or removed from `Settings`. Replaced with `cfg.order_timeout_seconds` (field guaranteed by Pydantic with `default=15`).
+
+- **FIX — `deque(maxlen)` consistent across all `_seen_candles` init points**  
+  Some code paths initialized `deque()` without `maxlen`, others used `deque(maxlen=200)`. All instances now use `deque(maxlen=_SEEN_CANDLES_MAXLEN)` (module constant = 200).
+
+#### `backend/core/portfolio_engine.py`
+
+- **FIX — `remove_position()` idempotent with explicit WARNING**  
+  Previously returned `None` silently on double-close or reconciliation drift. Now logs a `WARNING` with symbol name for audit trail. Non-raising, backward-compatible.
+
+---
+
+### v3.3.0 — 2026-05-20
+
+**Post-launch fixes round 1 — [commit 69ba9a5](https://github.com/Gzeu/nexus-trader/commit/69ba9a5900b4a67bdb8874669d57b9633aabcea4)**
+
+#### `backend/binance/binance_client.py`
+
+- **FIX — `get_open_orders(futures=bool)` routing**  
+  Always routed to Spot `/api/v3/openOrders`. Added `futures: bool = False` parameter — when `True`, routes to Futures `/fapi/v1/openOrders`. `portfolio_engine.reconcile()` now passes `futures=is_futures` correctly.
+
+- **FIX — `hmac.new()` keyword arguments**  
+  Positional `hmac.new(key, msg, digestmod)` raised a `DeprecationWarning` in Python 3.13+. Replaced with explicit `hmac.new(key=..., msg=..., digestmod=hashlib.sha256)`.
+
+- **FIX — `cancel_all_orders(futures=bool)` routing**  
+  Added `futures: bool = False` parameter. When `True`, issues `DELETE /fapi/v1/allOpenOrders`; when `False`, issues `DELETE /api/v3/openOrders`.
+
+#### `backend/core/automation_engine.py`
+
+- **FIX — `price_cache` accessed via public property**  
+  `self._portfolio._price_cache` (private attribute access) replaced with `self._portfolio.price_cache` (public `@property` added in `portfolio_engine.py`).
+
+- **FIX — `realized_pnl` sign correct for SHORT positions**  
+  PnL sign inversion was missing for SHORT closes. Added `if pos.side.upper() == "SELL": realized_pnl *= -1` (later strengthened to include `"SHORT"` in v4.0.0).
+
+- **FIX — `place_order()` wrapped with `asyncio.wait_for()`**  
+  Long-running Binance calls could block the automation tick indefinitely. Both entry and exit calls are now gated by `cfg.order_timeout_seconds` (default 15s). On `TimeoutError` → log `ERROR` + `continue`.
+
+#### `backend/core/portfolio_engine.py`
+
+- **ADD — `price_cache` public property**  
+  `@property price_cache` exposes `_price_cache` safely, eliminating fragile cross-module private access.
+
+#### `backend/core/risk_manager.py`
+
+- **FIX — `reset_daily()` equity guard**  
+  `self._daily_start_equity = self._equity` without checking `_equity > 0` would reset the daily baseline to `0` if called before the first reconciliation. Now logs `WARNING` and skips the update if `_equity == 0`.
+
+#### `.env.example`
+
+- **ADD — `IS_PRODUCTION` with visible warning**  
+  Documents that `IS_PRODUCTION=false` exposes `/docs` and `/redoc`. Default kept as `false` for local dev.
+
+- **ADD — `ORDER_TIMEOUT_SECONDS` + `RECONCILE_TIMEOUT_SECONDS`**  
+  Documented with recommended values for testnet (higher) vs mainnet (lower).
+
+---
+
 ### v3.2.0 — 2026-05-19
 
-**TradingView chart fixes applied in [commit 7d6b825](https://github.com/Gzeu/nexus-trader/commit/7d6b825ea02de536ea9a7f248b061db6d61568ab):**
+**TradingView chart fixes — [commit 7d6b825](https://github.com/Gzeu/nexus-trader/commit/7d6b825ea02de536ea9a7f248b061db6d61568ab)**
 
 #### `TradingChart.tsx`
 
@@ -310,40 +413,30 @@ TELEGRAM_CHAT_ID=
   The MACD `useEffect` previously checked `candleDataRef.current.length >= 35` at activation time, which silently no-oped if called before `loadData` completed. A stable `populateMACDPaneRef` callback ref now decouples mounting order from data availability: `loadData` calls `populateMACDPaneRef.current?.()` after writing to the candle ref, and the MACD effect calls the same function immediately on mount. Whichever runs second wins — the pane always populates exactly once with complete data.
 
 - **FIX — `barSpacing` TypeScript-safe cast**  
-  `(ts.options() as { barSpacing: number }).barSpacing` failed under `strict` mode because LWC v4 types `ts.options()` as `DeepPartial<TimeScaleOptions>`. Replaced with a `Record<string, unknown>` cast and `Number()` coercion with `|| 8` fallback — safe across all LWC versions and resilient to `undefined` if the property is ever removed from the public API.
+  `(ts.options() as { barSpacing: number }).barSpacing` failed under `strict` mode because LWC v4 types `ts.options()` as `DeepPartial<TimeScaleOptions>`. Replaced with a `Record<string, unknown>` cast and `Number()` coercion with `|| 8` fallback.
 
 - **FIX — `fetch24hChange` NaN guard**  
-  `await res.json() as { priceChangePercent: string }` asserted a type without validating the shape. On an invalid symbol or Binance API error, `d.priceChangePercent` was `undefined`, making `parseFloat(undefined)` → `NaN`, which then propagated to `.toFixed(2)` and crashed the badge renderer. The response is now typed as `Record<string, unknown>`, parsed with `parseFloat(String(d?.priceChangePercent ?? ''))`, and gated by `isFinite()` — returning `null` (no badge) instead of `NaN` on any unexpected payload.
+  `await res.json() as { priceChangePercent: string }` asserted a type without validating the shape. On an invalid symbol or Binance API error, `d.priceChangePercent` was `undefined` → `parseFloat(undefined)` → `NaN` → crash in `.toFixed(2)`. Now typed as `Record<string, unknown>`, gated by `isFinite()`, returns `null` instead of `NaN`.
 
 ---
 
 ### v1.1.0 — 2026-05-19
 
-**Critical bug fixes applied in [commit f83f983](https://github.com/Gzeu/nexus-trader/commit/f83f983cb4828fd35529275ac182f03869727f68):**
+**Critical bug fixes — [commit f83f983](https://github.com/Gzeu/nexus-trader/commit/f83f983cb4828fd35529275ac182f03869727f68)**
 
 #### `backtesting/backtest_engine.py`
-- **FIX — Lookahead bias in EMA crossover detection**  
-  Previously used `df[ema_f]` (current unconfirmed bar) paired with `shift(1)`. Now correctly uses `shift(1)` vs `shift(2)` — crossover is only detected on fully closed, confirmed candles.
-- **FIX — Execution price**  
-  Trades now execute on `open[i+1]` (next bar open), not `close[i]`. This reflects realistic market fill behavior.
-- **FIX — Testnet flag default**  
-  `load_from_binance(testnet=False)` by default. Binance testnet has no real historical OHLCV data — always use mainnet for backtesting.
-- **ADD — MACD histogram filter**  
-  Long entries require `MACDh > 0`, short entries require `MACDh < 0`. Eliminates ~18% of false entries in low-momentum conditions.
-- **ADD — ATR% volatility guard**  
-  Entries skipped when `ATR / close > 3%` — avoids high-slippage, gap-prone conditions.
-- **ADD — Walk-forward parameter optimizer**  
-  Grid search over 729 parameter combinations. Trains on 70% of data, validates on 30%. Best params saved as JSON for use in live config.
-- **ADD — Interactive HTML tearsheet**  
-  Plotly chart with price candles, entry markers, equity curve, and drawdown panel.
+- **FIX — Lookahead bias in EMA crossover detection** — uses `shift(1)` vs `shift(2)` (confirmed bars only)
+- **FIX — Execution price** — fills on `open[i+1]` (next bar open), not `close[i]`
+- **FIX — Testnet flag default** — `load_from_binance(testnet=False)` — testnet has no historical OHLCV data
+- **ADD — MACD histogram filter** — eliminates ~18% false entries in low-momentum conditions
+- **ADD — ATR% volatility guard** — skips entries when `ATR / close > 3%`
+- **ADD — Walk-forward parameter optimizer** — 729-combination grid search, 70/30 train/validate split
+- **ADD — Interactive HTML tearsheet** — Plotly equity curve, drawdown panel, entry markers
 
 #### `backend/core/automation_engine.py`
-- **FIX — `calc_position_size` missing arguments**  
-  Call now correctly passes `market_mode` and `leverage`. Without this, Futures positions were sized 10× smaller than intended.
-- **FIX — Live candle price**  
-  `price` used for sizing and entry now comes from `ohlcv.last_close` (confirmed close), not the current in-progress candle's live price.
-- **FIX — Position management uses confirmed close**  
-  `_position_loop` now reads `klines[-2][4]` (second-to-last, fully closed candle) instead of the live candle.
+- **FIX — `calc_position_size` missing arguments** — now passes `market_mode` and `leverage` correctly
+- **FIX — Live candle price** — uses `ohlcv.last_close` (confirmed close), not in-progress candle
+- **FIX — Position management uses confirmed close** — `klines[-2][4]` (second-to-last closed candle)
 
 ---
 
