@@ -110,7 +110,7 @@ export function PositionsTable({ positions, loading, onClose }: Props) {
             <path d="M12 6v6l4 2"/>
           </svg>
           <div style={{ fontSize: 'var(--text-sm)', color: 'var(--text-muted)', marginBottom: 4 }}>No open positions</div>
-          <div style={{ fontSize: 'var(--text-xs)' }}>Signals will appear here when the engine opens trades</div>
+          <div style={{ fontSize: 'var(--text-xs)' }}>Positions will appear here when the engine opens trades</div>
         </div>
       ) : (
         <div style={{ overflowX: 'auto' }}>
@@ -155,7 +155,7 @@ export function PositionsTable({ positions, loading, onClose }: Props) {
                     <span style={{ color: p.tp2_hit ? 'var(--green)' : undefined }}>{p.take_profit_2.toFixed(2)}</span>
                   </td>
                   <td><ProgressBar position={p} /></td>
-                  <td><PnlCell value={p.unrealized_pnl} /></td>
+                  <td><PnlCell value={p.unrealized_pnl ?? 0} /></td>
                   <td><PnlCell value={p.total_pnl} /></td>
                   <td style={{ color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-xs)' }}>
                     {new Date(p.opened_at).toLocaleTimeString()}
