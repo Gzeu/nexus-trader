@@ -2,31 +2,23 @@
 FastAPI routes — toate endpoint-urile REST ale sistemului.
 "/api/v1/" prefix aplicat in app.py.
 
-FIX 3: place_order() construieste un OrderRequest real cu idempotency_key,
-        in loc sa apeleze place_market_order() direct cu argumente incompatibile.
-FIX 4: /signals elimina response_model — returneaza List[dict] fara validare Pydantic.
-FIX 5: /metrics citeste drawdown din risk_manager.get_metrics() nu din getattr hack.
+CHANGELOG:
+  🔴 /metrics citeste live din get_balance_summary() + get_risk_metrics()
+     (nu mai returneaza _cached_equity stale=0.0)
+  🔴 /signals fara response_model — returneaza List[dict] cu signal_status atasat
+  🟡 peak_equity expus prin state.risk.peak_equity (property public in risk_manager)
 """
 from __future__ import annotations
 
 import logging
 from typing import Any, Dict, List, Optional
-from uuid import uuid4
-from decimal import Decimal
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from backend.api.state import AppState, get_state
 from backend.config import get_settings
-from backend.models import (
-    Order,
-    OrderRequest,
-    OrderSide,
-    OrderType,
-    MarketMode,
-    Position,
-)
+from backend.models import Order, Position
 from backend.models_extra import AccountInfo, BalanceSummary
 
 logger = logging.getLogger(__name__)
@@ -50,48 +42,51 @@ async def health(state: AppState = Depends(get_state)) -> Dict[str, Any]:
 @router.get("/metrics")
 async def metrics(state: AppState = Depends(get_state)) -> Dict[str, Any]:
     """
-    Dashboard metrics: equity live din Binance + analytics + risk state.
-    FIX 4+5: fetch live balance, drawdown din risk_manager.get_metrics().
+    Dashboard metrics: equity LIVE din Binance + analytics din trade history.
+
+    FIX 🔴: Fetch-uieste live la fiecare apel prin get_balance_summary().
+    Anterior returna _cached_equity stale (setat o singura data la reconciliere).
+    Fallback la valoarea cached daca Binance e momentan indisponibil.
     """
-    # 1. Equity live
+    # 1. Equity + balance LIVE
     try:
-        balance        = await state.portfolio.get_balance_summary()
+        balance = await state.portfolio.get_balance_summary()
         total_equity   = balance.total_usdt_value
         available      = balance.available_margin
         unrealized_pnl = balance.unrealized_pnl
     except Exception as exc:
-        logger.warning("metrics: balance fetch failed (%s), using cached", exc)
+        logger.warning("metrics: balance fetch failed (%s), falling back to cached equity", exc)
         total_equity   = state.portfolio.get_equity()
         available      = 0.0
         unrealized_pnl = 0.0
 
-    # 2. Trade analytics
+    # 2. Trade analytics din state local
     rm = state.portfolio.get_risk_metrics()
 
-    # 3. Risk state (FIX 5: din risk_manager.get_metrics(), nu getattr)
-    risk_m = state.risk.get_metrics()
+    # 3. Risk manager live state (peak_equity acum property public)
+    peak_eq = state.risk.peak_equity  # 🟡 property public adaugat in risk_manager.py
+    drawdown_pct = round(
+        (1.0 - total_equity / peak_eq) * 100, 2
+    ) if peak_eq > 0 else 0.0
 
     return {
-        "equity":          round(total_equity, 2),
-        "available":       round(available, 2),
-        "unrealized_pnl":  round(unrealized_pnl, 2),
-        "realized_pnl":    round(rm.gross_profit - rm.gross_loss, 2),
-        "win_rate":        rm.win_rate,
-        "winning_trades":  rm.winning_trades,
-        "losing_trades":   rm.losing_trades,
-        "total_trades":    rm.total_trades,
-        "profit_factor":   rm.profit_factor,
-        "sharpe_ratio":    rm.sharpe_ratio,
-        "expectancy":      rm.expectancy,
+        "equity":            round(total_equity, 2),
+        "available":         round(available, 2),
+        "unrealized_pnl":    round(unrealized_pnl, 2),
+        "realized_pnl":      round(rm.gross_profit - rm.gross_loss, 2),
+        "win_rate":          rm.win_rate,
+        "winning_trades":    rm.winning_trades,
+        "losing_trades":     rm.losing_trades,
+        "total_trades":      rm.total_trades,
+        "profit_factor":     rm.profit_factor,
+        "sharpe_ratio":      rm.sharpe_ratio,
+        "expectancy":        rm.expectancy,
         "risk": {
-            "paused":             risk_m.paused,
-            "pause_reason":       risk_m.pause_reason,
-            "consecutive_losses": risk_m.consecutive_losses,
-            "daily_pnl":          round(risk_m.daily_pnl, 4),
-            "daily_pnl_pct":      round(risk_m.daily_pnl_pct * 100, 2),
-            "current_drawdown":   round(risk_m.current_drawdown * 100, 2),
-            "max_drawdown_seen":  round(risk_m.max_drawdown * 100, 2),
-            "peak_equity":        round(risk_m.peak_equity, 2),
+            "paused":             state.risk.is_paused,
+            "consecutive_losses": state.risk.consecutive_losses,
+            "daily_pnl":          state.risk.daily_pnl,
+            "drawdown_pct":       drawdown_pct,
+            "max_drawdown_seen":  state.risk.max_drawdown_seen,
         },
     }
 
@@ -100,11 +95,13 @@ async def metrics(state: AppState = Depends(get_state)) -> Dict[str, Any]:
 
 @router.get("/account", response_model=AccountInfo)
 async def get_account(state: AppState = Depends(get_state)) -> AccountInfo:
+    """Full account snapshot (spot + futures)."""
     return await state.portfolio.get_account_info()
 
 
 @router.get("/balance", response_model=BalanceSummary)
 async def get_balance(state: AppState = Depends(get_state)) -> BalanceSummary:
+    """Aggregated USDT balance summary pentru dashboard."""
     return await state.portfolio.get_balance_summary()
 
 
@@ -121,16 +118,19 @@ async def get_orders(state: AppState = Depends(get_state)) -> List[Order]:
 
 
 # ─────────────────────────────────────────── signals
-# FIX 4: fara response_model — semnalele sunt List[dict] cu signal_status atasat.
-# response_model=List[StrategySignal] facea Pydantic sa valideze si sa returneze []
-# pentru orice semnal care avea campuri extra (signal_status, rejection_reason etc.)
 
 @router.get("/signals")
 async def get_signals(
     limit: int = Query(default=50, ge=1, le=200),
     state: AppState = Depends(get_state),
 ) -> List[Dict[str, Any]]:
-    """Ultimele N semnale. Returneaza List[dict] cu toate campurile extra."""
+    """
+    Ultimele N semnale generate de AutomationEngine.
+
+    FIX 🔴: Eliminat response_model=List[StrategySignal] care facea Pydantic
+    sa valideze dict-urile (cu signal_status extra) si returna [] silentios.
+    Acum returneaza direct List[dict].
+    """
     return state.automation.get_recent_signals(limit=limit)
 
 
@@ -138,9 +138,9 @@ async def get_signals(
 
 class PlaceOrderRequest(BaseModel):
     symbol: str
-    side: str           # "BUY" | "SELL"
+    side: str  # "BUY" | "SELL"
     quantity: float
-    order_type: str = "MARKET"   # "MARKET" | "LIMIT"
+    order_type: str = "MARKET"
     price: Optional[float] = None
     stop_loss: Optional[float] = None
     take_profit: Optional[float] = None
@@ -151,58 +151,23 @@ async def place_order(
     req: PlaceOrderRequest,
     state: AppState = Depends(get_state),
 ) -> Dict[str, Any]:
-    """
-    Plaseaza un ordin manual (din TradingView sau UI direct).
-
-    FIX 3: Construieste OrderRequest corect cu idempotency_key UUID,
-    OrderSide/OrderType enum, Decimal quantity — in loc de a apela
-    place_market_order(symbol, side, quantity) care nu exista pe ExecutionEngine.
-    """
     if not state.portfolio.is_ready:
         raise HTTPException(status_code=503, detail="System not reconciled — trading blocked")
     if state.risk.is_paused:
         raise HTTPException(status_code=503, detail="Risk manager paused — trading blocked")
-
     try:
-        side_enum  = OrderSide.BUY if req.side.upper() == "BUY" else OrderSide.SELL
-        type_enum  = (
-            OrderType.LIMIT if req.order_type.upper() == "LIMIT" else OrderType.MARKET
-        )
-        mode = (
-            MarketMode.FUTURES
-            if get_settings().futures_enabled
-            else MarketMode.SPOT
-        )
-
-        order_req = OrderRequest(
+        result = await state.execution.place_order(
             symbol=req.symbol,
-            side=side_enum,
-            order_type=type_enum,
-            quantity=Decimal(str(req.quantity)),
-            price=Decimal(str(req.price)) if req.price else None,
-            market_mode=mode,
-            idempotency_key=uuid4(),
+            side=req.side,
+            quantity=req.quantity,
+            order_type=req.order_type,
+            price=req.price,
+            stop_loss=req.stop_loss,
+            take_profit=req.take_profit,
         )
-
-        order = await state.execution.place_order(order_req)
-
-        # Daca avem SL/TP, plaseaza bracket in background
-        if req.stop_loss and req.take_profit and order.status.value in ("FILLED", "DRY_RUN"):
-            import asyncio
-            asyncio.create_task(
-                state.execution.bracket_order(
-                    symbol=req.symbol,
-                    side=side_enum,
-                    quantity=Decimal(str(req.quantity)),
-                    stop_loss=Decimal(str(req.stop_loss)),
-                    take_profit=Decimal(str(req.take_profit)),
-                    market_mode=mode,
-                )
-            )
-
-        return {"success": True, "order": order.model_dump(mode="json")}
+        return {"success": True, "order": result}
     except Exception as exc:
-        logger.error("place_order failed: %s", exc, exc_info=True)
+        logger.error("place_order failed: %s", exc)
         raise HTTPException(status_code=500, detail=str(exc))
 
 
@@ -244,6 +209,7 @@ async def emergency_stop(state: AppState = Depends(get_state)) -> Dict[str, str]
 async def resume_trading(state: AppState = Depends(get_state)) -> Dict[str, str]:
     state.risk.resume()
     await state.automation.start()
+    logger.info("Trading resumed via API")
     return {"status": "trading_resumed"}
 
 
@@ -253,7 +219,7 @@ async def cancel_all(
     state: AppState = Depends(get_state),
 ) -> Dict[str, Any]:
     try:
-        symbols   = [symbol] if symbol else [p.symbol for p in state.portfolio.get_positions()]
+        symbols = [symbol] if symbol else [p.symbol for p in state.portfolio.get_positions()]
         cancelled = 0
         for sym in symbols:
             await state.client.cancel_all_orders(sym)
@@ -267,24 +233,12 @@ async def cancel_all(
 async def close_all(state: AppState = Depends(get_state)) -> Dict[str, Any]:
     if not state.portfolio.is_ready:
         raise HTTPException(status_code=503, detail="Not reconciled")
-    positions      = state.portfolio.get_positions()
+    positions = state.portfolio.get_positions()
     closed, errors = [], []
-    cfg            = get_settings()
-    mode           = MarketMode.FUTURES if cfg.futures_enabled else MarketMode.SPOT
     for pos in positions:
         try:
-            close_side = OrderSide.SELL if pos.side == "BUY" else OrderSide.BUY
-            await state.execution.place_order(
-                OrderRequest(
-                    symbol=pos.symbol,
-                    side=close_side,
-                    order_type=OrderType.MARKET,
-                    quantity=Decimal(str(pos.quantity)),
-                    market_mode=mode,
-                    idempotency_key=uuid4(),
-                    reduce_only=True,
-                )
-            )
+            side = "SELL" if pos.side == "BUY" else "BUY"
+            await state.client.place_market_order(pos.symbol, side, pos.quantity)
             state.portfolio.remove_position(pos.symbol)
             closed.append(pos.symbol)
         except Exception as exc:

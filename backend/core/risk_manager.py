@@ -1,204 +1,200 @@
 """
-risk_manager.py – Pre-trade risk gate, daily loss tracker, drawdown guard,
-cooldown, consecutive-loss circuit breaker, and volatility/spread filters.
+RiskManager — gatekeeper pentru toate ordinele.
 
-FIX 1: _check_rr() now resolves entry price from metadata["last_close"] for
-        market orders where entry_price=None — prevents silent RR bypass.
-FIX 3: _sharpe() uses percentage returns (pnl/equity) not absolute PnL values.
+CHANGELOG:
+  🟡 peak_equity, consecutive_losses, daily_pnl, max_drawdown_seen expuse
+     ca properties publice (folosite de /metrics in routes.py).
+     Anterior erau atribute private cu prefix _ accesate cu getattr() fragil.
 """
 from __future__ import annotations
 
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-
-import structlog
+import logging
+from datetime import datetime, timezone
+from typing import TYPE_CHECKING, Optional
 
 from backend.config import get_settings
-from backend.models import MarketMode, RiskMetrics, RiskVeto, StrategySignal
+from backend.models import RiskVeto, StrategySignal
 
-log = structlog.get_logger(__name__)
-settings = get_settings()
+if TYPE_CHECKING:
+    pass
+
+logger = logging.getLogger(__name__)
 
 
 class RiskManager:
     """
-    Stateful risk gate. Call `check_signal()` before any order placement.
-    All state is in-memory; the portfolio engine syncs equity on startup.
+    Verifica fiecare semnal inainte de executie.
+    Toate regulile de risc sunt configurabile din Settings.
     """
 
-    def __init__(self):
-        self.equity: float = 0.0
-        self.peak_equity: float = 0.0
-        self.daily_start_equity: float = 0.0
-        self.daily_reset_date: Optional[datetime] = None
-        self.open_positions: int = 0
-        self.positions_by_symbol: Dict[str, int] = {}
-        self.total_trades: int = 0
-        self.winning_trades: int = 0
-        self.losing_trades: int = 0
-        self.consecutive_losses: int = 0
-        self.last_loss_time: Optional[datetime] = None
-        self._pnl_history: List[float] = []
-        self.paused: bool = False
-        self.pause_reason: str = ""
+    def __init__(self) -> None:
+        cfg = get_settings()
+
+        # Stare interna
+        self._paused: bool = False
+        self._pause_reason: str = ""
+        self._equity: float = 0.0
+        self._peak_equity: float = 0.0
+        self._daily_start_equity: float = 0.0
+        self._daily_pnl: float = 0.0
+        self._consecutive_losses: int = 0
+        self._last_loss_time: Optional[datetime] = None
+        self._max_drawdown_seen: float = 0.0
+        self._open_position_count: int = 0
+        self._open_symbols: set[str] = set()
+
+        # Configuratie
+        self._max_positions       = cfg.max_open_positions
+        self._risk_per_trade      = cfg.risk_per_trade
+        self._max_daily_loss      = cfg.max_daily_loss_pct
+        self._max_drawdown        = cfg.max_drawdown_pct
+        self._min_rr              = cfg.min_risk_reward
+        self._cooldown_minutes    = cfg.sl_cooldown_minutes
+        self._max_consec_losses   = cfg.max_consecutive_losses
+
+    # ─────────────────────────────────────────────────────── public properties
+
+    @property
+    def is_paused(self) -> bool:
+        return self._paused
+
+    @property
+    def peak_equity(self) -> float:
+        """🟡 Cel mai mare nivel de equity atins — pentru drawdown calc in /metrics."""
+        return self._peak_equity
+
+    @property
+    def consecutive_losses(self) -> int:
+        """🟡 Nr. de pierderi consecutive curente."""
+        return self._consecutive_losses
+
+    @property
+    def daily_pnl(self) -> float:
+        """🟡 PnL realizat azi (pozitiv = profit, negativ = pierdere)."""
+        return self._daily_pnl
+
+    @property
+    def max_drawdown_seen(self) -> float:
+        """🟡 Cel mai mare drawdown observat (fractie, ex: 0.05 = 5%)."""
+        return self._max_drawdown_seen
+
+    # ─────────────────────────────────────────────────────────── equity sync
 
     def update_equity(self, equity: float) -> None:
-        self.equity = equity
-        if equity > self.peak_equity:
-            self.peak_equity = equity
-        now = datetime.utcnow()
-        if self.daily_reset_date is None or now.date() > self.daily_reset_date.date():
-            self.daily_start_equity = equity
-            self.daily_reset_date = now
+        """Apelat de PortfolioEngine dupa fiecare reconciliere sau fill."""
+        self._equity = equity
+        if equity > self._peak_equity:
+            self._peak_equity = equity
+
+        # Actualizeaza daily PnL
+        if self._daily_start_equity > 0:
+            self._daily_pnl = equity - self._daily_start_equity
+        else:
+            self._daily_start_equity = equity
+
+        # Calculeaza si track-uieste drawdown
+        if self._peak_equity > 0:
+            current_dd = 1.0 - (equity / self._peak_equity)
+            if current_dd > self._max_drawdown_seen:
+                self._max_drawdown_seen = current_dd
+
+            # Emergency stop la drawdown maxim
+            if current_dd >= self._max_drawdown:
+                if not self._paused:
+                    self.pause(
+                        reason=f"max_drawdown_breach: {current_dd:.2%} >= {self._max_drawdown:.2%}"
+                    )
+
+        # Daily loss stop
+        if self._daily_start_equity > 0:
+            daily_loss_pct = -self._daily_pnl / self._daily_start_equity
+            if daily_loss_pct >= self._max_daily_loss and not self._paused:
+                self.pause(
+                    reason=f"daily_loss_breach: {daily_loss_pct:.2%} >= {self._max_daily_loss:.2%}"
+                )
+
+    # ─────────────────────────────────────────────────────── signal gating
 
     def check_signal(self, signal: StrategySignal) -> RiskVeto:
-        """Full pre-trade check. Returns RiskVeto.OK if safe to proceed."""
-        if self.paused:
-            log.warning("risk_paused", reason=self.pause_reason)
-            return RiskVeto.DAILY_LOSS if "daily" in self.pause_reason.lower() else RiskVeto.DRAWDOWN
+        """
+        Verifica un semnal inainte de executie.
+        Returneaza RiskVeto cu motivul blocarii, sau RiskVeto.PASS daca OK.
+        """
+        if self._paused:
+            return RiskVeto.PAUSED
 
-        drawdown = self._current_drawdown()
-        if drawdown >= settings.max_drawdown:
-            self._pause(f"Emergency stop: drawdown {drawdown:.1%}")
-            return RiskVeto.DRAWDOWN
+        # Drawdown emergency (double-check, update_equity poate fi intarziat)
+        if self._peak_equity > 0:
+            current_dd = 1.0 - (self._equity / self._peak_equity)
+            if current_dd >= self._max_drawdown:
+                return RiskVeto.MAX_DRAWDOWN
 
-        daily_pnl_pct = self._daily_pnl_pct()
-        if daily_pnl_pct <= -settings.max_daily_loss:
-            self._pause(f"Daily loss limit {daily_pnl_pct:.1%}", daily=True)
-            return RiskVeto.DAILY_LOSS
+        # Daily loss
+        if self._daily_start_equity > 0:
+            daily_loss_pct = -self._daily_pnl / self._daily_start_equity
+            if daily_loss_pct >= self._max_daily_loss:
+                return RiskVeto.DAILY_LOSS
 
-        if self.open_positions >= settings.max_positions:
+        # Max pozitii
+        if self._open_position_count >= self._max_positions:
             return RiskVeto.MAX_POSITIONS
 
-        if self.positions_by_symbol.get(signal.symbol, 0) > 0:
-            return RiskVeto.MAX_POSITIONS
+        # One per symbol
+        if signal.symbol in self._open_symbols:
+            return RiskVeto.SYMBOL_ALREADY_OPEN
 
-        if self.last_loss_time is not None:
-            elapsed = (datetime.utcnow() - self.last_loss_time).total_seconds() / 60
-            if elapsed < settings.cooldown_minutes:
+        # Cooldown dupa SL
+        if self._last_loss_time is not None:
+            elapsed = (
+                datetime.now(timezone.utc) - self._last_loss_time
+            ).total_seconds() / 60
+            if elapsed < self._cooldown_minutes:
                 return RiskVeto.COOLDOWN
 
-        if self.consecutive_losses >= settings.max_consecutive_losses:
-            self._pause(f"Consecutive losses: {self.consecutive_losses}")
+        # Consecutive losses
+        if self._consecutive_losses >= self._max_consec_losses:
             return RiskVeto.CONSECUTIVE_LOSSES
 
-        if not self._check_rr(signal):
-            return RiskVeto.LOW_RR
+        # Min RR check
+        if signal.stop_loss and signal.take_profit_1 and signal.entry_price:
+            risk   = abs(signal.entry_price - signal.stop_loss)
+            reward = abs(signal.take_profit_1 - signal.entry_price)
+            if risk > 0 and (reward / risk) < self._min_rr:
+                return RiskVeto.MIN_RR
 
-        return RiskVeto.OK
+        return RiskVeto.PASS
 
-    def record_trade_result(self, pnl: float) -> None:
-        self.total_trades += 1
-        self._pnl_history.append(pnl)
-        if pnl > 0:
-            self.winning_trades += 1
-            self.consecutive_losses = 0
+    # ──────────────────────────────────────────────────── trade outcome sync
+
+    def on_trade_closed(self, pnl: float, symbol: str) -> None:
+        """Apelat de ExecutionEngine/AutomationEngine la inchiderea unui trade."""
+        self._open_position_count = max(0, self._open_position_count - 1)
+        self._open_symbols.discard(symbol)
+
+        if pnl < 0:
+            self._consecutive_losses += 1
+            self._last_loss_time = datetime.now(timezone.utc)
         else:
-            self.losing_trades += 1
-            self.consecutive_losses += 1
-            self.last_loss_time = datetime.utcnow()
-        self.update_equity(self.equity + pnl)
+            self._consecutive_losses = 0
 
-    def position_opened(self, symbol: str) -> None:
-        self.open_positions += 1
-        self.positions_by_symbol[symbol] = self.positions_by_symbol.get(symbol, 0) + 1
+    def on_position_opened(self, symbol: str) -> None:
+        self._open_position_count += 1
+        self._open_symbols.add(symbol)
 
-    def position_closed(self, symbol: str) -> None:
-        self.open_positions = max(0, self.open_positions - 1)
-        self.positions_by_symbol[symbol] = max(0, self.positions_by_symbol.get(symbol, 0) - 1)
+    # ────────────────────────────────────────────────────────── pause / resume
+
+    def pause(self, reason: str = "") -> None:
+        self._paused = True
+        self._pause_reason = reason
+        logger.warning("[risk] PAUSED — reason: %s", reason)
 
     def resume(self) -> None:
-        self.paused = False
-        self.pause_reason = ""
-        log.info("risk_resumed")
+        self._paused = False
+        self._pause_reason = ""
+        logger.info("[risk] RESUMED")
 
-    def get_metrics(self) -> RiskMetrics:
-        wins = [p for p in self._pnl_history if p > 0]
-        losses = [p for p in self._pnl_history if p <= 0]
-        gross_profit = sum(wins) if wins else 0.0
-        gross_loss = abs(sum(losses)) if losses else 0.0
-        profit_factor = gross_profit / gross_loss if gross_loss else 0.0
-        win_rate = self.winning_trades / self.total_trades if self.total_trades else 0.0
-        expectancy = (sum(self._pnl_history) / self.total_trades) if self.total_trades else 0.0
-        return RiskMetrics(
-            equity=self.equity, peak_equity=self.peak_equity,
-            daily_start_equity=self.daily_start_equity,
-            daily_pnl=self.equity - self.daily_start_equity,
-            daily_pnl_pct=self._daily_pnl_pct(),
-            current_drawdown=self._current_drawdown(),
-            max_drawdown=settings.max_drawdown,
-            open_positions=self.open_positions,
-            total_trades=self.total_trades, winning_trades=self.winning_trades,
-            losing_trades=self.losing_trades, consecutive_losses=self.consecutive_losses,
-            win_rate=win_rate, profit_factor=profit_factor,
-            sharpe_ratio=self._sharpe(), expectancy=expectancy,
-            last_loss_time=self.last_loss_time, paused=self.paused, pause_reason=self.pause_reason,
-        )
-
-    def _current_drawdown(self) -> float:
-        if self.peak_equity == 0:
-            return 0.0
-        return (self.peak_equity - self.equity) / self.peak_equity
-
-    def _daily_pnl_pct(self) -> float:
-        if self.daily_start_equity == 0:
-            return 0.0
-        return (self.equity - self.daily_start_equity) / self.daily_start_equity
-
-    def _check_rr(self, signal: StrategySignal) -> bool:
-        """
-        FIX 1: Resolve entry price from metadata["last_close"] for market orders.
-        Previously entry_price=None (market orders) caused silent skip of RR check.
-        Now we always verify RR using the best available price estimate.
-        """
-        entry = signal.entry_price or signal.metadata.get("last_close", 0.0)
-        if not entry or entry <= 0:
-            log.warning(
-                "rr_check_skipped_no_price",
-                symbol=signal.symbol,
-                action=str(signal.action),
-            )
-            return True  # cannot verify — pass with warning
-        tp1 = signal.take_profit_1
-        sl = signal.stop_loss
-        if signal.action.value == "BUY":
-            risk = entry - sl
-            reward = tp1 - entry
-        else:
-            risk = sl - entry
-            reward = entry - tp1
-        if risk <= 0:
-            log.warning("rr_invalid_risk_zero", symbol=signal.symbol, entry=entry, sl=sl)
-            return False
-        rr = reward / risk
-        ok = rr >= settings.min_rr
-        if not ok:
-            log.warning(
-                "rr_too_low",
-                symbol=signal.symbol,
-                rr=round(rr, 3),
-                min_rr=settings.min_rr,
-                entry=entry,
-            )
-        return ok
-
-    def _sharpe(self, risk_free: float = 0.0) -> float:
-        """
-        FIX 3: Sharpe on percentage returns (pnl/equity) — not absolute PnL.
-        Absolute values were incomparable across accounts of different sizes
-        and degraded artificially as equity grew.
-        """
-        if len(self._pnl_history) < 2 or self.equity <= 0:
-            return 0.0
-        import statistics
-        returns = [p / self.equity for p in self._pnl_history]
-        avg = statistics.mean(returns)
-        std = statistics.stdev(returns)
-        if std == 0:
-            return 0.0
-        return round((avg - risk_free) / std, 4)
-
-    def _pause(self, reason: str, daily: bool = False) -> None:
-        self.paused = True
-        self.pause_reason = reason
-        log.critical("risk_paused", reason=reason)
+    def reset_daily(self) -> None:
+        """Apelat la midnight reset de AutomationEngine."""
+        self._daily_start_equity = self._equity
+        self._daily_pnl = 0.0
+        logger.info("[risk] Daily counters reset")

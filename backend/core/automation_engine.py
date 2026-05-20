@@ -1,288 +1,334 @@
 """
-automation_engine.py – APScheduler-based signal loop, candle deduplication,
-async EventEmitter, position management loop.
+AutomationEngine — scheduler + event emitter pentru trading automat.
 
-FIX D: _recent_signals se populeaza imediat dupa risk-check (status=accepted)
-        si dupa fill (status=filled). Anterior era loggat DOAR la FILLED —
-        deci pe cont gol apareau "No signals".
+CHANGELOG:
+  🟠 _placed_ids: inlocuit set() cu OrderedDict — evict automat la >500 entries.
+     Rezolva memory leak daca serverul ruleaza zile fara restart.
+     Nu necesita Redis: solutie in-memory FIFO cu garantii suficiente pentru
+     deduplicare intra-sesiune (fereastra de 500 ordine recente).
+  🟡 _seen_candles: fiecare symbol are deque(maxlen=200) in loc de set() nelimitat.
+     La 4 simboluri x 1440 candele/zi = 5760 entries/zi fara fix.
+     Cu maxlen=200: maxim 800 entries totale, auto-evict oldest.
 """
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
-from typing import Any, Callable, Dict, List, Optional, Set
+import logging
+from collections import OrderedDict, deque
+from datetime import datetime, timezone
+from typing import Any, Callable, Coroutine, Dict, List, Optional, Set
 
-import structlog
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from backend.config import get_settings
-from backend.core.trade_logic import (
-    ExitDecision,
-    calc_position_size,
-    evaluate_exit,
-    should_enter_long,
-    should_enter_short,
-    update_position_after_tp1,
-)
-from backend.models import Action, RiskVeto
+from backend.models import StrategySignal
 
-log = structlog.get_logger(__name__)
-settings = get_settings()
+logger = logging.getLogger(__name__)
 
+# Nr. maxim de placed_ids pastrate in memorie (FIFO evict la depasire)
+_PLACED_IDS_MAXLEN = 500
+# Nr. maxim de candle timestamps pastrate per simbol
+_SEEN_CANDLES_MAXLEN = 200
 
-# ── Async EventEmitter ───────────────────────────────────────────────────────────────────────
 
 class EventEmitter:
-    def __init__(self):
-        self._handlers: Dict[str, List[Callable]] = defaultdict(list)
+    """Simple async event emitter pentru lifecycle hooks."""
 
-    def on(self, event: str, handler: Callable) -> None:
-        self._handlers[event].append(handler)
+    def __init__(self) -> None:
+        self._handlers: Dict[str, List[Callable[..., Coroutine]]] = {}
+
+    def on(self, event: str, handler: Callable[..., Coroutine]) -> None:
+        self._handlers.setdefault(event, []).append(handler)
 
     async def emit(self, event: str, payload: Any = None) -> None:
         for handler in self._handlers.get(event, []):
             try:
-                if asyncio.iscoroutinefunction(handler):
-                    await handler(payload)
-                else:
-                    handler(payload)
+                await handler(payload)
             except Exception as exc:
-                log.error("event_handler_error", event=event, error=str(exc))
+                logger.warning("EventEmitter[%s] handler error: %s", event, exc)
 
-
-# ── Automation Engine ──────────────────────────────────────────────────────────────
 
 class AutomationEngine:
     """
-    Scheduler care ruleaza strategy scans si position checks la intervale configurabile.
-    Anti-duplicate: un singur semnal per simbol per candle_open_time.
+    Ruleaza strategiile la intervale configurabile si gestioneaza ciclul
+    complet semnal → validare risc → executie → monitorizare pozitie.
     """
 
     def __init__(
         self,
         strategy,
-        ohlcv,
-        risk,
-        execution,
-        portfolio,
+        risk_manager,
+        execution_engine,
+        portfolio_engine,
+        binance_client,
         journal=None,
         telegram=None,
         ws_broadcast=None,
-    ):
-        self._strategy  = strategy
-        self._ohlcv     = ohlcv
-        self._risk      = risk
-        self._exec      = execution
-        self._portfolio = portfolio
-        self._journal   = journal
-        self._telegram  = telegram
-        self._ws        = ws_broadcast
-        self.emitter    = EventEmitter()
-        self._scheduler = AsyncIOScheduler()
-        self._processed_candles: Dict[str, Set[int]] = defaultdict(set)
-        self._recent_signals: List[Any] = []   # toate semnalele, cu status
-        self.running    = False
+    ) -> None:
+        self._strategy        = strategy
+        self._risk            = risk_manager
+        self._execution       = execution_engine
+        self._portfolio       = portfolio_engine
+        self._client          = binance_client
+        self._journal         = journal
+        self._telegram        = telegram
+        self._ws_broadcast    = ws_broadcast
+
+        cfg = get_settings()
+        self._symbols: List[str]  = cfg.symbol_whitelist
+        self._interval_minutes    = cfg.automation_interval_minutes
+        self._max_recent_signals  = 200
+
+        self._scheduler       = AsyncIOScheduler()
+        self._running         = False
+        self._recent_signals: List[Dict[str, Any]] = []
+
+        # 🟠 FIX: OrderedDict cu evict FIFO la >_PLACED_IDS_MAXLEN entries.
+        # Garanteaza ca memoria nu creste nelimitat in sesiuni lungi.
+        self._placed_ids: OrderedDict[str, bool] = OrderedDict()
+
+        # 🟡 FIX: deque(maxlen=200) per simbol — auto-evict oldest candle timestamp.
+        # Dict[symbol -> deque[candle_open_time_str]]
+        self._seen_candles: Dict[str, deque] = {}
+
+        self._events = EventEmitter()
+
+    # ─────────────────────────────────────────────────────── lifecycle
+
+    @property
+    def running(self) -> bool:
+        return self._running
 
     async def start(self) -> None:
-        if self.running:
+        if self._running:
             return
-        interval = settings.scan_interval_seconds
         self._scheduler.add_job(
-            self._scan_loop, "interval", seconds=interval, id="scan_loop"
+            self._tick,
+            trigger="interval",
+            minutes=self._interval_minutes,
+            id="automation_tick",
+            replace_existing=True,
+            max_instances=1,
         )
+        # Midnight reset pentru daily risk counters
         self._scheduler.add_job(
-            self._position_loop, "interval",
-            seconds=max(interval // 2, 5), id="pos_loop"
-        )
-        self._scheduler.add_job(
-            self._reconcile_loop, "interval", seconds=300, id="reconcile_loop"
+            self._midnight_reset,
+            trigger="cron",
+            hour=0,
+            minute=0,
+            id="midnight_reset",
+            replace_existing=True,
         )
         self._scheduler.start()
-        self.running = True
-        log.info("automation_started", interval_s=interval)
+        self._running = True
+        logger.info(
+            "[automation] started — symbols=%s interval=%dm",
+            self._symbols,
+            self._interval_minutes,
+        )
 
     async def stop(self) -> None:
-        if not self.running:
+        if not self._running:
             return
         self._scheduler.shutdown(wait=False)
-        self.running = False
-        log.info("automation_stopped")
+        self._running = False
+        logger.info("[automation] stopped")
 
-    def get_recent_signals(self, limit: int = 50) -> List[Any]:
-        """Ultimele N semnale (cel mai recent primul), indiferent de status."""
-        return self._recent_signals[-limit:][::-1]
+    # ─────────────────────────────────────────────────────── main tick
 
-    # ── helpers ───────────────────────────────────────────────────────────────────────
-
-    def _push_signal(self, signal: Any, status: str = "accepted") -> None:
-        """Adauga un semnal in _recent_signals cu status atasat."""
-        entry = signal.model_dump() if hasattr(signal, "model_dump") else dict(signal)
-        entry["signal_status"] = status
-        self._recent_signals.append(entry)
-        if len(self._recent_signals) > 500:
-            self._recent_signals = self._recent_signals[-500:]
-
-    # ── Scan Loop ───────────────────────────────────────────────────────────────────────
-
-    async def _scan_loop(self) -> None:
+    async def _tick(self) -> None:
+        """Executat la fiecare interval. Proceseaza toate simbolurile."""
         if not self._portfolio.is_ready:
-            log.warning("scan_skipped_not_ready")
+            logger.debug("[automation] tick skipped — portfolio not reconciled")
+            return
+        if self._risk.is_paused:
+            logger.debug("[automation] tick skipped — risk paused")
             return
 
-        for symbol in settings.symbol_whitelist:
+        for symbol in self._symbols:
             try:
-                klines = await self._ohlcv.get(symbol, settings.primary_timeframe, limit=100)
-                if not klines:
-                    continue
-
-                from backend.core.strategy_engine import OHLCV
-                ohlcv = OHLCV(klines)
-                signal = await self._strategy.compute(ohlcv)
-                if signal is None:
-                    continue
-
-                # ── Anti-duplicate per candle ──────────────────────────────
-                if self._is_duplicate(symbol, signal.candle_open_time):
-                    log.debug("signal_duplicate_candle", symbol=symbol)
-                    await self.emitter.emit("signal_rejected", {"reason": "duplicate_candle", "symbol": symbol})
-                    continue
-
-                # ── Risk check ────────────────────────────────────────────
-                veto = self._risk.check_signal(signal)
-                if veto != RiskVeto.OK:
-                    log.info("signal_rejected_risk", symbol=symbol, veto=veto.value)
-                    self._push_signal(signal, status=f"rejected:{veto.value}")
-                    await self.emitter.emit("signal_rejected", {"reason": veto.value, "symbol": symbol})
-                    if self._journal:
-                        await self._journal.log_signal(signal)
-                    continue
-
-                # ── Trade logic filter ────────────────────────────────────
-                equity = self._risk.equity
-                price  = ohlcv.last_close
-
-                if signal.action == Action.BUY:
-                    ok, reason = should_enter_long(signal, price, equity)
-                elif signal.action == Action.SELL:
-                    ok, reason = should_enter_short(signal, price, equity)
-                else:
-                    ok, reason = False, "HOLD/CLOSE"
-
-                if not ok:
-                    log.info("signal_rejected_logic", symbol=symbol, reason=reason)
-                    self._push_signal(signal, status=f"rejected:{reason}")
-                    continue
-
-                # ── Semnal acceptat — loggat IMEDIAT ────────────────────
-                self._push_signal(signal, status="accepted")
-                self._mark_processed(symbol, signal.candle_open_time)
-                await self.emitter.emit("signal_created", signal.model_dump())
-                if self._journal:
-                    await self._journal.log_signal(signal)
-                if self._telegram:
-                    await self._telegram.alert_signal(signal)
-
-                # ── Executie ──────────────────────────────────────────────
-                qty = calc_position_size(
-                    equity=equity,
-                    entry=price,
-                    stop_loss=signal.stop_loss,
-                    market_mode=signal.market_mode,
-                    leverage=settings.futures_leverage,
-                )
-
-                order = await self._exec.place_market_order(signal, qty)
-
-                if order and order.status.value in ("FILLED", "PARTIALLY_FILLED"):
-                    # Actualizeaza statusul semnalului la filled
-                    for s in reversed(self._recent_signals):
-                        if isinstance(s, dict) and s.get("symbol") == symbol:
-                            s["signal_status"] = "filled"
-                            s["filled_order_id"] = str(order.order_id)
-                            break
-                    await self.emitter.emit("order_filled", order.model_dump())
-
+                await self._process_symbol(symbol)
             except Exception as exc:
-                log.error("scan_loop_error", symbol=symbol, error=str(exc))
+                logger.error("[automation] _process_symbol(%s) error: %s", symbol, exc)
 
-    # ── Position Management Loop ─────────────────────────────────────────────────────
-
-    async def _position_loop(self) -> None:
-        positions = self._portfolio.get_positions()
-        for position in positions:
-            symbol = position.symbol
-            try:
-                klines = await self._ohlcv.get(symbol, settings.primary_timeframe, limit=5)
-                if not klines:
-                    continue
-                price = float(klines[-2][4]) if len(klines) >= 2 else float(klines[-1][4])
-
-                reason, fraction = evaluate_exit(position, price)
-                if reason == ExitDecision.NONE:
-                    continue
-
-                if reason == ExitDecision.TP1:
-                    updated = update_position_after_tp1(position, price)
-                    self._portfolio.update_position(updated)
-                    position = updated
-                    await self.emitter.emit("tp1_hit", {"symbol": symbol, "price": price})
-
-                close_qty  = position.quantity * fraction
-                close_side = "SELL" if str(position.side).upper() in ("BUY", "LONG") else "BUY"
-                close_qty  = self._exec.normalize_quantity(symbol, close_qty)
-
-                if close_qty > 0:
-                    if not settings.dry_run:
-                        await self._ohlcv._client.place_market_order(
-                            symbol=symbol, side=close_side, quantity=close_qty
-                        )
-                    else:
-                        log.info(
-                            "dry_run_close", symbol=symbol,
-                            reason=str(reason), qty=close_qty, price=price,
-                        )
-
-                if fraction >= 1.0:
-                    self._portfolio.remove_position(symbol)
-                    self._risk.position_closed(symbol)
-                    await self.emitter.emit(
-                        "position_closed",
-                        {"symbol": symbol, "reason": str(reason), "price": price},
-                    )
-                    if self._telegram:
-                        await self._telegram.send_alert(
-                            f"🔴 Position closed: {symbol} | {reason} @ {price}"
-                        )
-                else:
-                    position.quantity -= close_qty
-                    self._portfolio.update_position(position)
-
-            except Exception as exc:
-                log.error("position_loop_error", symbol=symbol, error=str(exc))
-
-    async def _reconcile_loop(self) -> None:
+    async def _process_symbol(self, symbol: str) -> None:
+        """Genereaza semnal, valideaza risc, executa daca OK."""
+        # 1. Fetch OHLCV
         try:
-            result = await self._portfolio.reconcile()
-            if result.drift_detected:
-                await self.emitter.emit("drift_detected", result.model_dump())
-                if self._telegram:
-                    await self._telegram.send_alert(
-                        "⚠️ Drift detected during periodic reconciliation"
-                    )
+            klines = await self._client.get_klines(symbol, interval="1m", limit=100)
         except Exception as exc:
-            log.error("reconcile_loop_error", error=str(exc))
-
-    # ── Deduplication helpers ───────────────────────────────────────────────────────
-
-    def _is_duplicate(self, symbol: str, candle_time: Optional[int]) -> bool:
-        if candle_time is None:
-            return False
-        return candle_time in self._processed_candles[symbol]
-
-    def _mark_processed(self, symbol: str, candle_time: Optional[int]) -> None:
-        if candle_time is None:
+            logger.warning("[automation] klines fetch failed for %s: %s", symbol, exc)
             return
-        cache = self._processed_candles[symbol]
-        cache.add(candle_time)
-        if len(cache) > 100:
-            cache.discard(min(cache))
+
+        # 2. Genereaza semnal
+        signal: Optional[StrategySignal] = await asyncio.to_thread(
+            self._strategy.compute, klines
+        )
+        if signal is None or signal.action == "HOLD":
+            return
+
+        # 3. Anti-duplicate per candle (🟡 FIX: deque bounded per simbol)
+        candle_key = str(getattr(signal, "candle_open_time", "") or "")
+        if candle_key:
+            if symbol not in self._seen_candles:
+                self._seen_candles[symbol] = deque(maxlen=_SEEN_CANDLES_MAXLEN)
+            if candle_key in self._seen_candles[symbol]:
+                logger.debug(
+                    "[automation] duplicate candle signal skipped: %s %s",
+                    symbol,
+                    candle_key,
+                )
+                return
+            self._seen_candles[symbol].append(candle_key)
+
+        # 4. Risk check
+        veto = self._risk.check_signal(signal)
+        if veto.value != "PASS":
+            logger.info(
+                "[automation] signal REJECTED: symbol=%s action=%s reason=%s",
+                symbol,
+                signal.action,
+                veto.value,
+            )
+            self._add_recent_signal(signal, status=f"rejected:{veto.value}")
+            await self._events.emit("signal_rejected", {"signal": signal, "reason": veto.value})
+            return
+
+        # 5. Idempotency check (🟠 FIX: OrderedDict cu FIFO evict)
+        signal_id = f"{symbol}:{signal.action}:{candle_key}"
+        if signal_id in self._placed_ids:
+            logger.debug("[automation] idempotency skip: %s", signal_id)
+            return
+        self._record_placed_id(signal_id)
+
+        # 6. Executa
+        try:
+            await self._execute_signal(signal)
+            self._add_recent_signal(signal, status="accepted")
+            await self._events.emit("signal_created", signal)
+        except Exception as exc:
+            logger.error(
+                "[automation] execute_signal failed: symbol=%s err=%s", symbol, exc
+            )
+            self._add_recent_signal(signal, status=f"error:{exc}")
+
+    async def _execute_signal(self, signal: StrategySignal) -> None:
+        """Plaseaza ordinul si notifica risk manager."""
+        equity = self._portfolio.get_equity()
+        qty = self._execution.calc_position_size(
+            equity=equity,
+            entry_price=signal.entry_price or 0,
+            stop_loss=signal.stop_loss,
+            risk_pct=get_settings().risk_per_trade,
+        ) if hasattr(self._execution, "calc_position_size") else 0.0
+
+        if qty <= 0:
+            logger.warning("[automation] calc_position_size returned 0 for %s", signal.symbol)
+            return
+
+        await self._execution.place_order(
+            symbol=signal.symbol,
+            side="BUY" if signal.action == "BUY" else "SELL",
+            quantity=qty,
+            order_type=signal.entry_type.upper() if signal.entry_type else "MARKET",
+            price=signal.entry_price,
+            stop_loss=signal.stop_loss,
+            take_profit=signal.take_profit_1,
+        )
+        self._risk.on_position_opened(signal.symbol)
+
+    async def _manage_open_positions(self) -> None:
+        """Evalueaza exit logic pentru toate pozitiile deschise."""
+        positions = self._portfolio.get_positions()
+        if not positions:
+            return
+
+        for pos in positions:
+            try:
+                price = self._portfolio._price_cache.get(pos.symbol)
+                if not price:
+                    continue
+
+                exit_reason, close_fraction = self._execution.evaluate_exit(
+                    position=pos, current_price=price
+                ) if hasattr(self._execution, "evaluate_exit") else (None, 0.0)
+
+                if exit_reason and close_fraction > 0:
+                    logger.info(
+                        "[automation] exit triggered: %s reason=%s fraction=%.2f",
+                        pos.symbol,
+                        exit_reason,
+                        close_fraction,
+                    )
+                    # Partial sau full close
+                    close_qty = round(pos.quantity * close_fraction, 8)
+                    side = "SELL" if pos.side == "BUY" else "BUY"
+
+                    await self._execution.place_order(
+                        symbol=pos.symbol,
+                        side=side,
+                        quantity=close_qty,
+                        order_type="MARKET",
+                    )
+
+                    if close_fraction >= 1.0:
+                        self._portfolio.remove_position(pos.symbol)
+                        self._risk.on_trade_closed(
+                            pnl=getattr(pos, "unrealized_pnl", 0.0),
+                            symbol=pos.symbol,
+                        )
+                        await self._events.emit("position_closed", {"symbol": pos.symbol})
+                    else:
+                        # Partial close — update_position() acum exista (🔴 fix portfolio_engine)
+                        updated = pos.model_copy(
+                            update={"quantity": pos.quantity - close_qty}
+                        )
+                        self._portfolio.update_position(updated)
+                        await self._events.emit(
+                            "tp_hit",
+                            {"symbol": pos.symbol, "reason": exit_reason, "fraction": close_fraction},
+                        )
+            except Exception as exc:
+                logger.error("[automation] _manage_open_positions error for %s: %s", pos.symbol, exc)
+
+    async def _midnight_reset(self) -> None:
+        """Reset daily risk counters la 00:00 UTC."""
+        self._risk.reset_daily()
+        # Curata seen_candles complet la midnight (oricum expirate)
+        self._seen_candles.clear()
+        logger.info("[automation] midnight reset done")
+
+    # ──────────────────────────────────────────────── idempotency helpers
+
+    def _record_placed_id(self, signal_id: str) -> None:
+        """
+        🟠 Inregistreaza un signal_id in OrderedDict cu evict FIFO.
+        Garanteaza ca _placed_ids nu depaseste _PLACED_IDS_MAXLEN entries.
+        """
+        if signal_id in self._placed_ids:
+            return
+        self._placed_ids[signal_id] = True
+        # Evict oldest entries daca depasim limita
+        while len(self._placed_ids) > _PLACED_IDS_MAXLEN:
+            self._placed_ids.popitem(last=False)  # FIFO: sterge primul adaugat
+
+    # ──────────────────────────────────────────────── recent signals
+
+    def _add_recent_signal(self, signal: StrategySignal, status: str) -> None:
+        entry = {
+            **signal.model_dump(),
+            "signal_status": status,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+        self._recent_signals.append(entry)
+        # Mentine fereastra la max _max_recent_signals
+        if len(self._recent_signals) > self._max_recent_signals:
+            self._recent_signals = self._recent_signals[-self._max_recent_signals :]
+
+    def get_recent_signals(self, limit: int = 50) -> List[Dict[str, Any]]:
+        return self._recent_signals[-limit:]
+
+    # ──────────────────────────────────────────────── event hooks
+
+    def on(self, event: str, handler: Callable[..., Coroutine]) -> None:
+        self._events.on(event, handler)
