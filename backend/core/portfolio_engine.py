@@ -2,12 +2,12 @@
 PortfolioEngine — reconciliere Binance <-> state local, PnL analytics.
 
 CHANGELOG:
-  🔴 FIX #2: _fetch_raw_equity() calculeaza equity USDT complet pentru spot-only.
-     Daca Futures nu e activat, get_futures_account() arunca 400 Bad Request.
-     Acum: suma tuturor asset-urilor spot convertite in USDT via price_cache.
-  🔴 FIX #3: get_account_info() are fallback explicit pentru spot-only
-     (futures_assets=[] in loc de except silentios cu cached 0.0).
-  ➕ ADD: update_position() — folosit de automation_engine la partial close.
+  🔴 FIX #1 (prev): _fetch_raw_equity() calculeaza equity USDT complet pentru spot-only.
+  🔴 FIX #1 (prev): get_account_info() are fallback explicit pentru spot-only.
+  🔴 FIX #1 (curr): reconcile() transmite futures=True la get_open_orders() cand mode=futures.
+  🟠 FIX #2 : price_cache expus ca property public — elimina accesul fragil la atribut privat
+               din automation_engine (_portfolio._price_cache → _portfolio.price_cache).
+  ➕ ADD     : update_position() — folosit de automation_engine la partial close.
 """
 from __future__ import annotations
 
@@ -67,6 +67,15 @@ class PortfolioEngine:
     def is_ready(self) -> bool:
         return self._reconciled
 
+    @property
+    def price_cache(self) -> "PriceCache":
+        """
+        🟠 FIX #2: Property public pentru price_cache.
+        AutomationEngine si alte module nu mai acceseaza atributul privat _price_cache.
+        Protejat la refactoring — orice redenumire interna nu afecteaza consumatorii.
+        """
+        return self._price_cache
+
     # ------------------------------------------------------------- reconcile
 
     async def reconcile(self) -> ReconciliationResult:
@@ -77,12 +86,16 @@ class PortfolioEngine:
         async with self._reconcile_lock:
             logger.info("[reconcile] Starting (mode=%s)", self._mode)
             try:
-                if self._mode == "futures":
+                is_futures = self._mode == "futures"
+
+                if is_futures:
                     remote_positions = await self._client.get_positions()
-                    remote_orders    = await self._client.get_open_orders()
+                    # 🔴 FIX #1: transmite futures=True pentru a apela /fapi/v1/openOrders
+                    remote_orders = await self._client.get_open_orders(futures=True)
                 else:
                     remote_positions = []
-                    remote_orders    = await self._client.get_open_orders()
+                    # Spot: /api/v3/openOrders (default)
+                    remote_orders = await self._client.get_open_orders(futures=False)
 
                 remote_symbols = {
                     p["symbol"]
@@ -143,7 +156,6 @@ class PortfolioEngine:
 
     async def get_account_info(self) -> AccountInfo:
         """Fetch full account snapshot. Spot-only safe."""
-        # --- Spot ---
         try:
             spot = await self._client.get_spot_account()
         except Exception as exc:
@@ -166,7 +178,6 @@ class PortfolioEngine:
 
         total_spot_usdt = sum(a.usdt_valuation for a in spot_assets)
 
-        # --- Futures (optional — spot-only accounts nu au futures) ---
         futures_assets: List[FuturesAsset] = []
         futs_data: dict = {}
         if self._mode == "futures":
@@ -189,7 +200,6 @@ class PortfolioEngine:
                     if float(a.get("walletBalance", 0)) > 1e-9
                 ]
             except Exception as exc:
-                # 🔴 FIX #2: Futures nu e activat — log warning, nu crash
                 logger.warning(
                     "get_account_info: futures fetch skipped (spot-only account?): %s", exc
                 )
@@ -198,7 +208,6 @@ class PortfolioEngine:
         total_unreal      = sum(a.unrealized_profit  for a in futures_assets)
         total_avail_futs  = sum(a.available_balance  for a in futures_assets)
 
-        # Spot available = free USDT
         spot_usdt_free = next(
             (float(a["free"]) for a in spot.get("balances", []) if a["asset"] == "USDT"), 0.0
         )
@@ -297,9 +306,9 @@ class PortfolioEngine:
         losses = [t for t in closed if (t.pnl or 0) <= 0]
         total  = len(closed)
 
-        win_rate     = len(wins) / total if total else 0.0
-        gross_profit = sum(t.pnl for t in wins   if t.pnl)  # type: ignore
-        gross_loss   = abs(sum(t.pnl for t in losses if t.pnl))  # type: ignore
+        win_rate      = len(wins) / total if total else 0.0
+        gross_profit  = sum(t.pnl for t in wins   if t.pnl)  # type: ignore
+        gross_loss    = abs(sum(t.pnl for t in losses if t.pnl))  # type: ignore
         profit_factor = gross_profit / gross_loss if gross_loss else float("inf")
 
         pnls    = [t.pnl for t in closed if t.pnl is not None]
@@ -317,7 +326,6 @@ class PortfolioEngine:
             (1 - win_rate) * (gross_loss / len(losses) if losses else 0)
         )
 
-        # 🟠 FIX #5: gross_profit/gross_loss sunt campuri in RiskMetrics
         return RiskMetrics(
             win_rate=round(win_rate, 4),
             profit_factor=round(profit_factor, 4),
@@ -334,16 +342,13 @@ class PortfolioEngine:
 
     async def _fetch_raw_equity(self) -> float:
         """
-        🔴 FIX #2: Calculeaza equity USDT pentru spot-only accounts.
-        Nu mai depinde de Futures API — suma tuturor asset-urilor spot
-        convertite in USDT via price_cache cu fallback 0.
+        Calculeaza equity USDT. Spot-only safe — nu apeleaza Futures API.
         """
         try:
             if self._mode == "futures":
                 futs = await self._client.get_futures_account()
                 return float(futs.get("totalWalletBalance", 0))
 
-            # SPOT: suma tuturor balante convertite in USDT
             spot  = await self._client.get_spot_account()
             total = 0.0
             for a in spot.get("balances", []):
@@ -353,7 +358,6 @@ class PortfolioEngine:
                 if a["asset"] == "USDT":
                     total += qty
                 else:
-                    # usdt_value returneaza 0.0 daca pretul nu e in cache
                     total += self._price_cache.usdt_value(a["asset"], qty)
             return total
         except Exception as exc:

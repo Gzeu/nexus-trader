@@ -2,11 +2,17 @@
 AutomationEngine — scheduler + event emitter pentru trading automat.
 
 CHANGELOG:
-  🔴 FIX #1: _placed_ids TTL-based (Dict[str, float] + monotonic())
-     Inlocuieste OrderedDict cu evict FIFO cu dict TTL=1h.
-     Un order_id din sesiuni anterioare nu mai blocheaza re-entry dupa restart.
-  🟠 FIX #4: _seen_candles cleanup periodic la fiecare 1000 ticks.
-     Simbolurile retrase din whitelist nu mai acumuleaza chei moarte.
+  🔴 FIX #1 (prev) : _placed_ids TTL-based (Dict[str, float] + monotonic())
+  🔴 FIX #3        : realized_pnl calculat corect la on_trade_closed()
+                     (current_price - entry_price) * close_qty * side_sign
+                     Anterior: unrealized_pnl ramânea 0.0 → consecutive_losses nu se incrementa.
+  🟠 FIX #2        : _manage_open_positions() foloseste portfolio.price_cache (property public)
+                     in loc de portfolio._price_cache (atribut privat fragil).
+  🟡 FIX #4 (prev) : _seen_candles cleanup periodic la fiecare 1000 ticks.
+  🟡 FIX #5        : _midnight_reset() face evict smart pe seen_candles (TTL-based)
+                     in loc de .clear() complet — previne re-entry pe aceeasi lumanare.
+  🟡 FIX #6        : place_order() wrapped cu asyncio.wait_for(cfg.order_timeout_seconds)
+                     Previne blocarea tick-ului pe Binance lent/offline.
 """
 from __future__ import annotations
 
@@ -24,9 +30,7 @@ from backend.models import StrategySignal
 
 logger = logging.getLogger(__name__)
 
-# TTL pentru placed_ids: dupa 1h un signal_id este considerat expirat
 _PLACED_TTL: float = 3600.0
-# Nr. maxim de candle timestamps pastrate per simbol
 _SEEN_CANDLES_MAXLEN = 200
 
 
@@ -84,11 +88,10 @@ class AutomationEngine:
         self._recent_signals: List[Dict[str, Any]] = []
         self._tick_count     = 0
 
-        # 🔴 FIX #1: TTL-based idempotency store — Dict[signal_id, monotonic_timestamp]
-        # Un entry expirat dupa _PLACED_TTL secunde nu mai blocheaza re-entry.
+        # TTL-based idempotency store — Dict[signal_id, monotonic_timestamp]
         self._placed_ids: Dict[str, float] = {}
 
-        # Candle dedup per simbol
+        # Candle dedup per simbol — deque cu maxlen per simbol
         self._seen_candles: Dict[str, deque] = {}
 
         self._events = EventEmitter()
@@ -146,7 +149,7 @@ class AutomationEngine:
             logger.debug("[automation] tick skipped — risk paused")
             return
 
-        # 🟠 FIX #4: cleanup seen_candles pentru simboluri retrase din whitelist
+        # Cleanup seen_candles pentru simboluri retrase din whitelist
         if self._tick_count % 1000 == 0:
             active = set(self._cfg.symbol_whitelist)
             stale = [s for s in list(self._seen_candles) if s not in active]
@@ -204,7 +207,7 @@ class AutomationEngine:
             await self._events.emit("signal_rejected", {"signal": signal, "reason": veto.value})
             return
 
-        # 🔴 FIX #1: TTL idempotency check
+        # TTL idempotency check
         signal_id = f"{symbol}:{signal.action}:{candle_key}"
         if self._is_duplicate(signal_id):
             logger.debug("[automation] idempotency skip (TTL): %s", signal_id)
@@ -223,6 +226,7 @@ class AutomationEngine:
 
     async def _execute_signal(self, signal: StrategySignal) -> None:
         """Plaseaza ordinul si notifica risk manager."""
+        cfg = get_settings()
         equity = self._portfolio.get_equity()
         qty = 0.0
         if hasattr(self._execution, "calc_position_size"):
@@ -230,22 +234,35 @@ class AutomationEngine:
                 equity=equity,
                 entry_price=signal.entry_price or 0,
                 stop_loss=signal.stop_loss,
-                risk_pct=get_settings().risk_per_trade,
+                risk_pct=cfg.risk_per_trade,
             )
 
         if qty <= 0:
             logger.warning("[automation] calc_position_size returned 0 for %s", signal.symbol)
             return
 
-        await self._execution.place_order(
-            symbol=signal.symbol,
-            side="BUY" if signal.action == "BUY" else "SELL",
-            quantity=qty,
-            order_type=signal.entry_type.upper() if signal.entry_type else "MARKET",
-            price=signal.entry_price,
-            stop_loss=signal.stop_loss,
-            take_profit=signal.take_profit_1,
-        )
+        # 🟡 FIX #6: timeout explicit pentru place_order — previne blocarea tick-ului
+        order_timeout = getattr(cfg, "order_timeout_seconds", 15)
+        try:
+            await asyncio.wait_for(
+                self._execution.place_order(
+                    symbol=signal.symbol,
+                    side="BUY" if signal.action == "BUY" else "SELL",
+                    quantity=qty,
+                    order_type=signal.entry_type.upper() if signal.entry_type else "MARKET",
+                    price=signal.entry_price,
+                    stop_loss=signal.stop_loss,
+                    take_profit=signal.take_profit_1,
+                ),
+                timeout=order_timeout,
+            )
+        except asyncio.TimeoutError:
+            logger.error(
+                "[automation] place_order TIMEOUT (%ds) for %s — order may not have been placed!",
+                order_timeout,
+                signal.symbol,
+            )
+            return
         self._risk.on_position_opened(signal.symbol)
 
     async def _manage_open_positions(self) -> None:
@@ -256,7 +273,8 @@ class AutomationEngine:
 
         for pos in positions:
             try:
-                price = self._portfolio._price_cache.get(pos.symbol)
+                # 🟠 FIX #2: foloseste property public price_cache (nu atribut privat _price_cache)
+                price = self._portfolio.price_cache.get(pos.symbol)
                 if not price:
                     continue
 
@@ -276,21 +294,50 @@ class AutomationEngine:
                     close_qty = round(pos.quantity * close_fraction, 8)
                     side = "SELL" if pos.side == "BUY" else "BUY"
 
-                    await self._execution.place_order(
-                        symbol=pos.symbol,
-                        side=side,
-                        quantity=close_qty,
-                        order_type="MARKET",
-                    )
+                    order_timeout = getattr(get_settings(), "order_timeout_seconds", 15)
+                    try:
+                        await asyncio.wait_for(
+                            self._execution.place_order(
+                                symbol=pos.symbol,
+                                side=side,
+                                quantity=close_qty,
+                                order_type="MARKET",
+                            ),
+                            timeout=order_timeout,
+                        )
+                    except asyncio.TimeoutError:
+                        logger.error(
+                            "[automation] exit place_order TIMEOUT (%ds) for %s",
+                            order_timeout,
+                            pos.symbol,
+                        )
+                        continue
 
                     if close_fraction >= 1.0:
                         self._portfolio.remove_position(pos.symbol)
+
+                        # 🔴 FIX #3: calculeaza realized_pnl corect
+                        # Nu mai foloseste unrealized_pnl (mereu 0 la close total).
+                        # Formula: (exit_price - entry_price) * qty_closed * direction
+                        realized_pnl = (price - pos.entry_price) * close_qty
+                        if pos.side.upper() == "SELL":
+                            realized_pnl *= -1
+
                         self._risk.on_trade_closed(
-                            pnl=getattr(pos, "unrealized_pnl", 0.0),
+                            pnl=realized_pnl,
                             symbol=pos.symbol,
                         )
-                        await self._events.emit("position_closed", {"symbol": pos.symbol})
+                        logger.info(
+                            "[automation] position CLOSED: %s realized_pnl=%.4f",
+                            pos.symbol,
+                            realized_pnl,
+                        )
+                        await self._events.emit(
+                            "position_closed",
+                            {"symbol": pos.symbol, "pnl": realized_pnl},
+                        )
                     else:
+                        # Partial close — actualizeaza cantitatea ramasa
                         updated = pos.model_copy(
                             update={"quantity": pos.quantity - close_qty}
                         )
@@ -309,35 +356,49 @@ class AutomationEngine:
                 )
 
     async def _midnight_reset(self) -> None:
-        """Reset daily risk counters la 00:00 UTC."""
+        """
+        Reset daily risk counters la 00:00 UTC.
+
+        🟡 FIX #5: seen_candles NU mai e golit complet (.clear()).
+        In loc, face evict smart: sterge doar intrarile mai vechi decat
+        interval_minutes * 2, pastrând lumânările recente.
+        Previne re-entry pe aceeasi lumanare daca tick-ul ruleaza imediat dupa midnight.
+        """
         self._risk.reset_daily()
-        self._seen_candles.clear()
-        # Sterge si placed_ids expirate
+
+        # Smart evict seen_candles: pastram luminarile recente (< 2 intervale)
+        # Timestamp-urile sunt stringuri — nu putem compara ca float,
+        # dar putem trunchia deque-ul la ultimele N intrari (echivalent cu TTL pe count).
+        # Retinem ultimele interval_minutes * 2 intrari per simbol.
+        keep = max(2, self._interval_minutes * 2)
+        for symbol, dq in self._seen_candles.items():
+            while len(dq) > keep:
+                dq.popleft()
+
+        # Sterge placed_ids expirate
         now = monotonic()
         self._placed_ids = {
             k: t for k, t in self._placed_ids.items() if now - t <= _PLACED_TTL
         }
-        logger.info("[automation] midnight reset done")
+        logger.info(
+            "[automation] midnight reset — seen_candles trimmed to last %d per symbol", keep
+        )
 
     # ──────────────────────────────────────────── TTL idempotency helpers
 
     def _register_placed_id(self, signal_id: str) -> None:
         """
-        🔴 FIX #1: Inregistreaza signal_id cu timestamp monotonic.
-        Evict all expired entries la fiecare scriere (lazy GC).
+        Inregistreaza signal_id cu timestamp monotonic.
+        Lazy GC: evict all expired entries la fiecare scriere.
         """
         now = monotonic()
-        # Lazy evict expirate
         expired = [k for k, t in self._placed_ids.items() if now - t > _PLACED_TTL]
         for k in expired:
             del self._placed_ids[k]
         self._placed_ids[signal_id] = now
 
     def _is_duplicate(self, signal_id: str) -> bool:
-        """
-        🔴 FIX #1: True daca signal_id exista SI nu a expirat.
-        Auto-sterge entry-ul expirat.
-        """
+        """True daca signal_id exista SI nu a expirat. Auto-sterge entry-ul expirat."""
         t = self._placed_ids.get(signal_id)
         if t is None:
             return False

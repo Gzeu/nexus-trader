@@ -1,6 +1,10 @@
 """
 BinanceClient — async HTTP client (Spot + Futures, Testnet/Mainnet).
-HMAC-SHA256 signing, retry cu exponential backoff, toate metodele necesare.
+
+CHANGELOG:
+  🔴 FIX #1 : get_open_orders() accepta futures=bool — rutare corecta Spot vs Futures.
+  🔴 FIX #9 : cancel_all_orders() accepta futures=bool — anuleaza si ordinele Futures.
+  🟡 FIX #7 : hmac.new() cu keyword args (Python 3.13+ safe, fara deprecation warnings).
 """
 from __future__ import annotations
 
@@ -31,14 +35,12 @@ class BinanceClient:
 
     def __init__(self) -> None:
         cfg = get_settings()
-        # Pydantic v2 normalises all field names to snake_case regardless of
-        # how they are written in .env.  Always access via snake_case here.
-        self._api_key = cfg.binance_api_key
-        self._api_secret = cfg.binance_api_secret
-        self._testnet = cfg.testnet
-        self._dry_run = cfg.dry_run
+        self._api_key      = cfg.binance_api_key
+        self._api_secret   = cfg.binance_api_secret
+        self._testnet      = cfg.testnet
+        self._dry_run      = cfg.dry_run
 
-        self._spot_base = _SPOT_TEST if self._testnet else _SPOT_LIVE
+        self._spot_base    = _SPOT_TEST if self._testnet else _SPOT_LIVE
         self._futures_base = _FUTS_TEST if self._testnet else _FUTS_LIVE
 
         self._client: Optional[httpx.AsyncClient] = None
@@ -71,8 +73,11 @@ class BinanceClient:
     def _sign(self, params: Dict[str, Any]) -> Dict[str, Any]:
         params["timestamp"] = int(time.time() * 1000)
         query = urllib.parse.urlencode(params)
+        # 🟡 FIX #7: keyword args pentru Python 3.13+ compatibilitate
         sig = hmac.new(
-            self._api_secret.encode(), query.encode(), hashlib.sha256
+            key=self._api_secret.encode(),
+            msg=query.encode(),
+            digestmod=hashlib.sha256,
         ).hexdigest()
         params["signature"] = sig
         return params
@@ -163,9 +168,25 @@ class BinanceClient:
         """GET /fapi/v2/positionRisk — pozitii futures deschise."""
         return await self._signed_get("/fapi/v2/positionRisk", base_url=self._futures_base)
 
-    async def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict]:
-        """GET /api/v3/openOrders sau /fapi/v1/openOrders."""
+    async def get_open_orders(
+        self, symbol: Optional[str] = None, futures: bool = False
+    ) -> List[Dict]:
+        """
+        🔴 FIX #1: Rutare corecta Spot vs Futures.
+
+        Args:
+            symbol: Filtreaza dupa simbol (optional).
+            futures: Daca True, apeleaza /fapi/v1/openOrders (Futures).
+                     Daca False (default), apeleaza /api/v3/openOrders (Spot).
+
+        Returns:
+            Lista de ordine deschise de la exchange.
+        """
         params = {"symbol": symbol} if symbol else {}
+        if futures:
+            return await self._signed_get(
+                "/fapi/v1/openOrders", params, base_url=self._futures_base
+            )
         return await self._signed_get("/api/v3/openOrders", params)
 
     # ----------------------------------------------------------------- orders
@@ -235,11 +256,29 @@ class BinanceClient:
             "/api/v3/order", {"symbol": symbol, "orderId": order_id}
         )
 
-    async def cancel_all_orders(self, symbol: str) -> List[Dict]:
-        """DELETE /api/v3/openOrders — cancela toate ordinele pentru un simbol."""
+    async def cancel_all_orders(
+        self, symbol: str, futures: bool = False
+    ) -> List[Dict]:
+        """
+        🔴 FIX #9: Suport complet Spot + Futures.
+
+        Args:
+            symbol: Simbolul pentru care se anuleaza ordinele.
+            futures: Daca True, apeleaza /fapi/v1/allOpenOrders (Futures).
+                     Daca False (default), apeleaza /api/v3/openOrders (Spot DELETE).
+
+        Returns:
+            Lista ordinelor anulate (poate fi goala in DRY_RUN).
+        """
         if self._dry_run:
-            logger.info("[DRY_RUN] cancel_all_orders %s", symbol)
+            logger.info("[DRY_RUN] cancel_all_orders %s (futures=%s)", symbol, futures)
             return []
+        if futures:
+            return await self._signed_delete(
+                "/fapi/v1/allOpenOrders",
+                {"symbol": symbol},
+                base_url=self._futures_base,
+            )
         return await self._signed_delete("/api/v3/openOrders", {"symbol": symbol})
 
     async def set_leverage(

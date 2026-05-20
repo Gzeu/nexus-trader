@@ -2,21 +2,19 @@
 RiskManager — gatekeeper pentru toate ordinele.
 
 CHANGELOG:
-  🟡 peak_equity, consecutive_losses, daily_pnl, max_drawdown_seen expuse
-     ca properties publice (folosite de /metrics in routes.py).
-     Anterior erau atribute private cu prefix _ accesate cu getattr() fragil.
+  🟡 FIX #4 (prev) : peak_equity, consecutive_losses, daily_pnl, max_drawdown_seen expuse
+                     ca properties publice.
+  🟡 FIX #4 (curr) : reset_daily() are guard explicit — nu reseteaza daily_start_equity
+                     daca equity == 0 (ex: Binance offline la midnight).
 """
 from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Optional
+from typing import Optional
 
 from backend.config import get_settings
 from backend.models import RiskVeto, StrategySignal
-
-if TYPE_CHECKING:
-    pass
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +28,6 @@ class RiskManager:
     def __init__(self) -> None:
         cfg = get_settings()
 
-        # Stare interna
         self._paused: bool = False
         self._pause_reason: str = ""
         self._equity: float = 0.0
@@ -43,7 +40,6 @@ class RiskManager:
         self._open_position_count: int = 0
         self._open_symbols: set[str] = set()
 
-        # Configuratie
         self._max_positions       = cfg.max_open_positions
         self._risk_per_trade      = cfg.risk_per_trade
         self._max_daily_loss      = cfg.max_daily_loss_pct
@@ -60,22 +56,18 @@ class RiskManager:
 
     @property
     def peak_equity(self) -> float:
-        """🟡 Cel mai mare nivel de equity atins — pentru drawdown calc in /metrics."""
         return self._peak_equity
 
     @property
     def consecutive_losses(self) -> int:
-        """🟡 Nr. de pierderi consecutive curente."""
         return self._consecutive_losses
 
     @property
     def daily_pnl(self) -> float:
-        """🟡 PnL realizat azi (pozitiv = profit, negativ = pierdere)."""
         return self._daily_pnl
 
     @property
     def max_drawdown_seen(self) -> float:
-        """🟡 Cel mai mare drawdown observat (fractie, ex: 0.05 = 5%)."""
         return self._max_drawdown_seen
 
     # ─────────────────────────────────────────────────────────── equity sync
@@ -86,26 +78,21 @@ class RiskManager:
         if equity > self._peak_equity:
             self._peak_equity = equity
 
-        # Actualizeaza daily PnL
         if self._daily_start_equity > 0:
             self._daily_pnl = equity - self._daily_start_equity
         else:
             self._daily_start_equity = equity
 
-        # Calculeaza si track-uieste drawdown
         if self._peak_equity > 0:
             current_dd = 1.0 - (equity / self._peak_equity)
             if current_dd > self._max_drawdown_seen:
                 self._max_drawdown_seen = current_dd
-
-            # Emergency stop la drawdown maxim
             if current_dd >= self._max_drawdown:
                 if not self._paused:
                     self.pause(
                         reason=f"max_drawdown_breach: {current_dd:.2%} >= {self._max_drawdown:.2%}"
                     )
 
-        # Daily loss stop
         if self._daily_start_equity > 0:
             daily_loss_pct = -self._daily_pnl / self._daily_start_equity
             if daily_loss_pct >= self._max_daily_loss and not self._paused:
@@ -123,27 +110,22 @@ class RiskManager:
         if self._paused:
             return RiskVeto.PAUSED
 
-        # Drawdown emergency (double-check, update_equity poate fi intarziat)
         if self._peak_equity > 0:
             current_dd = 1.0 - (self._equity / self._peak_equity)
             if current_dd >= self._max_drawdown:
                 return RiskVeto.MAX_DRAWDOWN
 
-        # Daily loss
         if self._daily_start_equity > 0:
             daily_loss_pct = -self._daily_pnl / self._daily_start_equity
             if daily_loss_pct >= self._max_daily_loss:
                 return RiskVeto.DAILY_LOSS
 
-        # Max pozitii
         if self._open_position_count >= self._max_positions:
             return RiskVeto.MAX_POSITIONS
 
-        # One per symbol
         if signal.symbol in self._open_symbols:
             return RiskVeto.SYMBOL_ALREADY_OPEN
 
-        # Cooldown dupa SL
         if self._last_loss_time is not None:
             elapsed = (
                 datetime.now(timezone.utc) - self._last_loss_time
@@ -151,11 +133,9 @@ class RiskManager:
             if elapsed < self._cooldown_minutes:
                 return RiskVeto.COOLDOWN
 
-        # Consecutive losses
         if self._consecutive_losses >= self._max_consec_losses:
             return RiskVeto.CONSECUTIVE_LOSSES
 
-        # Min RR check
         if signal.stop_loss and signal.take_profit_1 and signal.entry_price:
             risk   = abs(signal.entry_price - signal.stop_loss)
             reward = abs(signal.take_profit_1 - signal.entry_price)
@@ -167,15 +147,23 @@ class RiskManager:
     # ──────────────────────────────────────────────────── trade outcome sync
 
     def on_trade_closed(self, pnl: float, symbol: str) -> None:
-        """Apelat de ExecutionEngine/AutomationEngine la inchiderea unui trade."""
+        """Apelat de AutomationEngine la inchiderea unui trade cu realized_pnl."""
         self._open_position_count = max(0, self._open_position_count - 1)
         self._open_symbols.discard(symbol)
 
         if pnl < 0:
             self._consecutive_losses += 1
             self._last_loss_time = datetime.now(timezone.utc)
+            logger.info(
+                "[risk] trade closed LOSS: symbol=%s pnl=%.4f consecutive_losses=%d",
+                symbol, pnl, self._consecutive_losses,
+            )
         else:
             self._consecutive_losses = 0
+            logger.info(
+                "[risk] trade closed WIN: symbol=%s pnl=%.4f",
+                symbol, pnl,
+            )
 
     def on_position_opened(self, symbol: str) -> None:
         self._open_position_count += 1
@@ -194,7 +182,25 @@ class RiskManager:
         logger.info("[risk] RESUMED")
 
     def reset_daily(self) -> None:
-        """Apelat la midnight reset de AutomationEngine."""
-        self._daily_start_equity = self._equity
+        """
+        Apelat la midnight reset de AutomationEngine.
+
+        🟡 FIX #4: Guard explicit — nu reseteaza daily_start_equity
+        daca equity == 0 (ex: Binance offline, update_equity() nu a fost apelat).
+        Fara guard, _daily_start_equity ar ramane la valoarea din ziua anterioara,
+        cauzand calcul daily_loss deplasat pentru toata ziua urmatoare.
+        """
+        if self._equity > 0:
+            self._daily_start_equity = self._equity
+        else:
+            logger.warning(
+                "[risk] reset_daily: equity=0, _daily_start_equity NOT updated "
+                "(Binance offline?). Keeping previous value=%.2f",
+                self._daily_start_equity,
+            )
         self._daily_pnl = 0.0
-        logger.info("[risk] Daily counters reset")
+        logger.info(
+            "[risk] Daily counters reset — equity=%.2f daily_start=%.2f",
+            self._equity,
+            self._daily_start_equity,
+        )
