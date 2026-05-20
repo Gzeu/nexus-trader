@@ -6,6 +6,10 @@ CHANGELOG:
                      ca properties publice.
   🟡 FIX #4 (curr) : reset_daily() are guard explicit — nu reseteaza daily_start_equity
                      daca equity == 0 (ex: Binance offline la midnight).
+  🟡 FIX D         : _open_position_count derivat autoritar din len(_open_symbols).
+                     Anterior: count += 1 independent de set.add() → count=2 pe acelasi simbol
+                     daca on_position_opened() era apelat dublu.
+                     Acum: count = len(set) in ambele metode — sursa unica de adevar.
 """
 from __future__ import annotations
 
@@ -37,9 +41,10 @@ class RiskManager:
         self._consecutive_losses: int = 0
         self._last_loss_time: Optional[datetime] = None
         self._max_drawdown_seen: float = 0.0
-        self._open_position_count: int = 0
         self._open_symbols: set[str] = set()
 
+        # 🟡 FIX D: _open_position_count e derivat din _open_symbols, nu mentinut separat.
+        # Proprietatea de mai jos garanteaza sincronizarea — nu mai exista stare duplicata.
         self._max_positions       = cfg.max_open_positions
         self._risk_per_trade      = cfg.risk_per_trade
         self._max_daily_loss      = cfg.max_daily_loss_pct
@@ -53,6 +58,11 @@ class RiskManager:
     @property
     def is_paused(self) -> bool:
         return self._paused
+
+    @property
+    def open_position_count(self) -> int:
+        """🟡 FIX D: sursa unica de adevar — derivat din set, nu mentinut separat."""
+        return len(self._open_symbols)
 
     @property
     def peak_equity(self) -> float:
@@ -73,7 +83,7 @@ class RiskManager:
     # ─────────────────────────────────────────────────────────── equity sync
 
     def update_equity(self, equity: float) -> None:
-        """Apelat de PortfolioEngine dupa fiecare reconciliere sau fill."""
+        """Apelat de AutomationEngine dupa fiecare order fill sau reconciliere."""
         self._equity = equity
         if equity > self._peak_equity:
             self._peak_equity = equity
@@ -120,7 +130,8 @@ class RiskManager:
             if daily_loss_pct >= self._max_daily_loss:
                 return RiskVeto.DAILY_LOSS
 
-        if self._open_position_count >= self._max_positions:
+        # 🟡 FIX D: foloseste property derivat — garantat sincronizat cu _open_symbols
+        if self.open_position_count >= self._max_positions:
             return RiskVeto.MAX_POSITIONS
 
         if signal.symbol in self._open_symbols:
@@ -148,26 +159,30 @@ class RiskManager:
 
     def on_trade_closed(self, pnl: float, symbol: str) -> None:
         """Apelat de AutomationEngine la inchiderea unui trade cu realized_pnl."""
-        self._open_position_count = max(0, self._open_position_count - 1)
         self._open_symbols.discard(symbol)
+        # 🟡 FIX D: count derivat autoritar — nu mai e mentinute separat
 
         if pnl < 0:
             self._consecutive_losses += 1
             self._last_loss_time = datetime.now(timezone.utc)
             logger.info(
-                "[risk] trade closed LOSS: symbol=%s pnl=%.4f consecutive_losses=%d",
-                symbol, pnl, self._consecutive_losses,
+                "[risk] trade closed LOSS: symbol=%s pnl=%.4f consecutive_losses=%d open=%d",
+                symbol, pnl, self._consecutive_losses, self.open_position_count,
             )
         else:
             self._consecutive_losses = 0
             logger.info(
-                "[risk] trade closed WIN: symbol=%s pnl=%.4f",
-                symbol, pnl,
+                "[risk] trade closed WIN: symbol=%s pnl=%.4f open=%d",
+                symbol, pnl, self.open_position_count,
             )
 
     def on_position_opened(self, symbol: str) -> None:
-        self._open_position_count += 1
+        """🟡 FIX D: set.add() e idempotent — count e derivat din len(set), nu incrementat."""
         self._open_symbols.add(symbol)
+        logger.debug(
+            "[risk] position opened: symbol=%s open_count=%d",
+            symbol, self.open_position_count,
+        )
 
     # ────────────────────────────────────────────────────────── pause / resume
 
@@ -187,8 +202,6 @@ class RiskManager:
 
         🟡 FIX #4: Guard explicit — nu reseteaza daily_start_equity
         daca equity == 0 (ex: Binance offline, update_equity() nu a fost apelat).
-        Fara guard, _daily_start_equity ar ramane la valoarea din ziua anterioara,
-        cauzand calcul daily_loss deplasat pentru toata ziua urmatoare.
         """
         if self._equity > 0:
             self._daily_start_equity = self._equity

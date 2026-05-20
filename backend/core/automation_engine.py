@@ -2,17 +2,21 @@
 AutomationEngine — scheduler + event emitter pentru trading automat.
 
 CHANGELOG:
-  🔴 FIX #1 (prev) : _placed_ids TTL-based (Dict[str, float] + monotonic())
-  🔴 FIX #3 (prev) : realized_pnl calculat corect la on_trade_closed()
-  🔴 FIX #1 (curr) : pos.side normalization — check 'SHORT'|'SELL' pentru Futures
-  🟠 FIX #2 (prev) : _manage_open_positions() foloseste portfolio.price_cache (property public)
-  🟠 FIX #3 (curr) : getattr(cfg, 'order_timeout_seconds', 15) → cfg.order_timeout_seconds
-                     Elimina accesul unsafe la atribut optional — config.py garanteaza campul.
-  🟡 FIX #4 (prev) : _seen_candles cleanup periodic la fiecare 1000 ticks.
-  🟡 FIX #5 (prev) : _midnight_reset() face evict smart pe seen_candles (TTL-based)
-  🟡 FIX #2 (curr) : _midnight_reset() trim cap la 20 — previne acumulare la interval=60m
-  🟡 FIX #5 (curr) : _seen_candles init consistent cu deque(maxlen=_SEEN_CANDLES_MAXLEN)
-  🟡 FIX #6 (prev) : place_order() wrapped cu asyncio.wait_for(cfg.order_timeout_seconds)
+  🔴 FIX A       : risk.update_equity() apelat dupa place_order() si dupa close pozitie
+                   Fara acest apel, RiskManager vedea _equity=0 → drawdown calculat fata
+                   de 0 → ZeroDivisionError sau veto imediat la primul semnal.
+  🟠 FIX B       : dublu assignment 'order_timeout = cfg = get_settings()' eliminat.
+                   Prima linie seta order_timeout = AppSettings (obiect!), suprascrisa imediat.
+  🔴 FIX #1 (prev): _placed_ids TTL-based (Dict[str, float] + monotonic())
+  🔴 FIX #3 (prev): realized_pnl calculat corect la on_trade_closed()
+  🔴 FIX #1 (curr): pos.side normalization — check 'SHORT'|'SELL' pentru Futures
+  🟠 FIX #2 (prev): _manage_open_positions() foloseste portfolio.price_cache (property public)
+  🟠 FIX #3 (curr): getattr(cfg, 'order_timeout_seconds', 15) → cfg.order_timeout_seconds
+  🟡 FIX #4 (prev): _seen_candles cleanup periodic la fiecare 1000 ticks.
+  🟡 FIX #5 (prev): _midnight_reset() face evict smart pe seen_candles (TTL-based)
+  🟡 FIX #2 (curr): _midnight_reset() trim cap la 20 — previne acumulare la interval=60m
+  🟡 FIX #5 (curr): _seen_candles init consistent cu deque(maxlen=_SEEN_CANDLES_MAXLEN)
+  🟡 FIX #6 (prev): place_order() wrapped cu asyncio.wait_for(cfg.order_timeout_seconds)
 """
 from __future__ import annotations
 
@@ -94,8 +98,6 @@ class AutomationEngine:
         self._placed_ids: Dict[str, float] = {}
 
         # 🟡 FIX #5 (curr): _seen_candles initializat consistent cu deque(maxlen=_SEEN_CANDLES_MAXLEN)
-        # Anterior: deque() fara maxlen in _process_symbol, dar cu maxlen in __init__ la alte locuri.
-        # Acum: toate instantierile folosesc deque(maxlen=_SEEN_CANDLES_MAXLEN).
         self._seen_candles: Dict[str, deque] = {}
 
         self._events = EventEmitter()
@@ -188,7 +190,6 @@ class AutomationEngine:
         candle_key = str(getattr(signal, "candle_open_time", "") or "")
         if candle_key:
             if symbol not in self._seen_candles:
-                # 🟡 FIX #5 (curr): deque cu maxlen consistent — nu mai e deque() fara limit
                 self._seen_candles[symbol] = deque(maxlen=_SEEN_CANDLES_MAXLEN)
             if candle_key in self._seen_candles[symbol]:
                 logger.debug(
@@ -246,8 +247,7 @@ class AutomationEngine:
             logger.warning("[automation] calc_position_size returned 0 for %s", signal.symbol)
             return
 
-        # 🟠 FIX #3 (curr): cfg.order_timeout_seconds direct — nu mai e getattr() cu default hardcodat.
-        # Campul este garantat de config.py (default=15). getattr() masca absenta lui din Settings.
+        # 🟠 FIX #3 (curr): cfg.order_timeout_seconds direct
         order_timeout = cfg.order_timeout_seconds
         try:
             await asyncio.wait_for(
@@ -269,7 +269,19 @@ class AutomationEngine:
                 signal.symbol,
             )
             return
+
         self._risk.on_position_opened(signal.symbol)
+
+        # 🔴 FIX A: Sincronizeaza equity in RiskManager dupa fiecare order plasat.
+        # Fara acest apel, _equity=0 si _peak_equity=0 → drawdown check fata de 0
+        # → potential ZeroDivisionError sau veto MAX_DRAWDOWN la primul semnal.
+        equity_after = self._portfolio.get_equity()
+        self._risk.update_equity(equity_after)
+        logger.debug(
+            "[automation] risk equity synced after entry: symbol=%s equity=%.2f",
+            signal.symbol,
+            equity_after,
+        )
 
     async def _manage_open_positions(self) -> None:
         """Evalueaza exit logic pentru toate pozitiile deschise."""
@@ -300,8 +312,9 @@ class AutomationEngine:
                     close_qty = round(pos.quantity * close_fraction, 8)
                     side = "SELL" if pos.side == "BUY" else "BUY"
 
-                    # 🟠 FIX #3 (curr): cfg.order_timeout_seconds direct
-                    order_timeout = cfg = get_settings()
+                    # 🟠 FIX B: split dublu assignment — order_timeout = cfg = get_settings()
+                    # Anterior, prima linie seta order_timeout = AppSettings (obiect!), suprascrisa imediat.
+                    cfg = get_settings()
                     order_timeout = cfg.order_timeout_seconds
                     try:
                         await asyncio.wait_for(
@@ -325,10 +338,6 @@ class AutomationEngine:
                         self._portfolio.remove_position(pos.symbol)
 
                         # 🔴 FIX #1 (curr): pos.side normalization pentru Futures SHORT.
-                        # Binance Futures returneaza side='SHORT' (nu 'SELL') in raspunsul de pozitii.
-                        # Anterior: check doar 'SELL' → SHORT-urile nu multiplicau cu -1
-                        #           → realized_pnl pozitiv chiar si la pierdere
-                        #           → consecutive_losses nu se incrementa → risk manager orb.
                         is_short = pos.side.upper() in ("SELL", "SHORT")
                         realized_pnl = (price - pos.entry_price) * close_qty
                         if is_short:
@@ -338,6 +347,16 @@ class AutomationEngine:
                             pnl=realized_pnl,
                             symbol=pos.symbol,
                         )
+
+                        # 🔴 FIX A: Sincronizeaza equity dupa inchiderea pozitiei.
+                        equity_after = self._portfolio.get_equity()
+                        self._risk.update_equity(equity_after)
+                        logger.debug(
+                            "[automation] risk equity synced after close: symbol=%s equity=%.2f",
+                            pos.symbol,
+                            equity_after,
+                        )
+
                         logger.info(
                             "[automation] position CLOSED: %s realized_pnl=%.4f",
                             pos.symbol,
@@ -352,6 +371,11 @@ class AutomationEngine:
                             update={"quantity": pos.quantity - close_qty}
                         )
                         self._portfolio.update_position(updated)
+
+                        # 🔴 FIX A: Sincronizeaza equity si dupa close partial (TP1/TP2).
+                        equity_after = self._portfolio.get_equity()
+                        self._risk.update_equity(equity_after)
+
                         await self._events.emit(
                             "tp_hit",
                             {
@@ -370,19 +394,16 @@ class AutomationEngine:
         Reset daily risk counters la 00:00 UTC.
 
         🟡 FIX #5 (prev): seen_candles NU mai e golit complet (.clear()).
-        🟡 FIX #2 (curr): trim cap la _SEEN_CANDLES_KEEP_MAX (20) — previne acumulare
-                          la intervale mari (ex: interval_minutes=60 → keep=120 fara cap).
+        🟡 FIX #2 (curr): trim cap la _SEEN_CANDLES_KEEP_MAX (20).
         Formula: keep = min(max(2, interval_minutes * 2), _SEEN_CANDLES_KEEP_MAX)
         """
         self._risk.reset_daily()
 
-        # Smart evict: pastreaza ultimele N intrari per simbol, cu cap superior
         keep = min(max(2, self._interval_minutes * 2), _SEEN_CANDLES_KEEP_MAX)
         for symbol, dq in self._seen_candles.items():
             while len(dq) > keep:
                 dq.popleft()
 
-        # Sterge placed_ids expirate
         now = monotonic()
         self._placed_ids = {
             k: t for k, t in self._placed_ids.items() if now - t <= _PLACED_TTL
@@ -394,10 +415,6 @@ class AutomationEngine:
     # ──────────────────────────────────────────── TTL idempotency helpers
 
     def _register_placed_id(self, signal_id: str) -> None:
-        """
-        Inregistreaza signal_id cu timestamp monotonic.
-        Lazy GC: evict all expired entries la fiecare scriere.
-        """
         now = monotonic()
         expired = [k for k, t in self._placed_ids.items() if now - t > _PLACED_TTL]
         for k in expired:
@@ -405,7 +422,6 @@ class AutomationEngine:
         self._placed_ids[signal_id] = now
 
     def _is_duplicate(self, signal_id: str) -> bool:
-        """True daca signal_id exista SI nu a expirat. Auto-sterge entry-ul expirat."""
         t = self._placed_ids.get(signal_id)
         if t is None:
             return False
