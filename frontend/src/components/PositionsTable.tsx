@@ -132,43 +132,46 @@ export function PositionsTable({ positions, loading, onClose }: Props) {
               </tr>
             </thead>
             <tbody>
-              {sorted.map(p => (
-                <tr key={p.id}>
-                  <td>
-                    <span style={{ fontWeight: 700, fontFamily: 'var(--font-mono)' }}>{p.symbol}</span>
-                    {p.is_dry_run && <span className="badge badge-yellow" style={{ marginLeft: 6 }}>DRY</span>}
-                  </td>
-                  <td>
-                    <span className={`badge ${p.side === 'BUY' ? 'badge-green' : 'badge-red'}`}>
-                      {p.side}
-                    </span>
-                  </td>
-                  <td style={{ fontFamily: 'var(--font-mono)' }}>{p.quantity}</td>
-                  <td style={{ fontFamily: 'var(--font-mono)' }}>{p.entry_price.toFixed(2)}</td>
-                  <td style={{ fontFamily: 'var(--font-mono)', color: p.current_price >= p.entry_price ? 'var(--green)' : 'var(--red)' }}>
-                    {p.current_price.toFixed(2)}
-                  </td>
-                  <td style={{ fontFamily: 'var(--font-mono)', color: 'var(--red)' }}>{p.stop_loss.toFixed(2)}</td>
-                  <td style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
-                    <span style={{ color: p.tp1_hit ? 'var(--green)' : undefined }}>{p.take_profit_1.toFixed(2)}</span>
-                    {' / '}
-                    <span style={{ color: p.tp2_hit ? 'var(--green)' : undefined }}>{p.take_profit_2.toFixed(2)}</span>
-                  </td>
-                  <td><ProgressBar position={p} /></td>
-                  <td><PnlCell value={p.unrealized_pnl ?? 0} /></td>
-                  <td><PnlCell value={p.total_pnl} /></td>
-                  <td style={{ color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-xs)' }}>
-                    {new Date(p.opened_at).toLocaleTimeString()}
-                  </td>
-                  <td>
-                    {onClose && (
-                      <button className="btn btn-danger btn-sm" onClick={() => onClose(p.id)}>
-                        Close
-                      </button>
-                    )}
-                  </td>
-                </tr>
-              ))}
+              {sorted.map(p => {
+                const unrealizedPnl = p.unrealized_pnl ?? 0;
+                return (
+                  <tr key={p.id}>
+                    <td>
+                      <span style={{ fontWeight: 700, fontFamily: 'var(--font-mono)' }}>{p.symbol}</span>
+                      {p.is_dry_run && <span className="badge badge-yellow" style={{ marginLeft: 6 }}>DRY</span>}
+                    </td>
+                    <td>
+                      <span className={`badge ${p.side === 'BUY' ? 'badge-green' : 'badge-red'}`}>
+                        {p.side}
+                      </span>
+                    </td>
+                    <td style={{ fontFamily: 'var(--font-mono)' }}>{p.quantity}</td>
+                    <td style={{ fontFamily: 'var(--font-mono)' }}>{p.entry_price.toFixed(2)}</td>
+                    <td style={{ fontFamily: 'var(--font-mono)', color: p.current_price >= p.entry_price ? 'var(--green)' : 'var(--red)' }}>
+                      {p.current_price.toFixed(2)}
+                    </td>
+                    <td style={{ fontFamily: 'var(--font-mono)', color: 'var(--red)' }}>{p.stop_loss.toFixed(2)}</td>
+                    <td style={{ fontFamily: 'var(--font-mono)', fontSize: 'var(--text-xs)', color: 'var(--text-muted)' }}>
+                      <span style={{ color: p.tp1_hit ? 'var(--green)' : undefined }}>{p.take_profit_1.toFixed(2)}</span>
+                      {' / '}
+                      <span style={{ color: p.tp2_hit ? 'var(--green)' : undefined }}>{p.take_profit_2.toFixed(2)}</span>
+                    </td>
+                    <td><ProgressBar position={p} /></td>
+                    <td><PnlCell value={unrealizedPnl} /></td>
+                    <td><PnlCell value={p.total_pnl} /></td>
+                    <td style={{ color: 'var(--text-faint)', fontFamily: 'var(--font-mono)', fontSize: 'var(--text-xs)' }}>
+                      {new Date(p.opened_at).toLocaleTimeString()}
+                    </td>
+                    <td>
+                      {onClose && (
+                        <button className="btn btn-danger btn-sm" onClick={() => onClose(p.id)}>
+                          Close
+                        </button>
+                      )}
+                    </td>
+                  </tr>
+                );
+              })}
             </tbody>
           </table>
         </div>

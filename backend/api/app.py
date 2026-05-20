@@ -6,6 +6,7 @@ CHANGELOG:
      startup-ul la infinit daca Binance e lent sau API key-ul e invalid.
      La timeout: serverul porneste in stare not_reconciled (trading blocat),
      logheza CRITICAL si trimite Telegram alert.
+  🟢 settings_routes inregistrat in create_app() — GET/PATCH /api/v1/settings functional.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api.routes import router as main_router
+from backend.api.settings_routes import router as settings_router
 from backend.api.state import AppState, set_state
 from backend.api.websocket import manager as ws_manager
 from backend.api.websocket import router as ws_router
@@ -120,6 +122,7 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(main_router, prefix="/api/v1")
+    app.include_router(settings_router)   # prefix /api/v1 definit intern in settings_routes.py
     app.include_router(ws_router)
 
     return app
