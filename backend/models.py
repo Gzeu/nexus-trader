@@ -1,6 +1,9 @@
 """
-Pydantic v2 domain models — complete version.
-Toate modelele folosite de strategy engine, execution, portfolio si API.
+Pydantic v2 domain models — single source of truth.
+
+Toate modelele folosite de strategy engine, execution, portfolio si API
+sunt definite aici. models_extra.py este un shim de backward-compat care
+re-exporta clasele din acest fisier.
 """
 from __future__ import annotations
 
@@ -27,7 +30,6 @@ class PositionSide(str, Enum):
     """Used in trade_logic to distinguish long vs short positions."""
     LONG  = "LONG"
     SHORT = "SHORT"
-    # convenience aliases matching raw "BUY"/"SELL" side strings
     BUY   = "LONG"
     SELL  = "SHORT"
 
@@ -38,13 +40,13 @@ class OrderSide(str, Enum):
 
 
 class OrderType(str, Enum):
-    MARKET           = "MARKET"
-    LIMIT            = "LIMIT"
-    STOP_LOSS        = "STOP_LOSS"
-    STOP_LOSS_LIMIT  = "STOP_LOSS_LIMIT"
-    TAKE_PROFIT      = "TAKE_PROFIT"
+    MARKET            = "MARKET"
+    LIMIT             = "LIMIT"
+    STOP_LOSS         = "STOP_LOSS"
+    STOP_LOSS_LIMIT   = "STOP_LOSS_LIMIT"
+    TAKE_PROFIT       = "TAKE_PROFIT"
     TAKE_PROFIT_LIMIT = "TAKE_PROFIT_LIMIT"
-    OCO              = "OCO"
+    OCO               = "OCO"
 
 
 class OrderStatus(str, Enum):
@@ -55,7 +57,7 @@ class OrderStatus(str, Enum):
     CANCELED         = "CANCELED"
     REJECTED         = "REJECTED"
     EXPIRED          = "EXPIRED"
-    DRY_RUN          = "DRY_RUN"   # dry-run simulated fill
+    DRY_RUN          = "DRY_RUN"
 
 
 class RiskVeto(str, Enum):
@@ -79,19 +81,80 @@ class MarketMode(str, Enum):
 
 
 class WSEventType(str, Enum):
-    """WebSocket event type constants used by ExecutionEngine and AutomationEngine."""
-    ORDER_FILLED       = "order_filled"
-    POSITION_UPDATED   = "position_update_required"
-    POSITION_OPENED    = "position_opened"
-    POSITION_CLOSED    = "position_closed"
-    SIGNAL_CREATED     = "signal_created"
-    SIGNAL_REJECTED    = "signal_rejected"
-    TP_HIT             = "tp_hit"
-    SL_HIT             = "sl_hit"
-    RISK_EVENT         = "risk_event"
-    RECONCILE_DONE     = "reconcile_done"
-    EMERGENCY_STOP     = "emergency_stop"
-    DAILY_SUMMARY      = "daily_summary"
+    ORDER_FILLED     = "order_filled"
+    POSITION_UPDATED = "position_update_required"
+    POSITION_OPENED  = "position_opened"
+    POSITION_CLOSED  = "position_closed"
+    SIGNAL_CREATED   = "signal_created"
+    SIGNAL_REJECTED  = "signal_rejected"
+    TP_HIT           = "tp_hit"
+    SL_HIT           = "sl_hit"
+    RISK_EVENT       = "risk_event"
+    RECONCILE_DONE   = "reconcile_done"
+    EMERGENCY_STOP   = "emergency_stop"
+    DAILY_SUMMARY    = "daily_summary"
+
+
+# ─────────────────────────────────────────────────── account balance models
+
+class AssetBalance(BaseModel):
+    """Single spot asset balance with USDT valuation."""
+    asset: str
+    free: float = 0.0
+    locked: float = 0.0
+    total: float = 0.0
+    usdt_valuation: float = 0.0
+
+
+class FuturesAsset(BaseModel):
+    """Single futures asset row from /fapi/v2/account."""
+    asset: str
+    wallet_balance: float = 0.0
+    unrealized_profit: float = 0.0
+    margin_balance: float = 0.0
+    maint_margin: float = 0.0
+    initial_margin: float = 0.0
+    available_balance: float = 0.0
+    max_withdraw_amount: float = 0.0
+    margin_available: bool = True
+    update_time: int = 0
+
+
+class AccountInfo(BaseModel):
+    """
+    Full unified account snapshot (spot + futures).
+    Replaces the old 3-field legacy AccountInfo.
+    Returnata de GET /account si folosita intern de PortfolioEngine.
+    """
+    total_equity: float = 0.0
+    total_wallet_balance: float = 0.0
+    total_unrealized_profit: float = 0.0
+    total_margin_balance: float = 0.0
+    available_balance: float = 0.0
+    total_position_initial_margin: float = 0.0
+    total_open_order_initial_margin: float = 0.0
+    max_withdraw_amount: float = 0.0
+    assets: List[AssetBalance] = Field(default_factory=list)
+    futures_assets: List[FuturesAsset] = Field(default_factory=list)
+    can_trade: bool = True
+    can_withdraw: bool = True
+    can_deposit: bool = True
+    update_time: int = 0
+    account_type: str = "UNIFIED"
+    maker_commission: int = 10
+    taker_commission: int = 10
+
+
+class BalanceSummary(BaseModel):
+    """Aggregated USDT summary pentru quick-glance dashboard panel."""
+    total_usdt_value: float = 0.0
+    spot_usdt_value: float = 0.0
+    futures_usdt_value: float = 0.0
+    unrealized_pnl: float = 0.0
+    available_margin: float = 0.0
+    used_margin_pct: float = 0.0
+    top_assets: List[AssetBalance] = Field(default_factory=list)
+    last_updated: str = ""
 
 
 # ─────────────────────────────────────────────────── signal
@@ -101,7 +164,7 @@ class StrategySignal(BaseModel):
     symbol: str
     action: Action
     confidence: float = Field(ge=0.0, le=1.0)
-    entry_type: str = "market"           # "market" | "limit"
+    entry_type: str = "market"
     entry_price: Optional[float] = None
     stop_loss: float
     take_profit_1: float
@@ -111,7 +174,7 @@ class StrategySignal(BaseModel):
     reason: str = ""
     market_mode: MarketMode = MarketMode.SPOT
     metadata: Dict[str, Any] = Field(default_factory=dict)
-    candle_open_time: Optional[int] = None   # ms timestamp — anti-duplicate key
+    candle_open_time: Optional[int] = None
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
 
 
@@ -145,7 +208,7 @@ class Order(BaseModel):
     quantity: Decimal = Decimal("0")
     filled_quantity: Decimal = Decimal("0")
     avg_fill_price: Optional[Decimal] = None
-    price: Optional[Decimal] = None              # limit price
+    price: Optional[Decimal] = None
     stop_price: Optional[Decimal] = None
     status: OrderStatus = OrderStatus.NEW
     market_mode: MarketMode = MarketMode.SPOT
@@ -156,7 +219,6 @@ class Order(BaseModel):
     updated_at: Optional[datetime] = None
     raw_response: Optional[Dict[str, Any]] = None
 
-    # legacy aliases kept for backward compat
     @property
     def filled_qty(self) -> Decimal:
         return self.filled_quantity
@@ -166,13 +228,11 @@ class Order(BaseModel):
         return self.avg_fill_price
 
 
-# ─────────────────────────────────────────────────── FilledOrder (alias used by execution_engine)
-
 class FilledOrder(Order):
     """
     Alias / subclass of Order representing a confirmed fill.
-    ExecutionEngine imports this; it is functionally identical to Order
-    but semantically communicates that the order has been executed.
+    Functionally identical to Order but semantically communicates
+    that the order has been executed.
     """
     pass
 
@@ -181,7 +241,7 @@ class FilledOrder(Order):
 
 class Position(BaseModel):
     symbol: str
-    side: str                             # "BUY" | "SELL" | "LONG" | "SHORT"
+    side: str
     quantity: float
     entry_price: float
     current_price: float = 0.0
@@ -192,7 +252,7 @@ class Position(BaseModel):
     tp1_hit: bool = False
     tp2_hit: bool = False
     breakeven_set: bool = False
-    at_breakeven: bool = False            # alias used by trade_logic
+    at_breakeven: bool = False
     strategy: str = ""
     market_mode: MarketMode = MarketMode.SPOT
     opened_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
@@ -218,7 +278,6 @@ class Position(BaseModel):
 
     @property
     def position_side(self) -> PositionSide:
-        """Normalize side string → PositionSide enum."""
         if self.side.upper() in ("BUY", "LONG"):
             return PositionSide.LONG
         return PositionSide.SHORT
@@ -275,18 +334,6 @@ class ReconciliationResult(BaseModel):
 # ─────────────────────────────────────────────────── websocket events
 
 class WSEvent(BaseModel):
-    event: str                            # use WSEventType values
+    event: str
     payload: Dict[str, Any] = Field(default_factory=dict)
     timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-
-# ─────────────────────────────────────────────────── account
-
-class AccountInfo(BaseModel):
-    """Account balance summary used by reconcile() and /balance endpoint."""
-    total_equity: float = 0.0
-    available_balance: float = 0.0
-    unrealized_pnl: float = 0.0
-    mode: str = "SPOT"
-    asset: str = "USDT"
-    updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
