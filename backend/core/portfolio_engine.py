@@ -5,6 +5,8 @@ CHANGELOG:
   🔴 FIX #1 (prev): _fetch_raw_equity() calculeaza equity USDT complet pentru spot-only.
   🔴 FIX #1 (prev): get_account_info() are fallback explicit pentru spot-only.
   🔴 FIX #1 (curr): reconcile() transmite futures=True la get_open_orders() cand mode=futures.
+  🔴 FIX #4 (curr): remove_position() idempotent — returneaza None cu WARNING daca simbolul
+                    nu exista in loc sa arunce KeyError implicit sau sa fie ignorat silentios.
   🟠 FIX #2 : price_cache expus ca property public — elimina accesul fragil la atribut privat
                din automation_engine (_portfolio._price_cache → _portfolio.price_cache).
   ➕ ADD     : update_position() — folosit de automation_engine la partial close.
@@ -282,7 +284,26 @@ class PortfolioEngine:
         self._positions[position.symbol] = position
 
     def remove_position(self, symbol: str) -> Optional[Position]:
-        return self._positions.pop(symbol, None)
+        """
+        🔴 FIX #4 (curr): remove_position() idempotent.
+
+        Anterior: dict.pop(symbol, None) returna None silentios — caller nu stia
+        daca pozitia a existat sau nu → possible double-close bug la reconnect.
+
+        Acum: daca simbolul nu exista, logheaza WARNING explicit (audit trail) si
+        returneaza None. Caller poate detecta discrepanta fara try/except.
+
+        Nu se arunca exceptie — metoda ramane non-raising pentru compatibilitate
+        cu _manage_open_positions() din automation_engine.
+        """
+        position = self._positions.pop(symbol, None)
+        if position is None:
+            logger.warning(
+                "[portfolio] remove_position(%s): symbol not found in local state — "
+                "possible double-close or reconciliation drift.",
+                symbol,
+            )
+        return position
 
     def update_position(self, position: Position) -> None:
         """Actualizeaza o pozitie existenta (e.g. dupa partial close)."""

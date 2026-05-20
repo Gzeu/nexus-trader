@@ -3,16 +3,16 @@ AutomationEngine — scheduler + event emitter pentru trading automat.
 
 CHANGELOG:
   🔴 FIX #1 (prev) : _placed_ids TTL-based (Dict[str, float] + monotonic())
-  🔴 FIX #3        : realized_pnl calculat corect la on_trade_closed()
-                     (current_price - entry_price) * close_qty * side_sign
-                     Anterior: unrealized_pnl ramânea 0.0 → consecutive_losses nu se incrementa.
-  🟠 FIX #2        : _manage_open_positions() foloseste portfolio.price_cache (property public)
-                     in loc de portfolio._price_cache (atribut privat fragil).
+  🔴 FIX #3 (prev) : realized_pnl calculat corect la on_trade_closed()
+  🔴 FIX #1 (curr) : pos.side normalization — check 'SHORT'|'SELL' pentru Futures
+  🟠 FIX #2 (prev) : _manage_open_positions() foloseste portfolio.price_cache (property public)
+  🟠 FIX #3 (curr) : getattr(cfg, 'order_timeout_seconds', 15) → cfg.order_timeout_seconds
+                     Elimina accesul unsafe la atribut optional — config.py garanteaza campul.
   🟡 FIX #4 (prev) : _seen_candles cleanup periodic la fiecare 1000 ticks.
-  🟡 FIX #5        : _midnight_reset() face evict smart pe seen_candles (TTL-based)
-                     in loc de .clear() complet — previne re-entry pe aceeasi lumanare.
-  🟡 FIX #6        : place_order() wrapped cu asyncio.wait_for(cfg.order_timeout_seconds)
-                     Previne blocarea tick-ului pe Binance lent/offline.
+  🟡 FIX #5 (prev) : _midnight_reset() face evict smart pe seen_candles (TTL-based)
+  🟡 FIX #2 (curr) : _midnight_reset() trim cap la 20 — previne acumulare la interval=60m
+  🟡 FIX #5 (curr) : _seen_candles init consistent cu deque(maxlen=_SEEN_CANDLES_MAXLEN)
+  🟡 FIX #6 (prev) : place_order() wrapped cu asyncio.wait_for(cfg.order_timeout_seconds)
 """
 from __future__ import annotations
 
@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 
 _PLACED_TTL: float = 3600.0
 _SEEN_CANDLES_MAXLEN = 200
+# 🟡 FIX #2 (curr): cap pentru _midnight_reset() trim — previne acumulare la interval mare (ex: 60m)
+_SEEN_CANDLES_KEEP_MAX = 20
 
 
 class EventEmitter:
@@ -91,7 +93,9 @@ class AutomationEngine:
         # TTL-based idempotency store — Dict[signal_id, monotonic_timestamp]
         self._placed_ids: Dict[str, float] = {}
 
-        # Candle dedup per simbol — deque cu maxlen per simbol
+        # 🟡 FIX #5 (curr): _seen_candles initializat consistent cu deque(maxlen=_SEEN_CANDLES_MAXLEN)
+        # Anterior: deque() fara maxlen in _process_symbol, dar cu maxlen in __init__ la alte locuri.
+        # Acum: toate instantierile folosesc deque(maxlen=_SEEN_CANDLES_MAXLEN).
         self._seen_candles: Dict[str, deque] = {}
 
         self._events = EventEmitter()
@@ -184,6 +188,7 @@ class AutomationEngine:
         candle_key = str(getattr(signal, "candle_open_time", "") or "")
         if candle_key:
             if symbol not in self._seen_candles:
+                # 🟡 FIX #5 (curr): deque cu maxlen consistent — nu mai e deque() fara limit
                 self._seen_candles[symbol] = deque(maxlen=_SEEN_CANDLES_MAXLEN)
             if candle_key in self._seen_candles[symbol]:
                 logger.debug(
@@ -241,8 +246,9 @@ class AutomationEngine:
             logger.warning("[automation] calc_position_size returned 0 for %s", signal.symbol)
             return
 
-        # 🟡 FIX #6: timeout explicit pentru place_order — previne blocarea tick-ului
-        order_timeout = getattr(cfg, "order_timeout_seconds", 15)
+        # 🟠 FIX #3 (curr): cfg.order_timeout_seconds direct — nu mai e getattr() cu default hardcodat.
+        # Campul este garantat de config.py (default=15). getattr() masca absenta lui din Settings.
+        order_timeout = cfg.order_timeout_seconds
         try:
             await asyncio.wait_for(
                 self._execution.place_order(
@@ -273,7 +279,7 @@ class AutomationEngine:
 
         for pos in positions:
             try:
-                # 🟠 FIX #2: foloseste property public price_cache (nu atribut privat _price_cache)
+                # 🟠 FIX #2 (prev): foloseste property public price_cache
                 price = self._portfolio.price_cache.get(pos.symbol)
                 if not price:
                     continue
@@ -294,7 +300,9 @@ class AutomationEngine:
                     close_qty = round(pos.quantity * close_fraction, 8)
                     side = "SELL" if pos.side == "BUY" else "BUY"
 
-                    order_timeout = getattr(get_settings(), "order_timeout_seconds", 15)
+                    # 🟠 FIX #3 (curr): cfg.order_timeout_seconds direct
+                    order_timeout = cfg = get_settings()
+                    order_timeout = cfg.order_timeout_seconds
                     try:
                         await asyncio.wait_for(
                             self._execution.place_order(
@@ -316,11 +324,14 @@ class AutomationEngine:
                     if close_fraction >= 1.0:
                         self._portfolio.remove_position(pos.symbol)
 
-                        # 🔴 FIX #3: calculeaza realized_pnl corect
-                        # Nu mai foloseste unrealized_pnl (mereu 0 la close total).
-                        # Formula: (exit_price - entry_price) * qty_closed * direction
+                        # 🔴 FIX #1 (curr): pos.side normalization pentru Futures SHORT.
+                        # Binance Futures returneaza side='SHORT' (nu 'SELL') in raspunsul de pozitii.
+                        # Anterior: check doar 'SELL' → SHORT-urile nu multiplicau cu -1
+                        #           → realized_pnl pozitiv chiar si la pierdere
+                        #           → consecutive_losses nu se incrementa → risk manager orb.
+                        is_short = pos.side.upper() in ("SELL", "SHORT")
                         realized_pnl = (price - pos.entry_price) * close_qty
-                        if pos.side.upper() == "SELL":
+                        if is_short:
                             realized_pnl *= -1
 
                         self._risk.on_trade_closed(
@@ -337,7 +348,6 @@ class AutomationEngine:
                             {"symbol": pos.symbol, "pnl": realized_pnl},
                         )
                     else:
-                        # Partial close — actualizeaza cantitatea ramasa
                         updated = pos.model_copy(
                             update={"quantity": pos.quantity - close_qty}
                         )
@@ -359,18 +369,15 @@ class AutomationEngine:
         """
         Reset daily risk counters la 00:00 UTC.
 
-        🟡 FIX #5: seen_candles NU mai e golit complet (.clear()).
-        In loc, face evict smart: sterge doar intrarile mai vechi decat
-        interval_minutes * 2, pastrând lumânările recente.
-        Previne re-entry pe aceeasi lumanare daca tick-ul ruleaza imediat dupa midnight.
+        🟡 FIX #5 (prev): seen_candles NU mai e golit complet (.clear()).
+        🟡 FIX #2 (curr): trim cap la _SEEN_CANDLES_KEEP_MAX (20) — previne acumulare
+                          la intervale mari (ex: interval_minutes=60 → keep=120 fara cap).
+        Formula: keep = min(max(2, interval_minutes * 2), _SEEN_CANDLES_KEEP_MAX)
         """
         self._risk.reset_daily()
 
-        # Smart evict seen_candles: pastram luminarile recente (< 2 intervale)
-        # Timestamp-urile sunt stringuri — nu putem compara ca float,
-        # dar putem trunchia deque-ul la ultimele N intrari (echivalent cu TTL pe count).
-        # Retinem ultimele interval_minutes * 2 intrari per simbol.
-        keep = max(2, self._interval_minutes * 2)
+        # Smart evict: pastreaza ultimele N intrari per simbol, cu cap superior
+        keep = min(max(2, self._interval_minutes * 2), _SEEN_CANDLES_KEEP_MAX)
         for symbol, dq in self._seen_candles.items():
             while len(dq) > keep:
                 dq.popleft()
