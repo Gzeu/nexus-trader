@@ -1,6 +1,6 @@
 # Nexus Trader
 
-> **Sistem complet de trading algoritmic** — manual din TradingView și automat prin engine Python, cu sincronizare perfectă Binance ↔ Backend ↔ UI.
+> **Complete algorithmic trading system** — manual trading from TradingView and automated trading via Python engine, with perfect synchronization between Binance ↔ Backend ↔ UI.
 
 [![Python 3.11+](https://img.shields.io/badge/python-3.11+-blue.svg)](https://www.python.org/)
 [![FastAPI](https://img.shields.io/badge/FastAPI-async-green.svg)](https://fastapi.tiangolo.com/)
@@ -8,82 +8,82 @@
 
 ---
 
-## Ce face
+## What it does
 
-Nexus Trader combină trading manual prin TradingView cu un engine Python autonom, pe același cont Binance, fără conflicte și fără ordere duplicate.
+Nexus Trader combines manual trading through TradingView with an autonomous Python engine, on the same Binance account, without conflicts and without duplicate orders.
 
-- **Trading manual** — plasezi ordere direct din TradingView, ca la orice broker. Pozițiile și fill-urile apar instant în UI.
-- **Trading automat** — engine-ul rulează strategiile configurate (Trend, Mean Reversion, Breakout sau un composite cu weighted voting) și plasează ordere fără intervenție umană.
-- **Sincronizare bidirecțională** — orice schimbare pe Binance (fill, SL atins, lichidare) se reflectă imediat în TradingView și în starea internă.
-- **Spot și Futures** — configurabil per simbol, cu leverage, whitelist și mod separat.
+- **Manual trading** — place orders directly from TradingView, just like any broker. Positions and fills appear instantly in the UI.
+- **Automated trading** — the engine runs configured strategies (Trend, Mean Reversion, Breakout, or a composite with weighted voting) and places orders without human intervention.
+- **Bidirectional sync** — any change on Binance (fill, SL hit, liquidation) is immediately reflected in TradingView and in internal state.
+- **Spot and Futures** — configurable per symbol, with leverage, whitelist, and separate mode.
 
 ---
 
-## Cerințe
+## Requirements
 
 - Python 3.11+
-- Node.js 18+ (pentru broker adapter TypeScript)
-- Cont Binance cu API key (testnet recomandat la început)
-- Opțional: PostgreSQL pentru jurnal persistent, Redis pentru idempotency
+- Node.js 18+ (for the TypeScript broker adapter)
+- Binance account with API key (testnet recommended at first)
+- Optional: PostgreSQL for persistent journal, Redis for idempotency
 
 ---
 
-## Instalare și pornire
+## Installation & Quickstart
 
 ```bash
-# 1. Clonează și instalează dependențele
+# 1. Clone and install dependencies
 git clone https://github.com/Gzeu/nexus-trader.git
 cd nexus-trader
 pip install -r requirements.txt
 
-# 2. Configurează
+# 2. Configure
 cp .env.example .env
-# Deschide .env și setează cel puțin:
+# Open .env and set at minimum:
 #   BINANCE_API_KEY=...
 #   BINANCE_API_SECRET=...
-# DRY_RUN=true și TESTNET=true sunt active implicit — nu riști nimic la primul start
+# DRY_RUN=true and TESTNET=true are active by default — no risk on first start
 
-# 3. Pornește serverul
+# 3. Start the server
 uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000
 
-# 4. Verifică starea
+# 4. Check status
 curl http://localhost:8000/api/v1/health
 ```
 
-> ⚠️ **Nu activa live trading fără un backtest prealabil.** Vezi secțiunea [Backtesting](#backtesting).  
-> ⚠️ **Rulează minimum 24h pe testnet cu `DRY_RUN=true` înainte de mainnet.**
+> ⚠️ **Do not enable live trading without prior backtesting.** See the [Backtesting](#backtesting) section.
+> ⚠️ **Run for at least 24h on testnet with `DRY_RUN=true` before going mainnet.**
 
 ---
 
-## Integrare TradingView
+## TradingView Integration
 
 ```typescript
 import { TradingSystemBroker } from './broker_adapter/tradingview_broker';
 
 const widget = new TradingView.widget({
-  // ...alte opțiuni
+  // ...other options
   brokerFactory: (host) => new TradingSystemBroker(host, 'http://localhost:8000'),
 });
 ```
 
-Fill-urile și actualizările de poziții sunt trimise prin WebSocket la `ws://localhost:8000/ws`. Broker adapter-ul reconectează automat și apelează `host.orderUpdate()` / `host.positionUpdate()` la fiecare eveniment relevant.
+Fills and position updates are pushed via WebSocket at `ws://localhost:8000/ws`. The broker adapter auto-reconnects and calls `host.orderUpdate()` / `host.positionUpdate()` on every relevant event.
 
 ---
 
 ## Backtesting
 
-Engine-ul de backtesting descarcă date reale de pe Binance (fără API key) și rulează o simulare completă cu comisioane, slippage, TP parțiale și logică de breakeven. Toate semnalele folosesc **exclusiv lumânări confirmate** — zero lookahead bias.
+The backtesting engine downloads real data from Binance (no API key required) and runs a full simulation with commissions, slippage, partial TPs, and breakeven logic. All signals use **exclusively confirmed candles** — zero lookahead bias.
 
-### Comandă rapidă
+### Quick command
 
 ```bash
-# BTCUSDT 15m — 1 an de date
+# BTCUSDT 15m — 1 year of data
 python -m backtesting.backtest_engine \
   --symbol BTCUSDT \
   --tf 15m \
   --days 365
 
-# Cu optimizator walk-forward (durează ~5 min)
+# With walk-forward optimizer (~5 min)
 python -m backtesting.backtest_engine \
   --symbol BTCUSDT \
   --tf 15m \
@@ -91,18 +91,18 @@ python -m backtesting.backtest_engine \
   --optimize
 ```
 
-### Ce generează
+### Output files
 
-| Fișier | Conținut |
-|--------|----------|
-| `backtesting/results/{symbol}_{tf}.html` | Tearsheet interactiv Plotly (equity curve, drawdown, intrări) |
-| `backtesting/results/{symbol}_{tf}_trades.csv` | Log complet al tranzacțiilor (entry, exit, PnL, motiv, bars held) |
-| `backtesting/results/{symbol}_{tf}_params.json` | Parametrii optimi din walk-forward optimizer |
+| File | Content |
+|------|---------|
+| `backtesting/results/{symbol}_{tf}.html` | Interactive Plotly tearsheet (equity curve, drawdown, entries) |
+| `backtesting/results/{symbol}_{tf}_trades.csv` | Full trade log (entry, exit, PnL, reason, bars held) |
+| `backtesting/results/{symbol}_{tf}_params.json` | Optimal parameters from walk-forward optimizer |
 
-### Praguri minime înainte de live
+### Minimum thresholds before going live
 
-| Metrică | Minim | Bun |
-|---------|-------|-----|
+| Metric | Minimum | Good |
+|--------|---------|------|
 | `win_rate` | > 0.42 | > 0.52 |
 | `profit_factor` | > 1.20 | > 1.80 |
 | `sharpe_ratio` | > 0.80 | > 1.50 |
@@ -111,153 +111,153 @@ python -m backtesting.backtest_engine \
 
 ---
 
-## Gestionarea riscului
+## Risk Management
 
-Toate verificările rulează prin `RiskManager.check_signal()` înainte de orice ordin. Dacă oricare condiție pică, semnalul este vetou-it cu un cod explicit.
+All checks run through `RiskManager.check_signal()` before any order. If any condition fails, the signal is vetoed with an explicit code.
 
 ```
-1. Sistem pauzat?                → VETO_PAUSED
-2. Drawdown maxim depășit?       → VETO_DRAWDOWN  (emergency stop automat)
-3. Limita zilnică de pierdere?   → VETO_DAILY_LOSS (auto-pauză)
-4. Prea multe poziții deschise?  → VETO_MAX_POSITIONS
-5. Simbol deja deschis?          → VETO_DUPLICATE_SYMBOL
-6. Cooldown activ după SL?       → VETO_COOLDOWN
-7. Prea multe pierderi consecutive? → VETO_CONSECUTIVE_LOSSES
-8. RR < 1.5?                     → VETO_POOR_RR
-9. Volatilitate ATR% prea mare?  → VETO_VOLATILITY
-→ OK — semnalul ajunge la execution
+1. System paused?                    → VETO_PAUSED
+2. Max drawdown exceeded?            → VETO_DRAWDOWN  (auto emergency stop)
+3. Daily loss limit reached?         → VETO_DAILY_LOSS (auto pause)
+4. Too many open positions?          → VETO_MAX_POSITIONS
+5. Symbol already open?              → VETO_DUPLICATE_SYMBOL
+6. Cooldown active after SL?         → VETO_COOLDOWN
+7. Too many consecutive losses?      → VETO_CONSECUTIVE_LOSSES
+8. RR < 1.5?                         → VETO_POOR_RR
+9. ATR% volatility too high?         → VETO_VOLATILITY
+→ OK — signal reaches execution
 ```
 
-**Sizing:** `size = (equity × RISK_PER_TRADE) / distanță_SL`. Pe Futures, rezultatul este împărțit la leverage.
+**Sizing:** `size = (equity × RISK_PER_TRADE) / sl_distance`. On Futures, the result is divided by leverage.
 
 ---
 
-## Strategii disponibile
+## Available Strategies
 
-| Strategie | Logică | Condiții optime |
-|-----------|--------|-----------------|
-| `TrendFollowingStrategy` | EMA crossover + RSI + MACD histogram + volum | Piețe în trend |
-| `MeanReversionStrategy` | Bollinger Bands + RSI oversold/overbought | Piețe range-bound |
-| `BreakoutStrategy` | High/low N lumânări + confirmare volum | Breakout din consolidare |
-| `CompositeStrategy` | Weighted voting (weights auto-normalizate) | Orice condiții de piață |
+| Strategy | Logic | Optimal conditions |
+|----------|-------|--------------------|
+| `TrendFollowingStrategy` | EMA crossover + RSI + MACD histogram + volume | Trending markets |
+| `MeanReversionStrategy` | Bollinger Bands + RSI oversold/overbought | Range-bound markets |
+| `BreakoutStrategy` | N-candle high/low + volume confirmation | Breakout from consolidation |
+| `CompositeStrategy` | Weighted voting (auto-normalized weights) | Any market conditions |
 
-`CompositeStrategy` rezolvă conflictele prin vot ponderat — semnalele sub pragul `min_consensus` sunt ignorate ca `HOLD`.
-
----
-
-## API REST
-
-| Metodă | Endpoint | Descriere |
-|--------|----------|-----------|
-| `GET` | `/api/v1/health` | Starea sistemului + reconciliation state |
-| `GET` | `/api/v1/metrics` | Analize risk + portfolio |
-| `GET` | `/api/v1/signals` | Ultimele 50 semnale din jurnal |
-| `GET` | `/api/v1/positions` | Poziții deschise |
-| `GET` | `/api/v1/account` | Balanțe + equity |
-| `POST` | `/api/v1/place_order` | Ordin manual (blocat dacă sistem pauzat) |
-| `POST` | `/api/v1/emergency_stop` | Oprire imediată + pauză automată |
-| `POST` | `/api/v1/resume_trading` | Reia după pauză |
-| `POST` | `/api/v1/cancel_all` | Anulează toate ordinele deschise |
-| `POST` | `/api/v1/close_all` | Închide toate pozițiile la market |
-| `WS` | `/ws` | Evenimente live → TradingView UI |
-
-> `/docs` și `/redoc` sunt disponibile doar când `IS_PRODUCTION=false` (default local).
+`CompositeStrategy` resolves conflicts through weighted voting — signals below the `min_consensus` threshold are ignored as `HOLD`.
 
 ---
 
-## Protecții de siguranță
+## REST API
 
-| Protecție | Comportament |
-|-----------|-------------|
-| **DRY_RUN** | Toate ordinele sunt simulate — zero apeluri reale la exchange |
-| **TESTNET** | Rutat pe endpoint-urile Binance testnet |
-| **Reconciliere la startup** | Trading blocat până când `portfolio.reconcile()` reușește |
-| **Zero ordere duplicate** | Idempotency keys cu TTL 1h + deduplicare per lumânare |
-| **Limita zilnică de pierdere** | Auto-pauză la −3% equity zilnic |
-| **Drawdown maxim** | Emergency stop la −12% față de peak equity |
-| **Cooldown după SL** | Lockout 15 min după un stop-loss |
-| **Pierderi consecutive** | Auto-pauză după N pierderi la rând (configurabil) |
-| **Emergency stop** | `POST /api/v1/emergency_stop` + alertă Telegram |
-| **Drift detection** | Reconciliere periodică detectează divergența Binance ↔ stare locală |
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| `GET` | `/api/v1/health` | System status + reconciliation state |
+| `GET` | `/api/v1/metrics` | Risk + portfolio analytics |
+| `GET` | `/api/v1/signals` | Last 50 signals from journal |
+| `GET` | `/api/v1/positions` | Open positions |
+| `GET` | `/api/v1/account` | Balances + equity |
+| `POST` | `/api/v1/place_order` | Manual order (blocked if system paused) |
+| `POST` | `/api/v1/emergency_stop` | Immediate stop + auto pause |
+| `POST` | `/api/v1/resume_trading` | Resume after pause |
+| `POST` | `/api/v1/cancel_all` | Cancel all open orders |
+| `POST` | `/api/v1/close_all` | Close all positions at market |
+| `WS` | `/ws` | Live events → TradingView UI |
+
+> `/docs` and `/redoc` are available only when `IS_PRODUCTION=false` (default locally).
 
 ---
 
-## Variabile de configurare
+## Safety Protections
 
-Setările complete sunt în `.env.example`. Cele mai importante:
+| Protection | Behavior |
+|------------|----------|
+| **DRY_RUN** | All orders are simulated — zero real exchange calls |
+| **TESTNET** | Routed to Binance testnet endpoints |
+| **Startup reconciliation** | Trading blocked until `portfolio.reconcile()` succeeds |
+| **Zero duplicate orders** | Idempotency keys with 1h TTL + per-candle deduplication |
+| **Daily loss limit** | Auto-pause at −3% daily equity |
+| **Max drawdown** | Emergency stop at −12% from peak equity |
+| **Cooldown after SL** | 15-minute lockout after a stop-loss |
+| **Consecutive losses** | Auto-pause after N consecutive losses (configurable) |
+| **Emergency stop** | `POST /api/v1/emergency_stop` + Telegram alert |
+| **Drift detection** | Periodic reconciliation detects Binance ↔ local state divergence |
+
+---
+
+## Configuration Variables
+
+Full settings are in `.env.example`. The most important ones:
 
 ```env
-# Credențiale Binance
+# Binance credentials
 BINANCE_API_KEY=your_key
 BINANCE_API_SECRET=your_secret
 
-# Mod de operare (implicit sigur)
-DRY_RUN=true           # true = simulare completă, fără ordere reale
-TESTNET=true           # true = endpoint-uri Binance testnet
-IS_PRODUCTION=false    # ⚠️ Setează true înainte de orice deploy live (ascunde /docs)
+# Operating mode (safe defaults)
+DRY_RUN=true           # true = full simulation, no real orders
+TESTNET=true           # true = Binance testnet endpoints
+IS_PRODUCTION=false    # ⚠️ Set true before any live deploy (hides /docs)
 
-# Timeout-uri (mărește pe testnet)
+# Timeouts (increase on testnet)
 ORDER_TIMEOUT_SECONDS=15
 RECONCILE_TIMEOUT_SECONDS=60
 
-# Parametri de risc
-RISK_PER_TRADE=0.01    # 1% risc per tranzacție
-MAX_DAILY_LOSS=0.03    # Pauză automată la -3% pierdere zilnică
-MAX_DRAWDOWN=0.12      # Emergency stop la -12% față de peak
-MAX_POSITIONS=3        # Număr maxim de poziții simultane
+# Risk parameters
+RISK_PER_TRADE=0.01    # 1% risk per trade
+MAX_DAILY_LOSS=0.03    # Auto-pause at -3% daily loss
+MAX_DRAWDOWN=0.12      # Emergency stop at -12% from peak
+MAX_POSITIONS=3        # Maximum simultaneous positions
 FUTURES_LEVERAGE=5
 
-# Simboluri permise
+# Allowed symbols
 SPOT_WHITELIST=BTCUSDT,ETHUSDT
 FUTURES_WHITELIST=BTCUSDT
 
-# Automatizare
+# Automation
 SCAN_INTERVAL_SECONDS=60
 PRIMARY_TIMEFRAME=15m
 
-# Telegram (opțional)
+# Telegram (optional)
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_CHAT_ID=
 ```
 
 ---
 
-## Structura proiectului
+## Project Structure
 
 ```
 nexus-trader/
 ├── .env.example
 ├── requirements.txt
 ├── backtesting/
-│   ├── backtest_engine.py       ← Backtest vectorizat + walk-forward optimizer
-│   └── results/                 ← Tearsheet-uri HTML + CSV-uri generate automat
+│   ├── backtest_engine.py       ← Vectorized backtest + walk-forward optimizer
+│   └── results/                 ← Auto-generated HTML tearsheets + CSVs
 ├── backend/
-│   ├── main.py                  ← Entry point uvicorn
+│   ├── main.py                  ← Uvicorn entry point
 │   ├── config.py                ← Pydantic v2 Settings (singleton)
-│   ├── models.py                ← Toate modelele de domeniu
+│   ├── models.py                ← All domain models
 │   ├── api/
 │   │   ├── app.py               ← FastAPI factory + lifespan
-│   │   ├── state.py             ← AppState — wiring componente
-│   │   ├── routes.py            ← Endpoint-uri REST
+│   │   ├── state.py             ← AppState — component wiring
+│   │   ├── routes.py            ← REST endpoints
 │   │   └── websocket.py         ← WebSocket broadcast hub → TradingView
 │   ├── binance/
-│   │   └── binance_client.py    ← Client async HTTP (Spot + Futures)
+│   │   └── binance_client.py    ← Async HTTP client (Spot + Futures)
 │   ├── core/
 │   │   ├── strategy_engine.py   ← BaseStrategy + Trend/MeanRev/Breakout/Composite
-│   │   ├── trade_logic.py       ← Decizii entry/exit, sizing, breakeven
+│   │   ├── trade_logic.py       ← Entry/exit decisions, sizing, breakeven
 │   │   ├── risk_manager.py      ← Risk gate, drawdown, daily loss, cooldown
-│   │   ├── execution_engine.py  ← Normalizare, idempotency, retry, dry-run
-│   │   ├── portfolio_engine.py  ← Reconciliere, sync balanțe, analize PnL
+│   │   ├── execution_engine.py  ← Normalization, idempotency, retry, dry-run
+│   │   ├── portfolio_engine.py  ← Reconciliation, balance sync, PnL analytics
 │   │   └── automation_engine.py ← APScheduler + EventEmitter + anti-dupe
 │   └── journal/
-│       ├── journal.py           ← Jurnal CSV + SQLite
-│       └── telegram_alerts.py   ← Notificări Telegram pentru evenimente critice
+│       ├── journal.py           ← CSV + SQLite journal
+│       └── telegram_alerts.py   ← Telegram notifications for critical events
 └── broker_adapter/
-    └── tradingview_broker.ts    ← Implementare completă IBrokerTerminal
+    └── tradingview_broker.ts    ← Full IBrokerTerminal implementation
 ```
 
 ---
 
-## Licență
+## License
 
-MIT — vezi [LICENSE](LICENSE).
+MIT — see [LICENSE](LICENSE).
