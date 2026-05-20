@@ -1,6 +1,14 @@
-/** ─── Nexus Trader — Dashboard data hook ───────────────────────────────── */
+/**
+ * useDashboard.ts — Dashboard data hook.
+ *
+ * FIX #7: Uses useWebSocket (single WS connection, exponential backoff).
+ * FIX #8:
+ *   - debounce(fetchAll, 500ms) — WS event bursts collapse into one fetch.
+ *   - Polling (15s) only active when WS is NOT connected (fallback mode).
+ *     When WS reconnects, polling is cleared automatically.
+ */
 'use client';
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api } from '@/lib/api';
 import { useWebSocket } from './useWebSocket';
 import type {
@@ -9,28 +17,37 @@ import type {
 } from '@/types/trading';
 
 export interface DashboardState {
-  health:      HealthStatus | null;
-  account:     AccountInfo  | null;
-  metrics:     RiskMetrics  | null;
-  positions:   Position[];
-  signals:     StrategySignal[];
-  loading:     boolean;
-  lastUpdated: Date | null;
-  wsStatus:    import('./useWebSocket').WsStatus;
-  refresh:     () => void;
+  health:        HealthStatus | null;
+  account:       AccountInfo  | null;
+  metrics:       RiskMetrics  | null;
+  positions:     Position[];
+  signals:       StrategySignal[];
+  loading:       boolean;
+  lastUpdated:   Date | null;
+  wsStatus:      import('./useWebSocket').WsStatus;
+  refresh:       () => void;
   emergencyStop: () => Promise<void>;
   resumeTrading: () => Promise<void>;
-  cancelAll:   () => Promise<void>;
-  closeAll:    () => Promise<void>;
+  cancelAll:     () => Promise<void>;
+  closeAll:      () => Promise<void>;
+}
+
+/** Minimal debounce — no lodash dependency needed */
+function debounce<T extends (...args: unknown[]) => unknown>(fn: T, ms: number): T {
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  return ((...args: unknown[]) => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => { timer = null; fn(...args); }, ms);
+  }) as T;
 }
 
 export function useDashboard(): DashboardState {
-  const [health,    setHealth]    = useState<HealthStatus | null>(null);
-  const [account,   setAccount]   = useState<AccountInfo  | null>(null);
-  const [metrics,   setMetrics]   = useState<RiskMetrics  | null>(null);
-  const [positions, setPositions] = useState<Position[]>([]);
-  const [signals,   setSignals]   = useState<StrategySignal[]>([]);
-  const [loading,   setLoading]   = useState(true);
+  const [health,      setHealth]      = useState<HealthStatus | null>(null);
+  const [account,     setAccount]     = useState<AccountInfo  | null>(null);
+  const [metrics,     setMetrics]     = useState<RiskMetrics  | null>(null);
+  const [positions,   setPositions]   = useState<Position[]>([]);
+  const [signals,     setSignals]     = useState<StrategySignal[]>([]);
+  const [loading,     setLoading]     = useState(true);
   const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
@@ -51,21 +68,47 @@ export function useDashboard(): DashboardState {
     }
   }, []);
 
+  // FIX #8 — debounced fetch for WS events: 500ms window collapses bursts
+  // useMemo keeps the debounced reference stable across renders
+  const debouncedFetch = useMemo(
+    () => debounce(fetchAll as (...args: unknown[]) => unknown, 500),
+    [fetchAll],
+  );
+
   const onWsEvent = useCallback((e: WSEvent) => {
-    if (e.event === 'position_opened' || e.event === 'position_closed' ||
-        e.event === 'order_filled'   || e.event === 'tp_hit'          ||
-        e.event === 'signal_created' || e.event === 'risk_event') {
-      void fetchAll();
-    }
-  }, [fetchAll]);
+    const relevant = new Set([
+      'position_opened', 'position_closed',
+      'order_filled',    'tp_hit',
+      'signal_created',  'risk_event',
+    ]);
+    if (relevant.has(e.event)) void debouncedFetch();
+  }, [debouncedFetch]);
 
   const { status: wsStatus } = useWebSocket({ onEvent: onWsEvent });
 
+  // Initial fetch on mount
+  useEffect(() => { void fetchAll(); }, [fetchAll]);
+
+  // FIX #8 — polling only when WS is NOT connected
+  // WS connected → clear poll; WS down → start 15s fallback poll
   useEffect(() => {
-    void fetchAll();
-    pollRef.current = setInterval(fetchAll, 15_000);
-    return () => { pollRef.current && clearInterval(pollRef.current); };
-  }, [fetchAll]);
+    if (wsStatus === 'connected') {
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+      return;
+    }
+    if (!pollRef.current) {
+      pollRef.current = setInterval(() => void fetchAll(), 15_000);
+    }
+    return () => {
+      if (pollRef.current) {
+        clearInterval(pollRef.current);
+        pollRef.current = null;
+      }
+    };
+  }, [wsStatus, fetchAll]);
 
   const emergencyStop = async () => { await api.emergencyStop(); await fetchAll(); };
   const resumeTrading = async () => { await api.resumeTrading(); await fetchAll(); };

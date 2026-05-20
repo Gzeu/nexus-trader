@@ -1,20 +1,7 @@
-'use client'
-import { useEffect, useRef } from 'react'
-import { wsClient } from '@/lib/websocket'
-
 /**
- * useWS — Subscribe to a WebSocket event.
- * Automatically connects the singleton on mount.
- * Cleans up subscription on unmount.
+ * useWS.ts — DEPRECATED re-export shim.
+ *
+ * FIX #7: useWebSocket.ts is the canonical implementation.
+ * Any component that imported useWS continues to work without changes.
  */
-export function useWS(event: string, handler: (payload: unknown) => void) {
-  const handlerRef = useRef(handler)
-  handlerRef.current = handler
-
-  useEffect(() => {
-    wsClient.connect()
-    const h = (payload: unknown) => handlerRef.current(payload)
-    wsClient.on(event, h)
-    return () => wsClient.off(event, h)
-  }, [event])
-}
+export { useWebSocket as useWS } from './useWebSocket';

@@ -1,41 +1,43 @@
-/** ─── Nexus Trader — API client (typed fetch wrappers) ─────────────────── */
-import type { AccountInfo, HealthStatus, Order, Position, RiskMetrics, StrategySignal } from '@/types/trading';
-
-const BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
-const API  = `${BASE}/api/v1`;
-
-async function get<T>(path: string): Promise<T> {
-  const res = await fetch(`${API}${path}`, { cache: 'no-store' });
-  if (!res.ok) throw new Error(`GET ${path} → ${res.status}`);
-  return res.json() as Promise<T>;
-}
-
-async function post<T>(path: string, body?: unknown): Promise<T> {
-  const res = await fetch(`${API}${path}`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  if (!res.ok) throw new Error(`POST ${path} → ${res.status}`);
-  return res.json() as Promise<T>;
-}
+/**
+ * api.ts — Single typed API client for Nexus Trader.
+ *
+ * FIX #6: All requests now go through apiFetch() from config.ts.
+ *   - Single base URL: NEXT_PUBLIC_API_BASE (replaces NEXT_PUBLIC_API_URL)
+ *   - X-API-Key header sent on every request automatically
+ *   - wsUrl() reads from config.wsUrl
+ *
+ * .env.local required vars:
+ *   NEXT_PUBLIC_API_BASE=http://localhost:8000/api/v1
+ *   NEXT_PUBLIC_WS_URL=ws://localhost:8000/ws
+ *   NEXT_PUBLIC_API_KEY=   # leave empty if backend auth is disabled
+ */
+import { apiFetch, config } from './config';
+import type {
+  AccountInfo, HealthStatus, Order,
+  Position, RiskMetrics, StrategySignal,
+} from '@/types/trading';
 
 export const api = {
-  health:        () => get<HealthStatus>('/health'),
-  account:       () => get<AccountInfo>('/account'),
-  metrics:       () => get<RiskMetrics>('/metrics'),
-  positions:     () => get<Position[]>('/positions'),
-  signals:       (limit = 20) => get<StrategySignal[]>(`/signals?limit=${limit}`),
-  orders:        () => get<Order[]>('/orders'),
+  health:    () => apiFetch<HealthStatus>('/health'),
+  account:   () => apiFetch<AccountInfo>('/account'),
+  metrics:   () => apiFetch<RiskMetrics>('/metrics'),
+  positions: () => apiFetch<Position[]>('/positions'),
+  signals:   (limit = 20) => apiFetch<StrategySignal[]>(`/signals?limit=${limit}`),
+  orders:    () => apiFetch<Order[]>('/orders'),
 
-  placeOrder:    (body: unknown) => post<Order>('/place_order', body),
-  emergencyStop: () => post<{ ok: boolean }>('/emergency_stop'),
-  resumeTrading: () => post<{ ok: boolean }>('/resume_trading'),
-  cancelAll:     () => post<{ ok: boolean }>('/cancel_all'),
-  closeAll:      () => post<{ ok: boolean }>('/close_all'),
+  placeOrder:    (body: unknown) =>
+    apiFetch<Order>('/place_order', { method: 'POST', body: JSON.stringify(body) }),
+  emergencyStop: () =>
+    apiFetch<{ ok: boolean }>('/emergency_stop', { method: 'POST' }),
+  resumeTrading: () =>
+    apiFetch<{ ok: boolean }>('/resume_trading', { method: 'POST' }),
+  cancelAll: () =>
+    apiFetch<{ ok: boolean }>('/cancel_all', { method: 'POST' }),
+  closeAll:  () =>
+    apiFetch<{ ok: boolean }>('/close_all', { method: 'POST' }),
 };
 
+/** WS URL from unified config */
 export function wsUrl(): string {
-  const base = process.env.NEXT_PUBLIC_WS_URL ?? 'ws://localhost:8000';
-  return `${base}/api/v1/ws`;
+  return config.wsUrl;
 }
