@@ -7,11 +7,12 @@ CHANGELOG:
      (nu mai returneaza _cached_equity stale=0.0)
   🔴 /signals fara response_model — returneaza List[dict] cu signal_status atasat
   🟡 peak_equity expus prin state.risk.peak_equity (property public in risk_manager)
+  🟢 /settings GET + PATCH + DELETE — runtime overrides pentru SettingsPage.tsx
 """
 from __future__ import annotations
 
 import logging
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Set
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
@@ -23,6 +24,20 @@ from backend.models_extra import AccountInfo, BalanceSummary
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
+
+# ─────────────────────────────────────────── settings store (in-memory overrides)
+
+# Cheile sensibile nu sunt returnate niciodata in GET /settings
+_SENSITIVE_KEYS: Set[str] = {
+    "binance_api_key",
+    "binance_api_secret",
+    "telegram_bot_token",
+    "telegram_chat_id",
+    "db_url",
+}
+
+# Override-uri runtime aplicate peste .env — persistă până la restart
+_settings_overrides: Dict[str, Any] = {}
 
 
 # ─────────────────────────────────────────── health / status
@@ -64,7 +79,7 @@ async def metrics(state: AppState = Depends(get_state)) -> Dict[str, Any]:
     rm = state.portfolio.get_risk_metrics()
 
     # 3. Risk manager live state (peak_equity acum property public)
-    peak_eq = state.risk.peak_equity  # 🟡 property public adaugat in risk_manager.py
+    peak_eq = state.risk.peak_equity
     drawdown_pct = round(
         (1.0 - total_equity / peak_eq) * 100, 2
     ) if peak_eq > 0 else 0.0
@@ -132,6 +147,96 @@ async def get_signals(
     Acum returneaza direct List[dict].
     """
     return state.automation.get_recent_signals(limit=limit)
+
+
+# ─────────────────────────────────────────── settings (runtime overrides)
+
+@router.get("/settings")
+async def get_settings_endpoint() -> Dict[str, Any]:
+    """
+    Returneaza toate setarile curente (valori .env + overrides active) cu
+    cheile sensibile excluse din payload.
+
+    Response shape (asteptat de useSettings.ts + SettingsPage.tsx):
+      {
+        "settings":       { ...toate valorile non-sensitive... },
+        "overrides":      { ...doar cheile suprascrise runtime... },
+        "sensitive_keys": [ "binance_api_key", ... ]
+      }
+    """
+    cfg = get_settings()
+
+    # Serializam toate campurile Pydantic ca dict
+    raw: Dict[str, Any] = cfg.model_dump()
+
+    # Aplicam override-urile runtime
+    merged = {**raw, **_settings_overrides}
+
+    # Excludem cheile sensibile din response
+    safe_settings = {k: v for k, v in merged.items() if k not in _SENSITIVE_KEYS}
+    safe_overrides = {k: v for k, v in _settings_overrides.items() if k not in _SENSITIVE_KEYS}
+
+    return {
+        "settings":       safe_settings,
+        "overrides":      safe_overrides,
+        "sensitive_keys": sorted(_SENSITIVE_KEYS),
+    }
+
+
+class SettingsPatchRequest(BaseModel):
+    """Payload pentru PATCH /settings — un dict cu campurile de modificat."""
+    data: Dict[str, Any]
+
+
+@router.patch("/settings")
+async def patch_settings(req: SettingsPatchRequest) -> Dict[str, Any]:
+    """
+    Aplica override-uri runtime peste valorile .env.
+    Cheile sensibile sunt ignorate silentios (nu pot fi schimbate via UI).
+    Modificarile sunt in-memory — un restart al backend-ului le reseteaza la .env.
+    Pentru persistenta permanenta, editeaza .env si restarteza serverul.
+    """
+    applied: Dict[str, Any] = {}
+    skipped_sensitive: List[str] = []
+
+    for key, value in req.data.items():
+        if key in _SENSITIVE_KEYS:
+            skipped_sensitive.append(key)
+            continue
+        # Validare: cheia trebuie sa existe in Settings schema
+        cfg = get_settings()
+        if not hasattr(cfg, key):
+            logger.warning("patch_settings: unknown key '%s' ignored", key)
+            continue
+        _settings_overrides[key] = value
+        applied[key] = value
+
+    logger.info(
+        "patch_settings: applied %d overrides, skipped %d sensitive keys",
+        len(applied), len(skipped_sensitive),
+    )
+
+    return {
+        "applied":            applied,
+        "skipped_sensitive":  skipped_sensitive,
+        "total_overrides":    len(_settings_overrides),
+        "message":            "Settings updated in-memory. Restart backend to persist to .env.",
+    }
+
+
+@router.delete("/settings/overrides")
+async def delete_settings_overrides() -> Dict[str, Any]:
+    """
+    Sterge toate override-urile runtime — backend-ul revine la valorile din .env.
+    Nu necesita restart.
+    """
+    count = len(_settings_overrides)
+    _settings_overrides.clear()
+    logger.info("patch_settings: all %d overrides cleared", count)
+    return {
+        "cleared": count,
+        "message": "All runtime overrides cleared. .env values are now active.",
+    }
 
 
 # ─────────────────────────────────────────── manual order
