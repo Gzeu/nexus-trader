@@ -4,6 +4,12 @@ get_account_info() si get_balance_summary() integrate complet.
 
 STARTUP GATE: reconcile() trebuie sa returneze succes inainte ca trading-ul
 sa fie permis. `is_ready` property blocheaza orice actiune pana atunci.
+
+FIX 1: update_position() adaugat — lipsea, cauza crash la TP1 partial close.
+FIX 5: reconcile() apeleaza risk_manager.update_equity() dupa fetch equity
+        astfel peak_equity este corect initializat de la primul run.
+FIX 6: reconcile() spot populeaza _positions din non-zero asset balances,
+        astfel one-per-symbol gate din RiskManager functioneaza corect.
 """
 from __future__ import annotations
 
@@ -13,7 +19,6 @@ from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Dict, List, Optional
 
 from backend.models import (
-    AccountInfo as _LegacyAccountInfo,
     Order,
     Position,
     ReconciliationResult,
@@ -30,6 +35,7 @@ from backend.models_extra import (
 if TYPE_CHECKING:
     from backend.binance.binance_client import BinanceClient
     from backend.core.price_cache import PriceCache
+    from backend.core.risk_manager import RiskManager
 
 logger = logging.getLogger(__name__)
 
@@ -44,10 +50,12 @@ class PortfolioEngine:
         self,
         client: "BinanceClient",
         price_cache: "PriceCache",
+        risk_manager: Optional["RiskManager"] = None,
         mode: str = "spot",  # "spot" | "futures"
     ) -> None:
         self._client = client
         self._price_cache = price_cache
+        self._risk = risk_manager  # FIX 5: injectat pentru update_equity la reconciliere
         self._mode = mode
 
         # Stare locala
@@ -72,6 +80,11 @@ class PortfolioEngine:
         """
         Sincronizeaza starea locala cu Binance.
         Apelat la startup (blocant) si periodic.
+
+        FIX 5: Dupa fetch equity, apeleaza risk_manager.update_equity()
+               astfel peak_equity si daily_start_equity sunt initializate.
+        FIX 6: La spot, populeaza _positions din asset balances non-zero,
+               asa incat one-per-symbol gate din RiskManager vede pozitiile reale.
         """
         async with self._reconcile_lock:
             logger.info("[reconcile] Starting reconciliation (mode=%s)", self._mode)
@@ -83,21 +96,63 @@ class PortfolioEngine:
                     remote_positions = []
                     remote_orders = await self._client.get_open_orders()
 
-                # Detecteaza drift pozitii
-                remote_symbols = {p["symbol"] for p in remote_positions if float(p.get("positionAmt", 0)) != 0}
+                # ── FIX 6: Spot — construieste pozitii din balances non-zero ──────────
+                if self._mode == "spot":
+                    try:
+                        spot_account = await self._client.get_spot_account()
+                        for bal in spot_account.get("balances", []):
+                            asset = bal["asset"]
+                            if asset == "USDT":
+                                continue  # USDT e cash, nu pozitie
+                            total = float(bal["free"]) + float(bal["locked"])
+                            if total < 1e-8:
+                                continue
+                            symbol = f"{asset}USDT"
+                            # Nu suprascrie pozitii deja gestionate
+                            if symbol not in self._positions:
+                                price_est = self._price_cache.get_price(symbol) or 0.0
+                                self._positions[symbol] = Position(
+                                    symbol=symbol,
+                                    side="BUY",
+                                    quantity=total,
+                                    entry_price=price_est,
+                                    opened_at=datetime.now(timezone.utc),
+                                )
+                                # FIX 6: Notifica risk manager de pozitia existenta
+                                if self._risk is not None:
+                                    self._risk.position_opened(symbol)
+                                logger.info(
+                                    "[reconcile][spot] Position imported: %s qty=%.8f",
+                                    symbol, total,
+                                )
+                    except Exception as spot_exc:
+                        logger.warning(
+                            "[reconcile][spot] Could not import spot balances: %s", spot_exc
+                        )
+
+                # ── Futures drift detection ───────────────────────────────────────────
+                remote_symbols = {
+                    p["symbol"]
+                    for p in remote_positions
+                    if float(p.get("positionAmt", 0)) != 0
+                }
                 local_symbols = set(self._positions.keys())
 
                 missing_locally = remote_symbols - local_symbols
-                ghost_locally = local_symbols - remote_symbols
+                ghost_locally   = local_symbols - remote_symbols if self._mode == "futures" else set()
 
                 if missing_locally:
-                    logger.warning("[reconcile] Positions on exchange but not locally: %s", missing_locally)
+                    logger.warning(
+                        "[reconcile] Positions on exchange but not locally: %s", missing_locally
+                    )
                 if ghost_locally:
-                    logger.warning("[reconcile] Positions locally but not on exchange: %s", ghost_locally)
+                    logger.warning(
+                        "[reconcile] Positions locally but not on exchange: %s", ghost_locally
+                    )
 
-                # Sync orders
+                # ── Sync open orders ──────────────────────────────────────────────────
                 self._open_orders = {
-                    o["orderId"]: Order(
+                    str(o["orderId"]): Order(
                         id=str(o["orderId"]),
                         symbol=o["symbol"],
                         side=o["side"],
@@ -110,21 +165,23 @@ class PortfolioEngine:
                     for o in remote_orders
                 }
 
-                # Update equity
-                account = await self._fetch_raw_equity()
-                self._cached_equity = account
+                # ── Equity fetch + FIX 5: notifica risk manager ───────────────────────
+                equity = await self._fetch_raw_equity()
+                self._cached_equity = equity
+                if self._risk is not None:
+                    self._risk.update_equity(equity)  # seteaza peak_equity si daily_start
 
                 self._reconciled = True
                 logger.info(
                     "[reconcile] OK — equity=%.2f, positions=%d, orders=%d",
                     self._cached_equity,
-                    len(remote_symbols),
+                    len(self._positions),
                     len(self._open_orders),
                 )
                 return ReconciliationResult(
                     success=True,
                     equity=self._cached_equity,
-                    positions_synced=len(remote_symbols),
+                    positions_synced=len(self._positions),
                     orders_synced=len(self._open_orders),
                     missing_locally=list(missing_locally),
                     ghost_locally=list(ghost_locally),
@@ -177,16 +234,18 @@ class PortfolioEngine:
                 if float(a.get("walletBalance", 0)) > 1e-9
             ]
 
-            total_spot = sum(a.usdt_valuation for a in spot_assets)
-            total_futs_wallet = sum(a.wallet_balance for a in futures_assets)
+            total_spot  = sum(a.usdt_valuation for a in spot_assets)
+            total_futs  = sum(a.wallet_balance for a in futures_assets)
             total_unreal = sum(a.unrealized_profit for a in futures_assets)
-            total_avail = sum(a.available_balance for a in futures_assets)
+            total_avail = sum(a.available_balance for a in futures_assets) + sum(
+                a.free for a in spot_assets if a.asset == "USDT"
+            )
 
             info = AccountInfo(
-                total_equity=total_spot + total_futs_wallet + total_unreal,
-                total_wallet_balance=total_spot + total_futs_wallet,
+                total_equity=total_spot + total_futs + total_unreal,
+                total_wallet_balance=total_spot + total_futs,
                 total_unrealized_profit=total_unreal,
-                total_margin_balance=total_futs_wallet + total_unreal,
+                total_margin_balance=total_futs + total_unreal,
                 available_balance=total_avail,
                 total_position_initial_margin=float(futs.get("totalPositionInitialMargin", 0)),
                 total_open_order_initial_margin=float(futs.get("totalOpenOrderInitialMargin", 0)),
@@ -202,6 +261,9 @@ class PortfolioEngine:
                 taker_commission=spot.get("takerCommission", 10),
             )
             self._cached_equity = info.total_equity
+            # FIX 5: tine risk_manager la curent la fiecare snapshot
+            if self._risk is not None:
+                self._risk.update_equity(info.total_equity)
             return info
 
         except Exception as exc:
@@ -212,20 +274,21 @@ class PortfolioEngine:
             )
 
     async def get_balance_summary(self) -> BalanceSummary:
-        """Aggregated USDT summary pentru quick-glance panel."""
+        """Aggregated USDT summary pentru quick-glance dashboard panel."""
         try:
             info = await self.get_account_info()
-            spot_val = sum(a.usdt_valuation for a in info.assets)
-            futs_wal = sum(a.wallet_balance for a in info.futures_assets)
-            unreal = sum(a.unrealized_profit for a in info.futures_assets)
-            avail = sum(a.available_balance for a in info.futures_assets) + sum(
+            spot_val  = sum(a.usdt_valuation for a in info.assets)
+            futs_wal  = sum(a.wallet_balance for a in info.futures_assets)
+            unreal    = sum(a.unrealized_profit for a in info.futures_assets)
+            avail     = sum(a.available_balance for a in info.futures_assets) + sum(
                 a.free for a in info.assets if a.asset == "USDT"
             )
-            total = spot_val + futs_wal + unreal
-            init_mar = (
-                info.total_position_initial_margin + info.total_open_order_initial_margin
+            total     = spot_val + futs_wal + unreal
+            init_mar  = (
+                info.total_position_initial_margin
+                + info.total_open_order_initial_margin
             )
-            used_pct = (init_mar / max(total, 1)) * 100 if total > 0 else 0.0
+            used_pct  = (init_mar / max(total, 1)) * 100 if total > 0 else 0.0
 
             return BalanceSummary(
                 total_usdt_value=total,
@@ -257,8 +320,26 @@ class PortfolioEngine:
     def add_position(self, position: Position) -> None:
         self._positions[position.symbol] = position
 
+    def update_position(self, position: Position) -> None:
+        """
+        FIX 1: Actualizeaza o pozitie existenta in state-ul local.
+        Apelata de automation_engine dupa TP1 partial close si
+        dupa mutarea SL la breakeven.
+        Daca pozitia nu exista (edge case), o adauga.
+        """
+        self._positions[position.symbol] = position
+        logger.debug(
+            "[portfolio] Position updated: %s qty=%.8f entry=%.4f",
+            position.symbol,
+            position.quantity,
+            position.entry_price,
+        )
+
     def remove_position(self, symbol: str) -> Optional[Position]:
-        return self._positions.pop(symbol, None)
+        pos = self._positions.pop(symbol, None)
+        if pos is not None and self._risk is not None:
+            self._risk.position_closed(symbol)
+        return pos
 
     def add_trade(self, trade: Trade) -> None:
         self._trades.append(trade)
@@ -274,16 +355,16 @@ class PortfolioEngine:
         if not closed:
             return RiskMetrics()
 
-        wins = [t for t in closed if (t.pnl or 0) > 0]
+        wins   = [t for t in closed if (t.pnl or 0) > 0]
         losses = [t for t in closed if (t.pnl or 0) <= 0]
-        total = len(closed)
+        total  = len(closed)
 
-        win_rate = len(wins) / total if total else 0.0
-        gross_profit = sum(t.pnl for t in wins if t.pnl)  # type: ignore
-        gross_loss = abs(sum(t.pnl for t in losses if t.pnl))  # type: ignore
-        profit_factor = gross_profit / gross_loss if gross_loss else float("inf")
+        win_rate      = len(wins) / total if total else 0.0
+        gross_profit  = sum(t.pnl for t in wins if t.pnl)    # type: ignore
+        gross_loss    = abs(sum(t.pnl for t in losses if t.pnl))  # type: ignore
+        profit_factor = gross_profit / gross_loss if gross_loss else 0.0
 
-        pnls = [t.pnl for t in closed if t.pnl is not None]
+        pnls    = [t.pnl for t in closed if t.pnl is not None]
         avg_pnl = sum(pnls) / len(pnls) if pnls else 0.0
         if len(pnls) > 1:
             variance = sum((p - avg_pnl) ** 2 for p in pnls) / len(pnls)
@@ -292,8 +373,9 @@ class PortfolioEngine:
         else:
             sharpe = 0.0
 
-        expectancy = (win_rate * (gross_profit / len(wins) if wins else 0)) - (
-            (1 - win_rate) * (gross_loss / len(losses) if losses else 0)
+        expectancy = (
+            win_rate * (gross_profit / len(wins) if wins else 0)
+            - (1 - win_rate) * (gross_loss / len(losses) if losses else 0)
         )
 
         return RiskMetrics(
@@ -318,11 +400,20 @@ class PortfolioEngine:
                 return float(futs.get("totalWalletBalance", 0))
             else:
                 spot = await self._client.get_spot_account()
-                usdt_bal = next(
-                    (a for a in spot.get("balances", []) if a["asset"] == "USDT"), None
-                )
-                if usdt_bal:
-                    return float(usdt_bal["free"]) + float(usdt_bal["locked"])
-                return self._cached_equity
+                total = 0.0
+                for a in spot.get("balances", []):
+                    free   = float(a["free"])
+                    locked = float(a["locked"])
+                    bal    = free + locked
+                    if bal < 1e-9:
+                        continue
+                    if a["asset"] == "USDT":
+                        total += bal
+                    else:
+                        # Estimeaza valoarea in USDT
+                        symbol = f"{a['asset']}USDT"
+                        price  = self._price_cache.get_price(symbol) or 0.0
+                        total += bal * price
+                return total
         except Exception:
             return self._cached_equity
