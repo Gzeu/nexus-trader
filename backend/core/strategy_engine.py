@@ -9,19 +9,26 @@ CHANGELOG:
      Fiecare strategie paseza timeframe-ul corect primit din context.
   🟡 FIX REVIEW #5: BreakoutStrategy confidence dinamic bazat pe magnitudinea breakout-ului.
      Anterior: confidence=0.75 fix → distorsiona votul in CompositeStrategy.
+  🟡 FEAT #8 (regime): Adaugat _adx(), Regime enum, RegimeDetector.
+     CompositeStrategy accepta regime_detector optional si filtreaza
+     strategiile incompatibile cu regimul curent inainte de voting.
+     ADX > adx_trend_threshold → TRENDING (ruleaza doar TrendFollowing + Breakout).
+     ADX < adx_range_threshold  → RANGING  (ruleaza doar MeanReversion).
+     NEUTRAL → toate strategiile voteaza (comportament anterior).
 """
 from __future__ import annotations
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Tuple
+from enum import Enum
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 from backend.models import Action, StrategySignal
 
 logger = logging.getLogger(__name__)
 
 
-# ──────────────────────────────────────────────────────────────── helpers
+# ─────────────────────────────────────────────────────────────────── helpers
 
 def _safe_float(val: Any, default: float = 0.0) -> float:
     try:
@@ -33,8 +40,8 @@ def _safe_float(val: Any, default: float = 0.0) -> float:
 def _ema(values: List[float], period: int) -> List[float]:
     if len(values) < period:
         return []
-    k     = 2 / (period + 1)
-    ema   = [sum(values[:period]) / period]
+    k   = 2 / (period + 1)
+    ema = [sum(values[:period]) / period]
     for v in values[period:]:
         ema.append(v * k + ema[-1] * (1 - k))
     return ema
@@ -63,8 +70,9 @@ def _atr(highs: List[float], lows: List[float], closes: List[float], period: int
     return sum(trs[-period:]) / period
 
 
-def _bollinger(closes: List[float], period: int = 20, std_mult: float = 2.0
-               ) -> Tuple[float, float, float]:
+def _bollinger(
+    closes: List[float], period: int = 20, std_mult: float = 2.0
+) -> Tuple[float, float, float]:
     """Returneaza (upper, middle, lower)."""
     if len(closes) < period:
         c = closes[-1] if closes else 0.0
@@ -75,7 +83,174 @@ def _bollinger(closes: List[float], period: int = 20, std_mult: float = 2.0
     return mean + std_mult * std, mean, mean - std_mult * std
 
 
-# ──────────────────────────────────────────────────────────────── Base
+def _adx(
+    highs: List[float],
+    lows: List[float],
+    closes: List[float],
+    period: int = 14,
+) -> Tuple[float, float, float]:
+    """
+    Calculeaza ADX, +DI, -DI folosind metoda Wilder (smoothed moving average).
+
+    Returneaza (adx, plus_di, minus_di) ca valori in [0, 100].
+    Returneaza (0.0, 0.0, 0.0) daca datele sunt insuficiente.
+
+    Algoritm:
+      1. True Range (TR) = max(H-L, |H-Cprev|, |L-Cprev|)
+      2. +DM = H - H_prev daca > 0 si > |L - L_prev|, altfel 0
+         -DM = L_prev - L daca > 0 si > |H - H_prev|, altfel 0
+      3. Smooth TR, +DM, -DM cu Wilder MA (EMA period=14, k=1/period)
+      4. +DI = 100 * smoothed_+DM / smoothed_TR
+         -DI = 100 * smoothed_-DM / smoothed_TR
+      5. DX = 100 * |+DI - -DI| / (+DI + -DI)
+      6. ADX = Wilder MA pe DX
+    """
+    min_len = period * 2 + 1
+    if len(closes) < min_len:
+        return 0.0, 0.0, 0.0
+
+    n = len(closes)
+    trs, plus_dms, minus_dms = [], [], []
+
+    for i in range(1, n):
+        h, l, c_prev = highs[i], lows[i], closes[i - 1]
+        tr = max(h - l, abs(h - c_prev), abs(l - c_prev))
+        trs.append(tr)
+
+        h_diff = highs[i] - highs[i - 1]
+        l_diff = lows[i - 1] - lows[i]
+        plus_dm  = h_diff if h_diff > 0 and h_diff > l_diff else 0.0
+        minus_dm = l_diff if l_diff > 0 and l_diff > h_diff else 0.0
+        plus_dms.append(plus_dm)
+        minus_dms.append(minus_dm)
+
+    # Wilder smoothing (seed cu sum primelor `period` valori)
+    def _wilder_smooth(data: List[float]) -> List[float]:
+        if len(data) < period:
+            return []
+        smoothed = [sum(data[:period])]
+        for v in data[period:]:
+            smoothed.append(smoothed[-1] - smoothed[-1] / period + v)
+        return smoothed
+
+    s_tr   = _wilder_smooth(trs)
+    s_pdm  = _wilder_smooth(plus_dms)
+    s_ndm  = _wilder_smooth(minus_dms)
+
+    if not s_tr:
+        return 0.0, 0.0, 0.0
+
+    dxs = []
+    for atr_w, pdm_w, ndm_w in zip(s_tr, s_pdm, s_ndm):
+        if atr_w == 0:
+            dxs.append(0.0)
+            continue
+        pdi = 100 * pdm_w / atr_w
+        ndi = 100 * ndm_w / atr_w
+        denom = pdi + ndi
+        dxs.append(100 * abs(pdi - ndi) / denom if denom else 0.0)
+
+    # ADX = Wilder MA pe DX
+    adx_series = _wilder_smooth(dxs)
+    if not adx_series:
+        return 0.0, 0.0, 0.0
+
+    # Valorile finale: ultimul element
+    adx_val = adx_series[-1]
+    last_tr  = s_tr[-1]
+    plus_di  = 100 * s_pdm[-1] / last_tr if last_tr else 0.0
+    minus_di = 100 * s_ndm[-1] / last_tr if last_tr else 0.0
+
+    return round(adx_val, 2), round(plus_di, 2), round(minus_di, 2)
+
+
+# ─────────────────────────────────────────────────────────────────── Regime
+
+class Regime(str, Enum):
+    TRENDING = "TRENDING"   # ADX > threshold_high  → TrendFollowing + Breakout activ
+    RANGING  = "RANGING"    # ADX < threshold_low   → MeanReversion activ
+    NEUTRAL  = "NEUTRAL"    # intre praguri          → toate strategiile voteaza
+
+
+# Strategii activate per regim. MeanReversion NU ruleaza in TRENDING (multe fals-pozitive).
+# TrendFollowing + Breakout NU ruleaza in RANGING (EMA crossover pe flat = zgomot).
+_REGIME_ALLOWED: Dict[Regime, Set[str]] = {
+    Regime.TRENDING: {"trend_following", "breakout"},
+    Regime.RANGING:  {"mean_reversion"},
+    Regime.NEUTRAL:  {"trend_following", "mean_reversion", "breakout"},
+}
+
+
+class RegimeDetector:
+    """
+    Detecteaza regimul de piata curent (TRENDING / RANGING / NEUTRAL)
+    bazat pe ADX + spread-ul +DI/-DI.
+
+    Parametri (configurabili din config.py / .env):
+      adx_period          — perioada ADX (default 14)
+      adx_trend_threshold — ADX > X → TRENDING (default 25)
+      adx_range_threshold — ADX < X → RANGING  (default 20)
+
+    Logica extinsa:
+      - TRENDING confirmat si de +DI > -DI (bullish) sau -DI > +DI (bearish)
+      - Histereza intre RANGING si NEUTRAL pentru a evita flip rapid
+    """
+
+    def __init__(
+        self,
+        period: int = 14,
+        trend_threshold: float = 25.0,
+        range_threshold: float = 20.0,
+    ) -> None:
+        self._period          = period
+        self._trend_threshold = trend_threshold
+        self._range_threshold = range_threshold
+        self._last_regime     = Regime.NEUTRAL
+
+    def detect(
+        self,
+        highs: List[float],
+        lows: List[float],
+        closes: List[float],
+    ) -> Tuple[Regime, float, float, float]:
+        """
+        Returneaza (regime, adx, plus_di, minus_di).
+        Foloseste histereza: daca regimul anterior e TRENDING,
+        pragul de iesire din TRENDING e mai mic (trend_threshold - 3).
+        """
+        adx, plus_di, minus_di = _adx(highs, lows, closes, self._period)
+
+        if adx == 0.0:
+            # Date insuficiente
+            return Regime.NEUTRAL, 0.0, 0.0, 0.0
+
+        # Histereza: cand iesim din TRENDING, folosim un prag usor mai mic
+        effective_trend_thresh = (
+            self._trend_threshold - 3.0
+            if self._last_regime == Regime.TRENDING
+            else self._trend_threshold
+        )
+
+        if adx >= effective_trend_thresh:
+            regime = Regime.TRENDING
+        elif adx < self._range_threshold:
+            regime = Regime.RANGING
+        else:
+            regime = Regime.NEUTRAL
+
+        self._last_regime = regime
+        logger.debug(
+            "[regime] ADX=%.1f +DI=%.1f -DI=%.1f → %s",
+            adx, plus_di, minus_di, regime.value,
+        )
+        return regime, adx, plus_di, minus_di
+
+    @property
+    def last_regime(self) -> Regime:
+        return self._last_regime
+
+
+# ─────────────────────────────────────────────────────────────────── Base
 
 class BaseStrategy(ABC):
     """Contract comun pentru toate strategiile."""
@@ -103,7 +278,6 @@ class BaseStrategy(ABC):
         metadata: Optional[Dict] = None,
         timeframe: str = "1m",
     ) -> StrategySignal:
-        # 🔴 FIX REVIEW #2: timeframe passat ca param — nu mai e hardcodat "1m"
         sl_dist = atr * sl_atr_mult
         if action in (Action.BUY,):
             stop_loss    = close - sl_dist
@@ -114,10 +288,10 @@ class BaseStrategy(ABC):
             take_profit1 = close - sl_dist * tp1_rr
             take_profit2 = close - sl_dist * tp2_rr
 
-        # Adauga atr_pct in metadata pentru VETO_VOLATILITY din RiskManager
         meta = metadata or {}
         if close > 0 and atr > 0:
-            meta["atr_pct"] = round(atr / close, 6)
+            meta["atr_pct"]   = round(atr / close, 6)
+            meta["atr_value"] = round(atr, 8)  # pentru trailing stop ATR-based
 
         return StrategySignal(
             symbol=symbol,
@@ -135,7 +309,7 @@ class BaseStrategy(ABC):
         )
 
 
-# ──────────────────────────────────────────────────────────────── Strategies
+# ─────────────────────────────────────────────────────────────────── Strategies
 
 class TrendFollowingStrategy(BaseStrategy):
     """EMA crossover (fast/slow) + RSI filter + ATR SL/TP."""
@@ -151,10 +325,10 @@ class TrendFollowingStrategy(BaseStrategy):
         if len(klines) < self._slow + 5:
             return None
 
-        closes  = [_safe_float(k[4]) for k in klines]
-        highs   = [_safe_float(k[2]) for k in klines]
-        lows    = [_safe_float(k[3]) for k in klines]
-        ts      = str(klines[-1][0]) if klines else None
+        closes = [_safe_float(k[4]) for k in klines]
+        highs  = [_safe_float(k[2]) for k in klines]
+        lows   = [_safe_float(k[3]) for k in klines]
+        ts     = str(klines[-1][0]) if klines else None
 
         ema_fast = _ema(closes, self._fast)
         ema_slow = _ema(closes, self._slow)
@@ -246,18 +420,16 @@ class BreakoutStrategy(BaseStrategy):
         atr   = _atr(highs, lows, closes)
         close = closes[-1]
 
-        prev_highs  = highs[-(self._lookback + 1):-1]
-        prev_lows   = lows[-(self._lookback + 1):-1]
-        avg_vol     = sum(volumes[-(self._lookback + 1):-1]) / self._lookback
-        curr_vol    = volumes[-1]
-        vol_ok      = curr_vol > avg_vol * self._vol_mult
+        prev_highs = highs[-(self._lookback + 1):-1]
+        prev_lows  = lows[-(self._lookback + 1):-1]
+        avg_vol    = sum(volumes[-(self._lookback + 1):-1]) / self._lookback
+        curr_vol   = volumes[-1]
+        vol_ok     = curr_vol > avg_vol * self._vol_mult
 
         resistance = max(prev_highs)
         support    = min(prev_lows)
 
         if close > resistance and vol_ok:
-            # 🟡 FIX REVIEW #5: confidence dinamic pe baza magnitudinii breakout-ului
-            # Anterior: confidence=0.75 fix → distorsiona votul in CompositeStrategy
             breakout_pct = (close - resistance) / resistance if resistance else 0.0
             conf = min(0.60 + breakout_pct * 20, 0.95)
             return self._make_signal(
@@ -274,15 +446,18 @@ class BreakoutStrategy(BaseStrategy):
         return None
 
 
-# ──────────────────────────────────────────────────────────────── Composite
+# ─────────────────────────────────────────────────────────────────── Composite
 
 class CompositeStrategy(BaseStrategy):
     """
     Weighted voting intre mai multe strategii cu conflict resolution.
 
     🟡 FIX #6: Weight-urile sunt normalizate la suma=1.0 inainte de voting.
-    Daca weights=[0.5, 0.3, 0.3] (suma=1.1), confidence depasea 1.0.
-    Acum: weights normalizate → confidence garantat in [0.0, 1.0].
+    🟡 FEAT #8: Accepta regime_detector optional.
+      - La fiecare compute(), detecteaza regimul curent din klines
+      - Filtreaza strategiile incompatibile cu regimul curent
+      - Re-normalizeaza weight-urile pe setul filtrat (nu modifica originalele)
+      - Logheza regimul si strategiile active pentru debugging
     """
 
     name = "composite"
@@ -292,46 +467,78 @@ class CompositeStrategy(BaseStrategy):
         strategies: List[BaseStrategy],
         weights: Optional[Dict[str, float]] = None,
         min_consensus: float = 0.55,
+        regime_detector: Optional[RegimeDetector] = None,
     ) -> None:
-        self._strategies    = strategies
-        self._min_consensus = min_consensus
+        self._strategies      = strategies
+        self._min_consensus   = min_consensus
+        self._regime_detector = regime_detector
 
-        # Build raw weights
         raw: Dict[str, float] = {
             s.name: (weights.get(s.name, 1.0) if weights else 1.0)
             for s in strategies
         }
-        # 🟡 FIX #6: Normalizeaza la suma = 1.0
         total_w = sum(raw.values()) or 1.0
         self._weights: Dict[str, float] = {k: v / total_w for k, v in raw.items()}
         logger.debug("CompositeStrategy normalized weights: %s", self._weights)
 
     def compute(self, klines: List[List[Any]], timeframe: str = "1m") -> Optional[StrategySignal]:
-        signals: List[Tuple[StrategySignal, float]] = []
+        # ── Regime detection ───────────────────────────────────────────────────
+        active_names: Optional[Set[str]] = None
+        regime = Regime.NEUTRAL
+        adx_val = 0.0
 
-        for strat in self._strategies:
+        if self._regime_detector is not None and len(klines) >= 2:
+            highs  = [_safe_float(k[2]) for k in klines]
+            lows   = [_safe_float(k[3]) for k in klines]
+            closes = [_safe_float(k[4]) for k in klines]
+            regime, adx_val, plus_di, minus_di = self._regime_detector.detect(
+                highs, lows, closes
+            )
+            active_names = _REGIME_ALLOWED[regime]
+            logger.info(
+                "[composite] regime=%s ADX=%.1f +DI=%.1f -DI=%.1f active=%s",
+                regime.value, adx_val, plus_di, minus_di, sorted(active_names),
+            )
+
+        # ── Filter strategies by regime ───────────────────────────────────────────
+        if active_names is not None:
+            active_strats = [s for s in self._strategies if s.name in active_names]
+        else:
+            active_strats = self._strategies
+
+        if not active_strats:
+            return None
+
+        # Re-normalizeaza weights pe setul filtrat
+        filtered_raw = {s.name: self._weights.get(s.name, 1.0) for s in active_strats}
+        total_filtered = sum(filtered_raw.values()) or 1.0
+        active_weights = {k: v / total_filtered for k, v in filtered_raw.items()}
+
+        # ── Compute signals ────────────────────────────────────────────────────────
+        signals: List[Tuple[StrategySignal, float]] = []
+        for strat in active_strats:
             try:
                 sig = strat.compute(klines, timeframe=timeframe)
             except Exception as exc:
                 logger.warning("CompositeStrategy: %s failed: %s", strat.name, exc)
                 sig = None
             if sig and sig.action != Action.HOLD:
-                w = self._weights.get(strat.name, 1.0 / len(self._strategies))
+                w = active_weights.get(strat.name, 1.0 / len(active_strats))
                 signals.append((sig, w))
 
         if not signals:
             return None
 
-        # Tally votes per action
+        # ── Weighted voting ────────────────────────────────────────────────────────
         votes: Dict[str, float] = {}
         for sig, w in signals:
             votes[sig.action] = votes.get(sig.action, 0.0) + w
 
         best_action = max(votes, key=lambda a: votes[a])
-        net_conf    = votes[best_action]   # in [0, 1] datorita normalizarii
+        net_conf    = votes[best_action]
 
         if net_conf < self._min_consensus:
-            return None   # HOLD implicit
+            return None
 
         concordant = [sig for sig, _ in signals if sig.action == best_action]
         avg_sl  = sum(s.stop_loss     for s in concordant) / len(concordant)
@@ -349,7 +556,16 @@ class CompositeStrategy(BaseStrategy):
             take_profit_1=round(avg_tp1, 8),
             take_profit_2=round(avg_tp2, 8),
             timeframe=timeframe,
-            reason=f"Composite({best_action}) conf={net_conf:.2f} from {len(concordant)} strategies",
+            reason=(
+                f"Composite({best_action}) conf={net_conf:.2f} "
+                f"regime={regime.value} adx={adx_val:.1f} "
+                f"from {len(concordant)} strategies"
+            ),
             candle_open_time=ref.candle_open_time,
-            metadata={"votes": votes, "weights": self._weights},
+            metadata={
+                "votes": votes,
+                "weights": active_weights,
+                "regime": regime.value,
+                "adx": adx_val,
+            },
         )

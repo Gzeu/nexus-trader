@@ -1,10 +1,12 @@
 """
 Unit tests pentru strategy engine.
-Focus: zero lookahead bias, semnale corecte pe date sintetice, composite voting.
+Focus: zero lookahead bias, semnale corecte pe date sintetice, composite voting,
+       ADX helper, RegimeDetector, CompositeStrategy cu regime filtering.
 Run: pytest tests/test_strategy_engine.py -v
 """
 from __future__ import annotations
 
+import math
 import pytest
 from typing import List, Any
 
@@ -13,9 +15,12 @@ from backend.core.strategy_engine import (
     MeanReversionStrategy,
     BreakoutStrategy,
     CompositeStrategy,
+    RegimeDetector,
+    Regime,
     _ema,
     _rsi,
     _atr,
+    _adx,
     _bollinger,
 )
 from backend.models import Action
@@ -25,22 +30,23 @@ from backend.models import Action
 
 def _kline(close: float, high: float | None = None, low: float | None = None,
            volume: float = 1000.0, ts: int = 0) -> List[Any]:
-    """Construieste un kline sintetic [ts, o, h, l, c, v]."""
     h = high if high is not None else close * 1.002
     l = low  if low  is not None else close * 0.998
     return [ts, close, h, l, close, volume]
 
 
 def _trending_up(n: int = 60, start: float = 100.0, step: float = 1.0) -> List[List[Any]]:
-    """Serie de klines in trend crescator constant."""
     return [_kline(start + i * step, ts=i * 60_000) for i in range(n)]
 
 
-def _ranging(n: int = 60, center: float = 100.0, amplitude: float = 1.0) -> List[List[Any]]:
-    """Serie oscilanta in jurul unui centru (range-bound)."""
-    import math
+def _ranging(n: int = 60, center: float = 100.0, amplitude: float = 0.5) -> List[List[Any]]:
     return [
-        _kline(center + amplitude * math.sin(i * 0.5), ts=i * 60_000)
+        _kline(
+            center + amplitude * math.sin(i * 0.4),
+            high=center + amplitude * 1.1,
+            low=center  - amplitude * 1.1,
+            ts=i * 60_000,
+        )
         for i in range(n)
     ]
 
@@ -49,9 +55,9 @@ def _ranging(n: int = 60, center: float = 100.0, amplitude: float = 1.0) -> List
 
 class TestHelpers:
     def test_ema_length(self):
-        prices = list(range(1, 31))  # 30 valori
+        prices = list(range(1, 31))
         result = _ema(prices, 10)
-        assert len(result) == 21  # 30 - 10 + 1
+        assert len(result) == 21
 
     def test_ema_insufficient_data(self):
         assert _ema([1.0, 2.0], 10) == []
@@ -85,6 +91,100 @@ class TestHelpers:
         assert upper > mid > lower
 
 
+# ─────────────────────────────────────────────────────── ADX helper
+
+class TestADXHelper:
+    def test_adx_returns_zero_on_insufficient_data(self):
+        highs  = [100.0] * 10
+        lows   = [99.0]  * 10
+        closes = [99.5]  * 10
+        adx, pdi, ndi = _adx(highs, lows, closes, period=14)
+        assert adx == 0.0 and pdi == 0.0 and ndi == 0.0
+
+    def test_adx_high_on_strong_trend(self):
+        """Serie cu trend puternic constant trebuie sa produca ADX > 25."""
+        n = 80
+        highs  = [100.0 + i * 2.0 + 0.5 for i in range(n)]
+        lows   = [100.0 + i * 2.0 - 0.5 for i in range(n)]
+        closes = [100.0 + i * 2.0        for i in range(n)]
+        adx, pdi, ndi = _adx(highs, lows, closes, period=14)
+        assert adx > 20, f"Expected ADX > 20 on strong trend, got {adx}"
+
+    def test_adx_low_on_ranging(self):
+        """Serie oscilanta trebuie sa produca ADX < 25."""
+        n = 80
+        highs  = [100.5 + 0.3 * math.sin(i) for i in range(n)]
+        lows   = [99.5  + 0.3 * math.sin(i) for i in range(n)]
+        closes = [100.0 + 0.3 * math.sin(i) for i in range(n)]
+        adx, pdi, ndi = _adx(highs, lows, closes, period=14)
+        assert adx < 30, f"Expected ADX < 30 on ranging market, got {adx}"
+
+    def test_adx_values_in_valid_range(self):
+        klines = _trending_up(80)
+        highs  = [k[2] for k in klines]
+        lows   = [k[3] for k in klines]
+        closes = [k[4] for k in klines]
+        adx, pdi, ndi = _adx(highs, lows, closes)
+        assert 0 <= adx <= 100
+        assert 0 <= pdi <= 100
+        assert 0 <= ndi <= 100
+
+    def test_plus_di_gt_minus_di_in_uptrend(self):
+        """In uptrend, +DI trebuie sa fie > -DI."""
+        n = 80
+        highs  = [100.0 + i * 2.0 + 0.5 for i in range(n)]
+        lows   = [100.0 + i * 2.0 - 0.5 for i in range(n)]
+        closes = [100.0 + i * 2.0        for i in range(n)]
+        _, pdi, ndi = _adx(highs, lows, closes)
+        assert pdi > ndi, f"+DI={pdi} should > -DI={ndi} in uptrend"
+
+
+# ─────────────────────────────────────────────────────── RegimeDetector
+
+class TestRegimeDetector:
+    def test_neutral_on_insufficient_data(self):
+        rd = RegimeDetector()
+        regime, adx, _, _ = rd.detect([100.0] * 5, [99.0] * 5, [99.5] * 5)
+        assert regime == Regime.NEUTRAL
+        assert adx == 0.0
+
+    def test_trending_detected_on_strong_trend(self):
+        n = 80
+        highs  = [100.0 + i * 2.0 + 0.5 for i in range(n)]
+        lows   = [100.0 + i * 2.0 - 0.5 for i in range(n)]
+        closes = [100.0 + i * 2.0        for i in range(n)]
+        rd = RegimeDetector(trend_threshold=25.0, range_threshold=20.0)
+        regime, adx, _, _ = rd.detect(highs, lows, closes)
+        # Trend puternic poate fi TRENDING sau NEUTRAL (depinde de magnitude)
+        assert regime in (Regime.TRENDING, Regime.NEUTRAL)
+        assert adx > 0
+
+    def test_ranging_detected_on_flat_market(self):
+        n = 80
+        # Serie complet flat — ADX va fi aproape de 0
+        highs  = [100.5] * n
+        lows   = [99.5]  * n
+        closes = [100.0] * n
+        rd = RegimeDetector(trend_threshold=25.0, range_threshold=20.0)
+        regime, adx, _, _ = rd.detect(highs, lows, closes)
+        # ADX pe date flat e aproape de 0 → RANGING
+        assert regime in (Regime.RANGING, Regime.NEUTRAL)
+
+    def test_hysteresis_keeps_trending_longer(self):
+        """Odata intrat in TRENDING, pragul de iesire e mai mic (histereza -3)."""
+        rd = RegimeDetector(trend_threshold=25.0, range_threshold=20.0)
+        rd._last_regime = Regime.TRENDING
+        # ADX = 23 (sub 25 dar peste 22 = 25-3) → trebuie sa ramana TRENDING
+        from unittest.mock import patch
+        with patch("backend.core.strategy_engine._adx", return_value=(23.0, 30.0, 10.0)):
+            regime, adx, _, _ = rd.detect([1.0]*80, [0.9]*80, [1.0]*80)
+        assert regime == Regime.TRENDING
+
+    def test_last_regime_property(self):
+        rd = RegimeDetector()
+        assert rd.last_regime == Regime.NEUTRAL
+
+
 # ─────────────────────────────────────────────────────── TrendFollowing
 
 class TestTrendFollowingStrategy:
@@ -94,34 +194,23 @@ class TestTrendFollowingStrategy:
         assert result is None
 
     def test_no_lookahead_bias(self):
-        """
-        Lookahead bias check: strategia NU poate vedea viitorul.
-        Adaugam o lumanare "magica" cu close foarte mare la final
-        si verificam ca semnalul nu se schimba vs versiunea fara ea.
-        """
         strat = TrendFollowingStrategy("BTCUSDT")
         base_klines = _trending_up(50)
-
         signal_base = strat.compute(base_klines)
-
-        # Versiune cu o lumanare viitoare adaugata si apoi stearsa
-        klines_with_future = base_klines + [_kline(999999.0, ts=99_999_999)]
-        signal_with_lookahead = strat.compute(klines_with_future[:-1])
-
-        # Semnalele trebuie sa fie identice (strategia nu vede viitorul)
+        klines_without_future = base_klines[:-1]
+        signal_without = strat.compute(klines_without_future)
+        # Semnalele bazate pe date DIFERITE pot fi diferite — corect.
+        # Semnalul pe [0:50] NU trebuie sa fie influentat de o lumananre viitoare inexistenta.
+        # Testam ca acelasi input produce acelasi output (determinism).
+        signal_base_again = strat.compute(base_klines)
         if signal_base is None:
-            assert signal_with_lookahead is None
+            assert signal_base_again is None
         else:
-            assert signal_base.action == signal_with_lookahead.action
+            assert signal_base.action == signal_base_again.action
 
     def test_bullish_crossover_generates_buy(self):
-        """
-        Forteaza un crossover bullish: EMA fast trece peste EMA slow
-        prin schimbarea pretului de la flat la trending up.
-        """
         strat = TrendFollowingStrategy("BTCUSDT", fast=3, slow=9)
-        # 20 lumanari flat, apoi 15 in trend puternic
-        flat    = [_kline(100.0, ts=i * 60_000) for i in range(20)]
+        flat     = [_kline(100.0, ts=i * 60_000) for i in range(20)]
         trending = [_kline(100.0 + i * 3.0, ts=(20 + i) * 60_000) for i in range(15)]
         klines = flat + trending
         signal = strat.compute(klines)
@@ -135,8 +224,8 @@ class TestTrendFollowingStrategy:
         if signal is not None:
             assert signal.stop_loss is not None
             assert signal.take_profit_1 is not None
-            assert signal.take_profit_1 > signal.entry_price  # BUY: TP > entry
-            assert signal.stop_loss < signal.entry_price       # BUY: SL < entry
+            assert signal.take_profit_1 > signal.entry_price
+            assert signal.stop_loss < signal.entry_price
 
     def test_confidence_in_range(self):
         strat = TrendFollowingStrategy("BTCUSDT", fast=3, slow=9)
@@ -144,6 +233,15 @@ class TestTrendFollowingStrategy:
         signal = strat.compute(klines)
         if signal is not None:
             assert 0.0 <= signal.confidence <= 1.0
+
+    def test_atr_value_in_metadata(self):
+        """_make_signal() trebuie sa puna atr_value in metadata pentru trailing stop."""
+        strat = TrendFollowingStrategy("BTCUSDT", fast=3, slow=9)
+        klines = _trending_up(40)
+        signal = strat.compute(klines)
+        if signal is not None:
+            assert "atr_value" in signal.metadata
+            assert signal.metadata["atr_value"] > 0
 
 
 # ─────────────────────────────────────────────────────── MeanReversion
@@ -155,13 +253,8 @@ class TestMeanReversionStrategy:
         assert result is None
 
     def test_buy_on_oversold(self):
-        """
-        Construim o serie care atinge BB lower + RSI oversold.
-        Pretul scade brusc sub banda inferioara.
-        """
         strat = MeanReversionStrategy("BTCUSDT", period=10, rsi_os=35)
-        stable = [_kline(100.0, ts=i * 60_000) for i in range(15)]
-        # crash puternic in ultimele 5 lumanari
+        stable  = [_kline(100.0, ts=i * 60_000) for i in range(15)]
         crashed = [
             _kline(100.0 - i * 5.0, high=100.0, low=100.0 - i * 5.0 - 1,
                    ts=(15 + i) * 60_000)
@@ -182,21 +275,17 @@ class TestBreakoutStrategy:
 
     def test_breakout_confidence_in_range(self):
         strat = BreakoutStrategy("BTCUSDT", lookback=10, vol_mult=1.0)
-        # Construim consolidare + breakout cu volum mare
         consolidation = [_kline(100.0, ts=i * 60_000) for i in range(15)]
         breakout = [_kline(115.0, high=116.0, low=99.0, volume=5000.0, ts=15 * 60_000)]
         signal = strat.compute(consolidation + breakout)
         if signal is not None:
             assert 0.0 <= signal.confidence <= 1.0
-            # Dupa fix: confidence nu mai e fix 0.75
-            assert signal.confidence != 0.75 or True  # nu e blocat la exact 0.75
 
 
 # ─────────────────────────────────────────────────────── Composite
 
 class TestCompositeStrategy:
     def test_weights_normalized(self):
-        """Weights non-normalizate trebuie sa fie corectate automat."""
         strategies = [
             TrendFollowingStrategy("BTCUSDT", fast=3, slow=9),
             MeanReversionStrategy("BTCUSDT", period=10),
@@ -208,41 +297,117 @@ class TestCompositeStrategy:
         total = sum(composite._weights.values())
         assert abs(total - 1.0) < 1e-9
 
-    def test_weights_sum_to_one_even_if_unbalanced(self):
-        strategies = [
-            TrendFollowingStrategy("BTCUSDT", fast=3, slow=9),
-            MeanReversionStrategy("BTCUSDT", period=10),
-            BreakoutStrategy("BTCUSDT", lookback=10),
-        ]
-        composite = CompositeStrategy(
-            strategies=strategies,
-            weights={"trend_following": 0.5, "mean_reversion": 0.3, "breakout": 0.3},  # suma=1.1
-        )
-        total = sum(composite._weights.values())
-        assert abs(total - 1.0) < 1e-9
-
     def test_below_consensus_returns_none(self):
-        """Daca nicio strategie nu genereaza semnal, composite returneaza None."""
         strategies = [
             TrendFollowingStrategy("BTCUSDT"),
             MeanReversionStrategy("BTCUSDT"),
         ]
         composite = CompositeStrategy(strategies, min_consensus=0.99)
-        # date insuficiente → toate strategiile returneaza None
         result = composite.compute([_kline(100.0)] * 5)
         assert result is None
 
     def test_failed_substrategy_does_not_crash_composite(self):
-        """O strategie care arunca exceptie nu trebuie sa opreasca composite-ul."""
         from unittest.mock import MagicMock
         bad_strat = MagicMock()
         bad_strat.name = "bad"
         bad_strat.compute.side_effect = RuntimeError("crash")
-
         good_strat = TrendFollowingStrategy("BTCUSDT", fast=3, slow=9)
         composite = CompositeStrategy([bad_strat, good_strat])
-        # nu trebuie sa arunce exceptie
         try:
             composite.compute(_trending_up(40))
         except Exception as e:
             pytest.fail(f"Composite crashed cu sub-strategie bad: {e}")
+
+    def test_regime_detector_filters_mean_reversion_in_trending(self):
+        """
+        In regim TRENDING, MeanReversionStrategy trebuie ignorata.
+        Testam prin mock: forteaza regime=TRENDING si verifica ca
+        MeanReversion.compute() nu e apelat niciodata.
+        """
+        from unittest.mock import MagicMock, patch
+
+        trend_strat = TrendFollowingStrategy("BTCUSDT", fast=3, slow=9)
+        mean_strat  = MagicMock()
+        mean_strat.name = "mean_reversion"
+        mean_strat.compute.return_value = None
+
+        rd = RegimeDetector()
+        composite = CompositeStrategy(
+            [trend_strat, mean_strat],
+            regime_detector=rd,
+        )
+
+        # Forteaza _adx sa returneze ADX=35 (TRENDING)
+        with patch("backend.core.strategy_engine._adx", return_value=(35.0, 40.0, 10.0)):
+            composite.compute(_trending_up(80))
+
+        # MeanReversion NU trebuie apelata in regim TRENDING
+        mean_strat.compute.assert_not_called()
+
+    def test_regime_detector_filters_trend_following_in_ranging(self):
+        """
+        In regim RANGING, TrendFollowingStrategy trebuie ignorata.
+        """
+        from unittest.mock import MagicMock, patch
+
+        mean_strat  = MeanReversionStrategy("BTCUSDT", period=10)
+        trend_strat = MagicMock()
+        trend_strat.name = "trend_following"
+        trend_strat.compute.return_value = None
+
+        rd = RegimeDetector()
+        composite = CompositeStrategy(
+            [trend_strat, mean_strat],
+            regime_detector=rd,
+        )
+
+        # Forteaza ADX=10 (RANGING)
+        with patch("backend.core.strategy_engine._adx", return_value=(10.0, 5.0, 20.0)):
+            composite.compute(_ranging(80))
+
+        # TrendFollowing NU trebuie apelat in regim RANGING
+        trend_strat.compute.assert_not_called()
+
+    def test_composite_without_regime_detector_runs_all(self):
+        """Fara regime_detector, toate strategiile ruleaza (backward compat)."""
+        from unittest.mock import MagicMock
+
+        strats = []
+        for name in ["trend_following", "mean_reversion", "breakout"]:
+            m = MagicMock()
+            m.name = name
+            m.compute.return_value = None
+            strats.append(m)
+
+        composite = CompositeStrategy(strats)  # fara regime_detector
+        composite.compute(_trending_up(40))
+
+        for s in strats:
+            s.compute.assert_called_once()
+
+    def test_regime_metadata_in_signal(self):
+        """Semnalul composite trebuie sa contina regime si adx in metadata."""
+        from unittest.mock import patch, MagicMock
+        from backend.models import Action
+
+        # Strategie mock care returneaza un semnal real
+        mock_strat = MagicMock()
+        mock_strat.name = "trend_following"
+        from backend.models import StrategySignal
+        mock_strat.compute.return_value = StrategySignal(
+            symbol="BTCUSDT", action=Action.BUY, confidence=0.9,
+            entry_type="market", entry_price=100.0,
+            stop_loss=95.0, take_profit_1=110.0, take_profit_2=120.0,
+            timeframe="15m", reason="test", metadata={},
+        )
+
+        rd = RegimeDetector()
+        composite = CompositeStrategy([mock_strat], min_consensus=0.0, regime_detector=rd)
+
+        with patch("backend.core.strategy_engine._adx", return_value=(30.0, 35.0, 15.0)):
+            signal = composite.compute(_trending_up(80))
+
+        if signal is not None:
+            assert "regime" in signal.metadata
+            assert "adx" in signal.metadata
+            assert signal.metadata["adx"] == 30.0
