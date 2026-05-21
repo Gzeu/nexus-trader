@@ -12,9 +12,17 @@ Provider logic:
 
 Streaming: Server-Sent Events (text/event-stream) — fiecare chunk e un token.
 Frontend (useAI.ts) consumă stream-ul via fetch() + ReadableStream.
+
+Rate-limit handling (I3):
+  _stream_groq_with_retry() wraps _stream_groq() și la HTTP 429:
+    - Citeste Retry-After header (fallback 10s)
+    - await asyncio.sleep() cu cap la 60s
+    - Retry maxim MAX_RETRIES=3 ori
+    - La a 4-a eroare: SSE error + fallback la OpenAI dacă există key
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any, AsyncGenerator, Dict, Optional
@@ -29,6 +37,10 @@ from backend.config import get_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/ai", tags=["ai"])
+
+MAX_RETRIES = 3          # număr maxim retry la 429
+_RETRY_CAP_S = 60.0      # sleep maxim per retry (secunde)
+_RETRY_DEFAULT_S = 10.0  # fallback dacă Retry-After header lipsește
 
 
 # ─── Request / Response models ────────────────────────────────────────────────
@@ -79,12 +91,22 @@ def _get_provider() -> tuple[str, str, str]:
     )
 
 
+# ─── Core streaming helpers ───────────────────────────────────────────────────
+
 async def _stream_groq(
     api_key: str,
     model: str,
     messages: list[dict],
 ) -> AsyncGenerator[str, None]:
-    """Streaming SSE via Groq REST API (fără SDK — httpx async)."""
+    """Streaming SSE via Groq REST API (fără SDK — httpx async).
+
+    Yields:
+      - SSE token chunks: ``data: {"token": "..."}""
+      - SSE done marker: ``data: [DONE]""
+      - SSE error (non-retryable): ``data: {"error": "..."}""
+      - SSE rate-limit sentinel (retryable): ``data: {"_rate_limit": {"retry_after": N}}""
+        → consumat de _stream_groq_with_retry(), nu ajunge la frontend.
+    """
     try:
         import httpx
     except ImportError:
@@ -106,6 +128,25 @@ async def _stream_groq(
 
     async with httpx.AsyncClient(timeout=60.0) as client:
         async with client.stream("POST", url, headers=headers, json=payload) as resp:
+            if resp.status_code == 429:
+                # Citim header Retry-After (poate fi float sau int în secunde)
+                retry_after_raw = resp.headers.get("retry-after", str(_RETRY_DEFAULT_S))
+                try:
+                    retry_after = float(retry_after_raw)
+                except ValueError:
+                    retry_after = _RETRY_DEFAULT_S
+                retry_after = min(retry_after, _RETRY_CAP_S)
+
+                # Citim body pentru logging detaliat
+                body = await resp.aread()
+                logger.warning(
+                    "_stream_groq: 429 rate-limit — Retry-After=%.1fs — body=%s",
+                    retry_after, body.decode()[:200],
+                )
+                # Sentinel intern — va fi interceptat de _stream_groq_with_retry
+                yield f"data: {json.dumps({'_rate_limit': {'retry_after': retry_after}})}\n\n"
+                return
+
             if resp.status_code != 200:
                 body = await resp.aread()
                 yield _sse_error(f"Groq error {resp.status_code}: {body.decode()[:200]}")
@@ -125,6 +166,82 @@ async def _stream_groq(
                         yield f"data: {json.dumps({'token': delta})}\n\n"
                 except (json.JSONDecodeError, KeyError, IndexError):
                     continue
+
+
+async def _stream_groq_with_retry(
+    api_key: str,
+    model: str,
+    messages: list[dict],
+    openai_key: Optional[str] = None,
+    openai_model: str = "gpt-4o-mini",
+) -> AsyncGenerator[str, None]:
+    """
+    Wrapper cu retry automat la 429 pentru _stream_groq.
+
+    Logică:
+      1. Apelează _stream_groq și consumă stream-ul token cu token.
+      2. Dacă întâlnește sentinela _rate_limit:
+         a. Trimite SSE {"notice": "Rate limit Groq, reîncerc în Xs..."} la frontend
+         b. await asyncio.sleep(retry_after)
+         c. Încearcă din nou — maxim MAX_RETRIES ori
+      3. La epuizarea retry-urilor:
+         a. Dacă există openai_key → trimite SSE notice de fallback + streamează OpenAI
+         b. Altfel → SSE error final
+    """
+    attempt = 0
+
+    while attempt <= MAX_RETRIES:
+        collected: list[str] = []  # buffer chunks înainte de a decide
+        rate_limited = False
+        retry_after = _RETRY_DEFAULT_S
+
+        async for chunk in _stream_groq(api_key, model, messages):
+            # Detecție sentinel intern
+            if chunk.startswith("data: ") and '"_rate_limit"' in chunk:
+                try:
+                    payload = json.loads(chunk[6:])
+                    retry_after = payload["_rate_limit"]["retry_after"]
+                except (json.JSONDecodeError, KeyError):
+                    pass
+                rate_limited = True
+                break  # nu yieldăm sentinela la frontend
+
+            collected.append(chunk)
+
+        if not rate_limited:
+            # Stream complet fără rate-limit — yieldăm tot ce am colectat
+            for c in collected:
+                yield c
+            return
+
+        # Rate limited
+        attempt += 1
+        logger.warning(
+            "_stream_groq_with_retry: rate-limit attempt %d/%d, sleep %.1fs",
+            attempt, MAX_RETRIES, retry_after,
+        )
+
+        if attempt <= MAX_RETRIES:
+            # Notificăm frontend că așteptăm (non-blocking UX)
+            yield f"data: {json.dumps({'notice': f'Rate limit Groq, reîncerc în {retry_after:.0f}s... (încercare {attempt}/{MAX_RETRIES})'})}\n\n"
+            await asyncio.sleep(retry_after)
+            continue
+
+        # Epuizat retry-uri
+        if openai_key:
+            logger.warning(
+                "_stream_groq_with_retry: toate %d retry-uri epuizate — fallback la OpenAI",
+                MAX_RETRIES,
+            )
+            yield f"data: {json.dumps({'notice': 'Groq rate-limit epuizat — comut la OpenAI...'})}\n\n"
+            async for chunk in _stream_openai(openai_key, openai_model, messages):
+                yield chunk
+        else:
+            yield _sse_error(
+                f"Rate limit Groq — toate {MAX_RETRIES} retry-uri epuizate și nu există "
+                "fallback OpenAI. Setează OPENAI_API_KEY sau așteaptă și reîncearcă."
+            )
+        return
 
 
 async def _stream_openai(
@@ -221,15 +338,20 @@ async def ai_chat(
       2. Construiește system prompt cu date live din AppState (dacă include_context=True)
       3. Asamblează lista de mesaje (system + history + mesaj curent)
       4. Streamează răspunsul LLM ca Server-Sent Events
+         - Groq: prin _stream_groq_with_retry() cu retry automat la 429
+         - OpenAI: direct prin _stream_openai()
 
     SSE format per chunk:
       data: {"token": "...text fragment..."}\n\n
+    SSE notice (retry/fallback info):
+      data: {"notice": "..."}\n\n
     SSE final:
       data: [DONE]\n\n
     SSE eroare:
       data: {"error": "...mesaj eroare..."}\n\n
     """
     provider, api_key, model = _get_provider()
+    cfg = get_settings()
 
     # 1. System prompt cu context live
     if req.include_context:
@@ -251,9 +373,16 @@ async def ai_chat(
         provider, model, len(req.history), len(req.message),
     )
 
-    # 3. Stream
+    # 3. Stream — Groq cu retry 429, OpenAI direct
     if provider == "groq":
-        stream = _stream_groq(api_key, model, messages)
+        # Pasăm openai_key pentru fallback la epuizarea retry-urilor
+        openai_key: Optional[str] = cfg.openai_api_key if cfg.openai_api_key else None
+        openai_model = cfg.ai_model or "gpt-4o-mini" if openai_key else "gpt-4o-mini"
+        stream = _stream_groq_with_retry(
+            api_key, model, messages,
+            openai_key=openai_key,
+            openai_model=openai_model,
+        )
     else:
         stream = _stream_openai(api_key, model, messages)
 

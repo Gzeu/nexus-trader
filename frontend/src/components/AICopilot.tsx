@@ -4,7 +4,7 @@ import { useEffect, useRef, useState } from 'react'
 import { useAI } from '@/hooks/useAI'
 import type { AIAction, AIMessage } from '@/types/ai'
 
-// ─── Inline SVG icons ────────────────────────────────────────────────────────────────────
+// ─── Inline SVG icons ────────────────────────────────────────────────────────
 
 function SendIcon() {
   return (
@@ -59,7 +59,115 @@ function XIcon() {
   )
 }
 
-// ─── Action card cu confirmare ───────────────────────────────────────────────────────
+// ─── Markdown renderer ───────────────────────────────────────────────────────
+//
+// Reguli de securitate:
+//  - Rulează DOAR pe mesajele assistant (role !== 'user')
+//  - Orice tag HTML în input e escapuit ÎNAINTE de procesare
+//  - Textul parțial din stream e safe: token-urile deschise rămân plain text
+//
+// Sintaxă suportată (în ordinea evaluării):
+//  ### heading (h1-h4 pe baza numărului de #)
+//  **bold**   → <strong>
+//  *italic*   → <em>
+//  `cod`      → <code>
+//  - item     → <ul><li>
+//  \n\n       → paragraf nou <p>
+
+function escapeHtml(s: string): string {
+  return s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;')
+}
+
+/**
+ * Aplică formatarea inline (bold / italic / code) pe o linie deja escapuită.
+ * Robust pe text parțial: dacă un token de deschidere nu are pereche,
+ * rămâne ca text literal — nu produce tag-uri HTML deschise.
+ */
+function applyInline(line: string): string {
+  // `cod` — procesăm primul pentru a proteja conținutul de regulile de mai jos
+  line = line.replace(/`([^`]+)`/g, '<code class="ai-code">$1</code>')
+  // **bold** — se cere perechea completă pe aceeași linie
+  line = line.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+  // *italic* — nu intră în conflict cu ** deja procesat
+  line = line.replace(/\*([^*\n]+)\*/g, '<em>$1</em>')
+  return line
+}
+
+function renderMarkdown(raw: string): string {
+  // 1. Escape HTML — protecție XSS (input vine din LLM, nu de la user)
+  const escaped = escapeHtml(raw)
+
+  // 2. Normalizare line endings
+  const normalized = escaped.replace(/\r\n/g, '\n')
+
+  // 3. Split în blocuri la linii goale (\n\n+)
+  const blocks = normalized.split(/\n{2,}/)
+
+  const htmlBlocks: string[] = []
+
+  for (const block of blocks) {
+    const trimmed = block.trim()
+    if (!trimmed) continue
+
+    // ── Heading: #### ... # (1-4 #)
+    const headingMatch = trimmed.match(/^(#{1,4})\s+(.+)$/)
+    if (headingMatch) {
+      const level = Math.min(headingMatch[1].length, 4)
+      const tag = `h${level}`
+      htmlBlocks.push(`<${tag} class="ai-h${level}">${applyInline(headingMatch[2])}</${tag}>`)
+      continue
+    }
+
+    // ── Lista cu bullets: linii care încep cu "- " sau "* "
+    const lines = trimmed.split('\n')
+    const isList = lines.every(l => /^[-*]\s+/.test(l.trim()))
+    if (isList) {
+      const items = lines
+        .map(l => `<li>${applyInline(l.trim().replace(/^[-*]\s+/, ''))}</li>`)
+        .join('')
+      htmlBlocks.push(`<ul class="ai-list">${items}</ul>`)
+      continue
+    }
+
+    // ── Paragraf mixt: unele linii pot fi bullets, altele text normal
+    // Procesăm linie cu linie și grupăm consecutiv
+    const mixedParts: string[] = []
+    let listBuffer: string[] = []
+
+    function flushList() {
+      if (listBuffer.length > 0) {
+        mixedParts.push(`<ul class="ai-list">${listBuffer.join('')}</ul>`)
+        listBuffer = []
+      }
+    }
+
+    for (const line of lines) {
+      if (/^[-*]\s+/.test(line.trim())) {
+        listBuffer.push(`<li>${applyInline(line.trim().replace(/^[-*]\s+/, ''))}</li>`)
+      } else {
+        flushList()
+        const inlined = applyInline(line)
+        if (inlined.trim()) mixedParts.push(inlined)
+      }
+    }
+    flushList()
+
+    if (mixedParts.length === 1 && !mixedParts[0].startsWith('<ul')) {
+      htmlBlocks.push(`<p class="ai-p">${mixedParts[0]}</p>`)
+    } else {
+      htmlBlocks.push(mixedParts.join('\n'))
+    }
+  }
+
+  return htmlBlocks.join('\n')
+}
+
+// ─── Action card cu confirmare ───────────────────────────────────────────────
 
 const ACTION_COLORS: Record<string, string> = {
   place_order:     'var(--color-primary)',
@@ -140,7 +248,7 @@ function ActionCard({ action, onConfirm, executing, disabled }: ActionCardProps)
             transition: 'opacity 150ms',
           }}
         >
-          <CheckIcon /> Confirmă & Execută
+          <CheckIcon /> Confirmă &amp; Execută
         </button>
       )}
 
@@ -163,7 +271,7 @@ function ActionCard({ action, onConfirm, executing, disabled }: ActionCardProps)
   )
 }
 
-// ─── Mesaj individual ────────────────────────────────────────────────────────────────────────
+// ─── Mesaj individual ────────────────────────────────────────────────────────
 
 interface MessageBubbleProps {
   message: AIMessage
@@ -173,6 +281,12 @@ interface MessageBubbleProps {
 
 function MessageBubble({ message, onExecuteAction, executing }: MessageBubbleProps) {
   const isUser = message.role === 'user'
+
+  // Markdown rendering NUMAI pentru mesajele assistant.
+  // Mesajele user rămân plain text — niciodată dangerouslySetInnerHTML pe input user.
+  const renderedHtml = !isUser
+    ? renderMarkdown(message.content || '')
+    : null
 
   return (
     <div style={{
@@ -188,21 +302,42 @@ function MessageBubble({ message, onExecuteAction, executing }: MessageBubblePro
       </div>
 
       {/* Bubble */}
-      <div style={{
-        maxWidth: '90%',
-        padding: 'var(--space-2) var(--space-3)',
-        borderRadius: isUser ? 'var(--radius-lg) var(--radius-lg) var(--radius-sm) var(--radius-lg)' : 'var(--radius-lg) var(--radius-lg) var(--radius-lg) var(--radius-sm)',
-        background: isUser ? 'var(--color-primary)' : 'var(--color-surface-2)',
-        color: isUser ? '#fff' : 'var(--color-text)',
-        border: isUser ? 'none' : '1px solid var(--color-border)',
-        fontSize: 'var(--text-xs)',
-        lineHeight: 1.6,
-        whiteSpace: 'pre-wrap',
-        wordBreak: 'break-word',
-      }}>
-        {message.content || (message.streaming ? '' : '—')}
-        {message.streaming && (
-          <span style={{ display: 'inline-block', width: '2px', height: '1em', background: 'currentColor', marginLeft: '2px', animation: 'blink 1s step-end infinite', verticalAlign: 'text-bottom' }} />
+      <div
+        style={{
+          maxWidth: '90%',
+          padding: 'var(--space-2) var(--space-3)',
+          borderRadius: isUser
+            ? 'var(--radius-lg) var(--radius-lg) var(--radius-sm) var(--radius-lg)'
+            : 'var(--radius-lg) var(--radius-lg) var(--radius-lg) var(--radius-sm)',
+          background: isUser ? 'var(--color-primary)' : 'var(--color-surface-2)',
+          color: isUser ? '#fff' : 'var(--color-text)',
+          border: isUser ? 'none' : '1px solid var(--color-border)',
+          fontSize: 'var(--text-xs)',
+          lineHeight: 1.6,
+          wordBreak: 'break-word',
+          // user bubbles: pre-wrap pentru newlines; assistant: normal (Markdown gestionează)
+          whiteSpace: isUser ? 'pre-wrap' : 'normal',
+        }}
+      >
+        {isUser ? (
+          // Plain text — niciodată innerHTML pe input user
+          <>
+            {message.content || (message.streaming ? '' : '—')}
+            {message.streaming && (
+              <span className="ai-cursor" />
+            )}
+          </>
+        ) : (
+          // Markdown HTML — input este escapuit de renderMarkdown() înainte de procesare
+          <>
+            <div
+              className="ai-md"
+              dangerouslySetInnerHTML={{ __html: renderedHtml || (message.streaming ? '' : '<em style="opacity:0.5">—</em>') }}
+            />
+            {message.streaming && (
+              <span className="ai-cursor" />
+            )}
+          </>
         )}
       </div>
 
@@ -224,7 +359,7 @@ function MessageBubble({ message, onExecuteAction, executing }: MessageBubblePro
   )
 }
 
-// ─── Sugestii rapide ────────────────────────────────────────────────────────────────────────
+// ─── Sugestii rapide ─────────────────────────────────────────────────────────
 
 const QUICK_PROMPTS = [
   'Analizează starea contului meu',
@@ -234,7 +369,7 @@ const QUICK_PROMPTS = [
   'Opreşte trading-ul dacă e necesar',
 ]
 
-// ─── Component principal ────────────────────────────────────────────────────────────────────
+// ─── Component principal ─────────────────────────────────────────────────────
 
 interface AICopilotProps {
   onClose: () => void
@@ -246,7 +381,6 @@ export function AICopilot({ onClose }: AICopilotProps) {
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
 
-  // Auto-scroll la mesaje noi
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' })
   }, [messages])
@@ -274,7 +408,7 @@ export function AICopilot({ onClose }: AICopilotProps) {
       background: 'var(--color-surface)',
       borderLeft: '1px solid var(--color-border)',
     }}>
-      {/* ── Header ──────────────────────────────────────────────────────────────── */}
+      {/* ── Header ─────────────────────────────────────────────────────────── */}
       <div style={{
         display: 'flex', alignItems: 'center', justifyContent: 'space-between',
         padding: 'var(--space-3) var(--space-4)',
@@ -315,7 +449,7 @@ export function AICopilot({ onClose }: AICopilotProps) {
         </div>
       </div>
 
-      {/* ── Messages ───────────────────────────────────────────────────────────── */}
+      {/* ── Messages ───────────────────────────────────────────────────────── */}
       <div style={{
         flex: 1,
         overflowY: 'auto',
@@ -369,7 +503,7 @@ export function AICopilot({ onClose }: AICopilotProps) {
         <div ref={messagesEndRef} />
       </div>
 
-      {/* ── Input ────────────────────────────────────────────────────────────────── */}
+      {/* ── Input ──────────────────────────────────────────────────────────── */}
       <div style={{
         padding: 'var(--space-3) var(--space-4)',
         borderTop: '1px solid var(--color-border)',
@@ -432,8 +566,70 @@ export function AICopilot({ onClose }: AICopilotProps) {
         </div>
       </div>
 
+      {/* ── Scoped styles ──────────────────────────────────────────────────── */}
       <style>{`
         @keyframes blink { 0%, 100% { opacity: 1; } 50% { opacity: 0; } }
+
+        .ai-cursor {
+          display: inline-block;
+          width: 2px;
+          height: 1em;
+          background: currentColor;
+          margin-left: 2px;
+          animation: blink 1s step-end infinite;
+          vertical-align: text-bottom;
+        }
+
+        /* ── Markdown output styles (scoped via .ai-md parent) ── */
+        .ai-md { line-height: 1.65; }
+
+        .ai-md .ai-p {
+          margin: 0 0 var(--space-2);
+        }
+        .ai-md .ai-p:last-child { margin-bottom: 0; }
+
+        .ai-md .ai-h1,
+        .ai-md .ai-h2,
+        .ai-md .ai-h3,
+        .ai-md .ai-h4 {
+          font-weight: 700;
+          line-height: 1.3;
+          margin: var(--space-3) 0 var(--space-1);
+          color: var(--color-text);
+        }
+        .ai-md .ai-h1:first-child,
+        .ai-md .ai-h2:first-child,
+        .ai-md .ai-h3:first-child,
+        .ai-md .ai-h4:first-child { margin-top: 0; }
+
+        .ai-md .ai-h1 { font-size: calc(var(--text-xs) * 1.25); }
+        .ai-md .ai-h2 { font-size: calc(var(--text-xs) * 1.15); }
+        .ai-md .ai-h3 { font-size: var(--text-xs); }
+        .ai-md .ai-h4 { font-size: var(--text-xs); opacity: 0.85; }
+
+        .ai-md .ai-list {
+          margin: var(--space-1) 0 var(--space-2) var(--space-4);
+          padding: 0;
+          list-style: disc;
+        }
+        .ai-md .ai-list li {
+          margin-bottom: var(--space-1);
+          line-height: 1.55;
+        }
+        .ai-md .ai-list:last-child { margin-bottom: 0; }
+
+        .ai-md .ai-code {
+          font-family: ui-monospace, 'Cascadia Code', 'Source Code Pro', monospace;
+          font-size: 0.9em;
+          background: var(--color-surface-offset);
+          border: 1px solid var(--color-border);
+          border-radius: var(--radius-sm);
+          padding: 0.1em 0.35em;
+          white-space: nowrap;
+        }
+
+        .ai-md strong { font-weight: 700; }
+        .ai-md em     { font-style: italic; }
       `}</style>
     </div>
   )
