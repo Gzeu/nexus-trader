@@ -3,6 +3,7 @@
 import { useState, useEffect } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
+import { AICopilot } from '@/components/AICopilot'
 
 const NAV = [
   { href: '/',          label: 'Overview',   icon: GridIcon },
@@ -13,9 +14,13 @@ const NAV = [
   { href: '/settings',  label: 'Settings',   icon: CogIcon },
 ]
 
+// Latimea panoului AI — ajustabila
+const AI_PANEL_WIDTH = 320
+
 export function DashboardShell({ children }: { children: React.ReactNode }) {
   const pathname = usePathname()
   const [theme, setTheme] = useState<'dark' | 'light'>('dark')
+  const [aiOpen, setAiOpen] = useState(false)
 
   useEffect(() => {
     const saved = (localStorage.getItem('nt-theme') ?? 'dark') as 'dark' | 'light'
@@ -31,8 +36,13 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
   }
 
   return (
-    <div className="dashboard-shell">
-      {/* ── Sidebar ─────────────────────────────────────────── */}
+    <div className="dashboard-shell" style={{
+      // Adauga coloana AI la dreapta cand panelul e deschis
+      gridTemplateColumns: aiOpen
+        ? `var(--sidebar-width) 1fr ${AI_PANEL_WIDTH}px`
+        : 'var(--sidebar-width) 1fr',
+    }}>
+      {/* ── Sidebar ──────────────────────────────────────────────────────────────────── */}
       <aside className="dashboard-sidebar" style={{
         background: 'var(--color-surface)',
         borderRight: '1px solid var(--color-border)',
@@ -73,8 +83,27 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
           })}
         </nav>
 
-        {/* Bottom: theme toggle */}
-        <div style={{ padding: 'var(--space-4)', borderTop: '1px solid var(--color-border)' }}>
+        {/* Bottom: AI toggle + theme toggle */}
+        <div style={{ padding: 'var(--space-4)', borderTop: '1px solid var(--color-border)', display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
+          {/* AI Copilot toggle button */}
+          <button
+            onClick={() => setAiOpen(o => !o)}
+            className="btn btn-ghost btn-sm"
+            style={{
+              width: '100%',
+              justifyContent: 'flex-start',
+              color: aiOpen ? 'var(--color-primary)' : undefined,
+              background: aiOpen ? 'var(--color-primary-dim)' : undefined,
+              border: aiOpen ? '1px solid var(--color-primary-border)' : '1px solid transparent',
+            }}
+          >
+            <SparkleIcon size={14} />
+            AI Copilot
+            {aiOpen && (
+              <span style={{ marginLeft: 'auto', fontSize: 'var(--text-xs)', color: 'var(--color-primary)', background: 'var(--color-primary-dim)', padding: '1px 6px', borderRadius: 'var(--radius-full)' }}>ON</span>
+            )}
+          </button>
+
           <button onClick={toggleTheme} className="btn btn-ghost btn-sm" style={{ width: '100%', justifyContent: 'flex-start' }}>
             {theme === 'dark' ? <SunIcon size={14} /> : <MoonIcon size={14} />}
             {theme === 'dark' ? 'Light mode' : 'Dark mode'}
@@ -82,7 +111,7 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
         </div>
       </aside>
 
-      {/* ── Header ──────────────────────────────────────────── */}
+      {/* ── Header ───────────────────────────────────────────────────────────────────── */}
       <header className="dashboard-header" style={{
         background: 'var(--color-surface)',
         borderBottom: '1px solid var(--color-border)',
@@ -98,15 +127,35 @@ export function DashboardShell({ children }: { children: React.ReactNode }) {
         </div>
       </header>
 
-      {/* ── Main ────────────────────────────────────────────── */}
+      {/* ── Main ────────────────────────────────────────────────────────────────────────── */}
       <main className="dashboard-main" style={{ padding: 'var(--space-6)' }}>
         <div className="animate-fade-up">{children}</div>
       </main>
+
+      {/* ── AI Copilot Panel ─────────────────────────────────────────────────────────────── */}
+      {aiOpen && (
+        <aside
+          className="dashboard-ai-panel"
+          style={{
+            gridRow: '1 / -1',     // ocupa toata inaltimea (header + main)
+            gridColumn: '3',
+            height: '100dvh',
+            position: 'sticky',
+            top: 0,
+            overflow: 'hidden',
+            display: 'flex',
+            flexDirection: 'column',
+          }}
+        >
+          <AICopilot onClose={() => setAiOpen(false)} />
+        </aside>
+      )}
     </div>
   )
 }
 
-// ─── Status pill (connects to health endpoint) ────────────────────────────
+// ─── Status pill (connects to health endpoint) ─────────────────────────────────────────
+
 function StatusPill() {
   const [status, setStatus] = useState<'live'|'paused'|'offline'>('offline')
   useEffect(() => {
@@ -131,7 +180,8 @@ function StatusPill() {
   )
 }
 
-// ─── Inline SVG Icons ─────────────────────────────────────────────────────
+// ─── Inline SVG Icons ──────────────────────────────────────────────────────────────────────────
+
 function Icon({ d, size=16 }: { d: string, size?: number }) {
   return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d={d}/></svg>
 }
@@ -143,6 +193,13 @@ function ShieldIcon(p: {size?:number}) { return <Icon d="M12 22s8-4 8-10V5l-8-3-
 function CogIcon(p: {size?:number})    { return <svg width={p.size??16} height={p.size??16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg> }
 function SunIcon(p: {size?:number})    { return <svg width={p.size??16} height={p.size??16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><circle cx="12" cy="12" r="5"/><path d="M12 1v2M12 21v2M4.22 4.22l1.42 1.42M18.36 18.36l1.42 1.42M1 12h2M21 12h2M4.22 19.78l1.42-1.42M18.36 5.64l1.42-1.42"/></svg> }
 function MoonIcon(p: {size?:number})   { return <Icon d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z" size={p.size} /> }
+function SparkleIcon(p: {size?:number}) {
+  return (
+    <svg width={p.size??16} height={p.size??16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+      <path d="M12 2L14.5 9.5L22 12L14.5 14.5L12 22L9.5 14.5L2 12L9.5 9.5L12 2Z" />
+    </svg>
+  )
+}
 
 function NexusLogo() {
   return (
