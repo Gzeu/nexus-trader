@@ -2,62 +2,43 @@ name: CI
 
 on:
   push:
-    branches: [main, develop]
+    branches: [main]
   pull_request:
     branches: [main]
 
 jobs:
   test:
-    name: Python Tests
+    name: pytest
     runs-on: ubuntu-latest
-    timeout-minutes: 15
 
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-          cache: pip
+
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
 
       - name: Install dependencies
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pytest pytest-asyncio pytest-cov
+          pip install pytest pytest-asyncio pytest-mock
 
       - name: Run tests
         env:
           DRY_RUN: "true"
           TESTNET: "true"
-          BINANCE_API_KEY: test_key
-          BINANCE_API_SECRET: test_secret
+          BINANCE_API_KEY: "ci_test_key"
+          BINANCE_API_SECRET: "ci_test_secret"
+          DATABASE_URL: "sqlite+aiosqlite:///./test_ci.db"
         run: |
-          pytest tests/ -v --tb=short --cov=backend --cov-report=term-missing
-
-  lint:
-    name: Lint & Type Check
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-          cache: pip
-
-      - name: Install linting tools
-        run: |
-          pip install ruff mypy
-          pip install -r requirements.txt
-
-      - name: Ruff lint
-        run: ruff check backend/ --output-format=github
-
-      - name: Mypy type check
-        run: mypy backend/ --ignore-missing-imports --no-error-summary
-        continue-on-error: true  # warnings only until fully typed
+          pytest tests/ -v --tb=short

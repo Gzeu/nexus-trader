@@ -8,6 +8,8 @@ CHANGELOG:
   🔴 /signals fara response_model — returneaza List[dict] cu signal_status atasat
   🟡 peak_equity expus prin state.risk.peak_equity (property public in risk_manager)
   🟢 /settings GET + PATCH + DELETE — runtime overrides pentru SettingsPage.tsx
+  🟡 /health extins cu risk metrics: consecutive_losses, daily_pnl, max_drawdown_seen,
+     is_paused — util pentru dashboards si health probes externe.
 """
 from __future__ import annotations
 
@@ -25,7 +27,7 @@ from backend.models_extra import AccountInfo, BalanceSummary
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# ─────────────────────────────────────────── settings store (in-memory overrides)
+# ───────────────────────────────────────────── settings store (in-memory overrides)
 
 # Cheile sensibile nu sunt returnate niciodata in GET /settings
 _SENSITIVE_KEYS: Set[str] = {
@@ -40,17 +42,32 @@ _SENSITIVE_KEYS: Set[str] = {
 _settings_overrides: Dict[str, Any] = {}
 
 
-# ─────────────────────────────────────────── health / status
+# ───────────────────────────────────────────── health / status
 
 @router.get("/health")
 async def health(state: AppState = Depends(get_state)) -> Dict[str, Any]:
+    """
+    System health check.
+
+    🟡 Extins cu risk metrics (consecutive_losses, daily_pnl, max_drawdown_seen, is_paused)
+    pentru a permite health probes externe si dashboard-uri sa detecteze rapid
+    daca sistemul e blocat sau in drawdown fara sa apeleze /metrics.
+    """
     cfg = get_settings()
+    rm  = state.risk
     return {
-        "status": "ok",
-        "reconciled": state.portfolio.is_ready,
-        "dry_run": cfg.dry_run,
-        "testnet": cfg.testnet,
+        "status":             "ok",
+        "reconciled":         state.portfolio.is_ready,
+        "dry_run":            cfg.dry_run,
+        "testnet":            cfg.testnet,
         "automation_running": state.automation.running,
+        "risk": {
+            "is_paused":           rm.is_paused,
+            "consecutive_losses":  rm.consecutive_losses,
+            "daily_pnl":           round(rm.daily_pnl, 2),
+            "max_drawdown_seen":   round(rm.max_drawdown_seen, 4),
+            "peak_equity":         round(rm.peak_equity, 2),
+        },
     }
 
 
@@ -106,7 +123,7 @@ async def metrics(state: AppState = Depends(get_state)) -> Dict[str, Any]:
     }
 
 
-# ─────────────────────────────────────────── account / balance
+# ──────────────────────────────────────────────────── account / balance
 
 @router.get("/account", response_model=AccountInfo)
 async def get_account(state: AppState = Depends(get_state)) -> AccountInfo:
@@ -120,7 +137,7 @@ async def get_balance(state: AppState = Depends(get_state)) -> BalanceSummary:
     return await state.portfolio.get_balance_summary()
 
 
-# ─────────────────────────────────────────── positions / orders
+# ──────────────────────────────────────────────────── positions / orders
 
 @router.get("/positions", response_model=List[Position])
 async def get_positions(state: AppState = Depends(get_state)) -> List[Position]:
@@ -132,7 +149,7 @@ async def get_orders(state: AppState = Depends(get_state)) -> List[Order]:
     return state.portfolio.get_open_orders()
 
 
-# ─────────────────────────────────────────── signals
+# ──────────────────────────────────────────────────── signals
 
 @router.get("/signals")
 async def get_signals(
@@ -149,7 +166,7 @@ async def get_signals(
     return state.automation.get_recent_signals(limit=limit)
 
 
-# ─────────────────────────────────────────── settings (runtime overrides)
+# ──────────────────────────────────────────────────── settings (runtime overrides)
 
 @router.get("/settings")
 async def get_settings_endpoint() -> Dict[str, Any]:
@@ -239,7 +256,7 @@ async def delete_settings_overrides() -> Dict[str, Any]:
     }
 
 
-# ─────────────────────────────────────────── manual order
+# ──────────────────────────────────────────────────── manual order
 
 class PlaceOrderRequest(BaseModel):
     symbol: str
@@ -276,7 +293,7 @@ async def place_order(
         raise HTTPException(status_code=500, detail=str(exc))
 
 
-# ─────────────────────────────────────────── journal
+# ──────────────────────────────────────────────────── journal
 
 @router.get("/journal/trades")
 async def journal_trades(
@@ -299,7 +316,7 @@ async def journal_signals(
     return {"signals": signals, "count": len(signals)}
 
 
-# ─────────────────────────────────────────── kill switches
+# ──────────────────────────────────────────────────── kill switches
 
 @router.post("/emergency_stop")
 async def emergency_stop(state: AppState = Depends(get_state)) -> Dict[str, str]:
