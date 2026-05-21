@@ -1,137 +1,151 @@
 """
-ai_context.py — Construieste system prompt-ul si contextul live pentru AI Copilot.
+ai_context.py — Construiește system prompt-ul AI Copilot cu date live.
 
-Injecteaza date reale din AppState: metrics, positions, signals, risk state.
-Astfel LLM-ul are context complet despre starea contului cand raspunde.
+Injectează în prompt:
+  - Equity, available margin, unrealized PnL
+  - Risk state (paused, drawdown, daily PnL, consecutive losses)
+  - Pozițiile deschise curente (symbol, side, size, entry, unrealized PnL)
+  - Ultimele 5 semnale generate de AutomationEngine
+  - Configurație sistem (dry_run, testnet, market_mode, automation running)
+
+Folosit exclusiv de ai_routes.py → POST /api/v1/ai/chat.
 """
 from __future__ import annotations
 
-import json
 import logging
-from typing import Any, Dict
+from datetime import datetime, timezone
 
 from backend.api.state import AppState
 
 logger = logging.getLogger(__name__)
 
 
-ASSTANT_SYSTEM_PROMPT = """
-Esti NexusAI, asistentul inteligent al platformei NexusTrader — un sistem automat
-de trading pe Binance Spot si Futures.
+async def build_system_prompt(state: AppState) -> str:
+    """
+    Construiește un system prompt detaliat cu starea live a sistemului.
+    Toate erorile de fetch sunt prinse — prompt-ul se construiește parțial
+    dacă unele date nu sunt disponibile momentan.
+    """
+    lines: list[str] = [
+        "Ești NexusTrader AI Copilot, un asistent expert în trading automatizat pe Binance (Spot + Futures).",
+        "Răspunzi în română sau engleză în funcție de limbajul user-ului.",
+        "Ești concis, direct și bazat pe date. Nu inventa cifre.",
+        "",
+        f"=== STAREA SISTEMULUI (actualizat: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}) ===",
+    ]
 
-ROLUL TAU:
-- Analizezi datele live ale contului (equity, pozitii, semnale, risc)
-- Raspunzi la intrebari despre starea trading-ului
-- Poti propune actiuni concrete: place_order, emergency_stop, resume_trading,
-  cancel_all, close_all, close_position, patch_settings
-- NU executi niciodata actiuni autonom — propui, iar traderul confirma
-
-CUM PROPUI ACTIUNI:
-Cand vrei sa propui o actiune, include in raspuns un bloc JSON special:
-
-<action>
-{{
-  "type": "place_order" | "emergency_stop" | "resume_trading" | "cancel_all" | "close_all" | "close_position" | "patch_settings",
-  "label": "Text scurt afisat pe butonul de confirmare",
-  "description": "Explicatie de ce recomanzi aceasta actiune",
-  "params": {{ ... parametri specifici actiunii ... }}
-}}
-</action>
-
-Pentru place_order, params trebuie sa contina:
-  symbol, side ("BUY"|"SELL"), quantity, order_type (default "MARKET"),
-  price (optional), stop_loss (optional), take_profit (optional)
-
-Pentru patch_settings, params trebuie sa contina:
-  data: {{ key: value, ... }} — ex: {{ "risk_per_trade": 0.005 }}
-
-Pentru close_position, params trebuie sa contina:
-  symbol (string)
-
-REGULI:
-- Fii concis si direct. Datele de trading sunt exacte, nu aproxima.
-- Daca nu ai date suficiente, cere clarificari.
-- Nu inventa valori — foloseste doar datele din contextul de mai jos.
-- Moneda de baza este USDT daca nu se specifica altfel.
-- Raspunde intotdeauna in limba in care ti se vorbeste (romana sau engleza).
-"""
-
-
-async def build_context(state: AppState) -> str:
-    """Construieste un bloc de context JSON cu datele live din AppState."""
-    ctx: Dict[str, Any] = {}
-
-    # 1. Metrics / equity
+    # ── Config de bază ────────────────────────────────────────────────────────
     try:
-        balance = await state.portfolio.get_balance_summary()
-        rm = state.portfolio.get_risk_metrics()
-        peak_eq = state.risk.peak_equity
-        total_eq = balance.total_usdt_value
-        drawdown_pct = round((1.0 - total_eq / peak_eq) * 100, 2) if peak_eq > 0 else 0.0
-        ctx["account"] = {
-            "equity": round(total_eq, 2),
-            "available": round(balance.available_margin, 2),
-            "unrealized_pnl": round(balance.unrealized_pnl, 2),
-            "realized_pnl": round(rm.gross_profit - rm.gross_loss, 2),
-            "win_rate": rm.win_rate,
-            "total_trades": rm.total_trades,
-            "profit_factor": rm.profit_factor,
-            "drawdown_pct": drawdown_pct,
-        }
-    except Exception as exc:
-        logger.warning("ai_context: balance fetch failed: %s", exc)
-        ctx["account"] = {"error": "balance unavailable"}
-
-    # 2. Risk state
-    ctx["risk"] = {
-        "is_paused": state.risk.is_paused,
-        "pause_reason": getattr(state.risk, "pause_reason", None),
-        "consecutive_losses": state.risk.consecutive_losses,
-        "daily_pnl": state.risk.daily_pnl,
-        "max_drawdown_seen": state.risk.max_drawdown_seen,
-    }
-
-    # 3. Pozitii deschise
-    try:
-        positions = state.portfolio.get_positions()
-        ctx["open_positions"] = [
-            {
-                "symbol": p.symbol,
-                "side": p.side,
-                "quantity": p.quantity,
-                "entry_price": p.entry_price,
-                "current_price": p.current_price,
-                "unrealized_pnl": p.unrealized_pnl,
-                "stop_loss": p.stop_loss,
-                "take_profit_1": p.take_profit_1,
-            }
-            for p in positions
+        from backend.config import get_settings
+        cfg = get_settings()
+        lines += [
+            f"Mod: {'DRY RUN (simulare, fără ordine reale)' if cfg.dry_run else 'LIVE TRADING'}",
+            f"Testnet: {'DA' if cfg.testnet else 'NU'}",
+            f"Market mode: {cfg.market_mode.upper()}",
+            f"Automation: {'RUNNING' if state.automation.running else 'STOPPED'}",
+            f"Simboluri monitorizate: {cfg.symbols}",
         ]
     except Exception as exc:
-        logger.warning("ai_context: positions fetch failed: %s", exc)
-        ctx["open_positions"] = []
+        logger.warning("ai_context: config fetch failed: %s", exc)
+        lines.append("Config: indisponibil momentan")
 
-    # 4. Ultimele 5 semnale
+    # ── Metrics / Equity ──────────────────────────────────────────────────────
+    lines.append("")
+    lines.append("--- Financiar ---")
+    try:
+        balance = await state.portfolio.get_balance_summary()
+        lines += [
+            f"Equity total: ${balance.total_usdt_value:.2f} USDT",
+            f"Margin disponibil: ${balance.available_margin:.2f} USDT",
+            f"Unrealized PnL: ${balance.unrealized_pnl:.2f} USDT",
+        ]
+    except Exception as exc:
+        logger.warning("ai_context: balance fetch failed: %s", exc)
+        # Fallback la equity cached
+        equity = state.portfolio.get_equity()
+        lines.append(f"Equity (cached): ${equity:.2f} USDT (date live indisponibile)")
+
+    # ── Risk state ────────────────────────────────────────────────────────────
+    lines.append("")
+    lines.append("--- Risk Manager ---")
+    try:
+        rm = state.risk
+        peak = rm.peak_equity
+        equity_now = state.portfolio.get_equity()
+        drawdown = round((1.0 - equity_now / peak) * 100, 2) if peak > 0 else 0.0
+        lines += [
+            f"Status: {'⛔ PAUZAT' if rm.is_paused else '✅ ACTIV'}",
+            f"Daily PnL: ${rm.daily_pnl:.2f} USDT",
+            f"Drawdown curent: {drawdown}%",
+            f"Max drawdown văzut: {rm.max_drawdown_seen:.2f}%",
+            f"Pierderi consecutive: {rm.consecutive_losses}",
+        ]
+    except Exception as exc:
+        logger.warning("ai_context: risk state failed: %s", exc)
+        lines.append("Risk state: indisponibil")
+
+    # ── Poziții deschise ──────────────────────────────────────────────────────
+    lines.append("")
+    lines.append("--- Poziții deschise ---")
+    try:
+        positions = state.portfolio.get_positions()
+        if not positions:
+            lines.append("Nicio poziție deschisă.")
+        else:
+            for pos in positions:
+                upnl = pos.unrealized_pnl if pos.unrealized_pnl is not None else 0.0
+                lines.append(
+                    f"  {pos.symbol} {pos.side} | qty={pos.quantity} "
+                    f"| entry=${pos.entry_price:.4f} "
+                    f"| uPnL=${upnl:.2f}"
+                )
+    except Exception as exc:
+        logger.warning("ai_context: positions failed: %s", exc)
+        lines.append("Poziții: indisponibile")
+
+    # ── Ultimele semnale ──────────────────────────────────────────────────────
+    lines.append("")
+    lines.append("--- Ultimele 5 semnale ---")
     try:
         signals = state.automation.get_recent_signals(limit=5)
-        ctx["recent_signals"] = signals
+        if not signals:
+            lines.append("Niciun semnal recent.")
+        else:
+            for sig in signals:
+                symbol = sig.get("symbol", "?")
+                action = sig.get("action", sig.get("signal_type", "?"))
+                confidence = sig.get("confidence", sig.get("strength", ""))
+                ts = sig.get("timestamp", sig.get("created_at", ""))
+                conf_str = f" | confidence={confidence}" if confidence else ""
+                ts_str = f" | {ts}" if ts else ""
+                lines.append(f"  {symbol} → {action}{conf_str}{ts_str}")
     except Exception as exc:
-        logger.warning("ai_context: signals fetch failed: %s", exc)
-        ctx["recent_signals"] = []
+        logger.warning("ai_context: signals failed: %s", exc)
+        lines.append("Semnale: indisponibile")
 
-    # 5. System config relevant
-    from backend.config import get_settings
-    cfg = get_settings()
-    ctx["config"] = {
-        "market_mode": cfg.market_mode,
-        "dry_run": cfg.dry_run,
-        "testnet": cfg.testnet,
-        "symbols": cfg.symbols_list,
-        "max_positions": cfg.max_positions,
-        "risk_per_trade": cfg.risk_per_trade,
-        "max_daily_loss": cfg.max_daily_loss,
-        "max_drawdown": cfg.max_drawdown,
-        "automation_running": state.automation.running,
-    }
+    # ── Trade analytics ───────────────────────────────────────────────────────
+    lines.append("")
+    lines.append("--- Analytics trades ---")
+    try:
+        rm_stats = state.portfolio.get_risk_metrics()
+        lines += [
+            f"Total trades: {rm_stats.total_trades}",
+            f"Win rate: {rm_stats.win_rate:.1f}%",
+            f"Profit factor: {rm_stats.profit_factor:.2f}",
+            f"Sharpe ratio: {rm_stats.sharpe_ratio:.2f}",
+            f"Expectancy: ${rm_stats.expectancy:.2f}",
+        ]
+    except Exception as exc:
+        logger.warning("ai_context: analytics failed: %s", exc)
+        lines.append("Analytics: indisponibile")
 
-    return json.dumps(ctx, indent=2, default=str)
+    lines += [
+        "",
+        "=== INSTRUCȚIUNI ===",
+        "- Bazează-te EXCLUSIV pe datele de mai sus când răspunzi despre starea sistemului.",
+        "- Dacă datele lipsesc, spune că sunt temporar indisponibile.",
+        "- Nu executa niciodată ordine reale — ești în modul read-only/analiză.",
+        "- La întrebări despre setup/configurație, explică clar pașii.",
+    ]
+
+    return "\n".join(lines)
