@@ -3,10 +3,7 @@ AutomationEngine — scheduler + event emitter pentru trading automat.
 
 CHANGELOG:
   🔴 FIX A       : risk.update_equity() apelat dupa place_order() si dupa close pozitie
-                   Fara acest apel, RiskManager vedea _equity=0 → drawdown calculat fata
-                   de 0 → ZeroDivisionError sau veto imediat la primul semnal.
   🟠 FIX B       : dublu assignment 'order_timeout = cfg = get_settings()' eliminat.
-                   Prima linie seta order_timeout = AppSettings (obiect!), suprascrisa imediat.
   🔴 FIX #1 (prev): _placed_ids TTL-based (Dict[str, float] + monotonic())
   🔴 FIX #3 (prev): realized_pnl calculat corect la on_trade_closed()
   🔴 FIX #1 (curr): pos.side normalization — check 'SHORT'|'SELL' pentru Futures
@@ -19,8 +16,11 @@ CHANGELOG:
   🟡 FIX #6 (prev): place_order() wrapped cu asyncio.wait_for(cfg.order_timeout_seconds)
   🔴 FIX REVIEW #1: klines fetched cu cfg.primary_timeframe in loc de "1m" hardcodat
   🟠 FIX REVIEW #4: on_position_opened() apelat INAINTE de place_order cu rollback pe esec
-  🟡 REFACTOR     : rollback foloseste risk.rollback_position_opened() — nu mai acceseaza
-                    _open_symbols direct (atribut privat al RiskManager).
+  🟡 REFACTOR     : rollback foloseste risk.rollback_position_opened() — encapsulare corecta
+  🔴 FIX TRADE #1  : update_trailing_stop() apelat in _manage_open_positions() la fiecare tick
+  🔴 FIX TRADE #2  : evaluate_exit() primeste opposite_signal generat in _process_symbol()
+  🟠 FIX TRADE #3  : update_position_after_tp1() apelat si salvat in portfolio dupa TP1 hit
+  🟠 FIX TRADE #4  : semnal curent per simbol pastrat in _latest_signals pentru opposite_signal
 """
 from __future__ import annotations
 
@@ -35,12 +35,12 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from backend.config import get_settings
 from backend.models import StrategySignal
+from backend.core.trade_logic import ExitDecision, update_position_after_tp1, update_trailing_stop
 
 logger = logging.getLogger(__name__)
 
 _PLACED_TTL: float = 3600.0
 _SEEN_CANDLES_MAXLEN = 200
-# 🟡 FIX #2 (curr): cap pentru _midnight_reset() trim — previne acumulare la interval mare (ex: 60m)
 _SEEN_CANDLES_KEEP_MAX = 20
 
 
@@ -98,11 +98,11 @@ class AutomationEngine:
         self._recent_signals: List[Dict[str, Any]] = []
         self._tick_count     = 0
 
-        # TTL-based idempotency store — Dict[signal_id, monotonic_timestamp]
         self._placed_ids: Dict[str, float] = {}
-
-        # 🟡 FIX #5 (curr): _seen_candles initializat consistent cu deque(maxlen=_SEEN_CANDLES_MAXLEN)
         self._seen_candles: Dict[str, deque] = {}
+
+        # 🟠 FIX TRADE #4: ultimul semnal per simbol — folosit ca opposite_signal in _manage_open_positions()
+        self._latest_signals: Dict[str, StrategySignal] = {}
 
         self._events = EventEmitter()
 
@@ -159,7 +159,6 @@ class AutomationEngine:
             logger.debug("[automation] tick skipped — risk paused")
             return
 
-        # Cleanup seen_candles pentru simboluri retrase din whitelist
         if self._tick_count % 1000 == 0:
             active = set(self._cfg.symbol_whitelist)
             stale = [s for s in list(self._seen_candles) if s not in active]
@@ -178,7 +177,6 @@ class AutomationEngine:
 
     async def _process_symbol(self, symbol: str) -> None:
         """Genereaza semnal, valideaza risc, executa daca OK."""
-        # 🔴 FIX REVIEW #1: foloseste primary_timeframe din config, nu "1m" hardcodat
         timeframe = self._cfg.primary_timeframe
         try:
             klines = await self._client.get_klines(symbol, interval=timeframe, limit=100)
@@ -189,10 +187,15 @@ class AutomationEngine:
         signal: Optional[StrategySignal] = await asyncio.to_thread(
             self._strategy.compute, klines
         )
+
+        # 🟠 FIX TRADE #4: salveaza cel mai recent semnal per simbol
+        # Folosit de _manage_open_positions() ca potential opposite_signal
+        if signal is not None and signal.action != "HOLD":
+            self._latest_signals[symbol] = signal
+
         if signal is None or signal.action == "HOLD":
             return
 
-        # Anti-duplicate per candle
         candle_key = str(getattr(signal, "candle_open_time", "") or "")
         if candle_key:
             if symbol not in self._seen_candles:
@@ -206,7 +209,6 @@ class AutomationEngine:
                 return
             self._seen_candles[symbol].append(candle_key)
 
-        # Risk check
         veto = self._risk.check_signal(signal)
         if veto.value != "PASS":
             logger.info(
@@ -219,7 +221,6 @@ class AutomationEngine:
             await self._events.emit("signal_rejected", {"signal": signal, "reason": veto.value})
             return
 
-        # TTL idempotency check
         signal_id = f"{symbol}:{signal.action}:{candle_key}"
         if self._is_duplicate(signal_id):
             logger.debug("[automation] idempotency skip (TTL): %s", signal_id)
@@ -255,10 +256,6 @@ class AutomationEngine:
 
         order_timeout = cfg.order_timeout_seconds
 
-        # 🟠 FIX REVIEW #4: on_position_opened() inainte de place_order
-        # cu rollback explicit daca place_order esueaza sau da timeout.
-        # 🟡 REFACTOR: foloseste rollback_position_opened() public — nu mai acceseaza
-        # self._risk._open_symbols direct.
         self._risk.on_position_opened(signal.symbol)
         order_placed = False
         try:
@@ -283,11 +280,9 @@ class AutomationEngine:
             )
         finally:
             if not order_placed:
-                # 🟡 REFACTOR: rollback prin metoda publica — encapsulare corecta
                 self._risk.rollback_position_opened(signal.symbol)
                 return
 
-        # 🔴 FIX A: Sincronizeaza equity in RiskManager dupa fiecare order plasat.
         equity_after = self._portfolio.get_equity()
         self._risk.update_equity(equity_after)
         logger.debug(
@@ -304,15 +299,32 @@ class AutomationEngine:
 
         for pos in positions:
             try:
-                # 🟠 FIX #2 (prev): foloseste property public price_cache
                 price = self._portfolio.price_cache.get(pos.symbol)
                 if not price:
                     continue
 
+                # 🔴 FIX TRADE #1: update trailing stop la fiecare tick, inainte de evaluate_exit()
+                # Fara acest apel, trailing stop-ul era setat la intrare si nu se misca niciodata.
+                pos = update_trailing_stop(pos, price)
+
+                # 🟠 FIX TRADE #2: paseaza opposite_signal la evaluate_exit()
+                # Anterior: evaluate_exit(pos, price) fara semnal opus → SIGNAL_CLOSE niciodata trigger.
+                opposite_signal = self._latest_signals.get(pos.symbol)
+                # Un semnal e "opus" doar daca directia e contrara pozitiei deschise
+                if opposite_signal is not None:
+                    from backend.models import Action
+                    pos_is_long = pos.side.upper() in ("BUY", "LONG")
+                    is_opposite = (
+                        (pos_is_long and opposite_signal.action == Action.SELL) or
+                        (not pos_is_long and opposite_signal.action == Action.BUY)
+                    )
+                    if not is_opposite:
+                        opposite_signal = None
+
                 exit_reason, close_fraction = (None, 0.0)
                 if hasattr(self._execution, "evaluate_exit"):
                     exit_reason, close_fraction = self._execution.evaluate_exit(
-                        position=pos, current_price=price
+                        position=pos, current_price=price, opposite_signal=opposite_signal
                     )
 
                 if exit_reason and close_fraction > 0:
@@ -325,7 +337,6 @@ class AutomationEngine:
                     close_qty = round(pos.quantity * close_fraction, 8)
                     side = "SELL" if pos.side == "BUY" else "BUY"
 
-                    # 🟠 FIX B: split dublu assignment
                     cfg = get_settings()
                     order_timeout = cfg.order_timeout_seconds
                     try:
@@ -346,69 +357,70 @@ class AutomationEngine:
                         )
                         continue
 
-                    if close_fraction >= 1.0:
+                    if exit_reason == ExitDecision.TP1:
+                        # 🟠 FIX TRADE #3: TP1 → apeleaza update_position_after_tp1() si salveaza in portfolio
+                        # Anterior: tp1_hit si SL breakeven nu erau niciodata persistate.
+                        # La restart/reconciliere, sistemul incerca TP1 din nou pe aceeasi pozitie.
+                        updated = update_position_after_tp1(pos, price)
+                        self._portfolio.update_position(updated)
+                        logger.info(
+                            "[automation] TP1 hit — breakeven set: symbol=%s new_sl=%.4f",
+                            pos.symbol, updated.stop_loss,
+                        )
+                        equity_after = self._portfolio.get_equity()
+                        self._risk.update_equity(equity_after)
+                        await self._events.emit(
+                            "tp_hit",
+                            {"symbol": pos.symbol, "reason": exit_reason, "fraction": close_fraction},
+                        )
+
+                    elif close_fraction >= 1.0:
                         self._portfolio.remove_position(pos.symbol)
 
-                        # 🔴 FIX #1 (curr): pos.side normalization pentru Futures SHORT.
                         is_short = pos.side.upper() in ("SELL", "SHORT")
                         realized_pnl = (price - pos.entry_price) * close_qty
                         if is_short:
                             realized_pnl *= -1
 
-                        self._risk.on_trade_closed(
-                            pnl=realized_pnl,
-                            symbol=pos.symbol,
-                        )
+                        self._risk.on_trade_closed(pnl=realized_pnl, symbol=pos.symbol)
 
-                        # 🔴 FIX A: Sincronizeaza equity dupa inchiderea pozitiei.
                         equity_after = self._portfolio.get_equity()
                         self._risk.update_equity(equity_after)
-                        logger.debug(
-                            "[automation] risk equity synced after close: symbol=%s equity=%.2f",
-                            pos.symbol,
-                            equity_after,
-                        )
-
                         logger.info(
-                            "[automation] position CLOSED: %s realized_pnl=%.4f",
-                            pos.symbol,
-                            realized_pnl,
+                            "[automation] position CLOSED: %s realized_pnl=%.4f reason=%s",
+                            pos.symbol, realized_pnl, exit_reason,
                         )
                         await self._events.emit(
                             "position_closed",
                             {"symbol": pos.symbol, "pnl": realized_pnl},
                         )
+
                     else:
+                        # TP2 sau alte close partiale (nu TP1 si nu full close)
                         updated = pos.model_copy(
                             update={"quantity": pos.quantity - close_qty}
                         )
                         self._portfolio.update_position(updated)
 
-                        # 🔴 FIX A: Sincronizeaza equity si dupa close partial (TP1/TP2).
                         equity_after = self._portfolio.get_equity()
                         self._risk.update_equity(equity_after)
 
                         await self._events.emit(
                             "tp_hit",
-                            {
-                                "symbol": pos.symbol,
-                                "reason": exit_reason,
-                                "fraction": close_fraction,
-                            },
+                            {"symbol": pos.symbol, "reason": exit_reason, "fraction": close_fraction},
                         )
+
+                else:
+                    # Niciun exit — dar trailing stop-ul a fost modificat in memorie;
+                    # salvam pozitia actualizata in portfolio pentru persistenta.
+                    self._portfolio.update_position(pos)
+
             except Exception as exc:
                 logger.error(
                     "[automation] _manage_open_positions error for %s: %s", pos.symbol, exc
                 )
 
     async def _midnight_reset(self) -> None:
-        """
-        Reset daily risk counters la 00:00 UTC.
-
-        🟡 FIX #5 (prev): seen_candles NU mai e golit complet (.clear()).
-        🟡 FIX #2 (curr): trim cap la _SEEN_CANDLES_KEEP_MAX (20).
-        Formula: keep = min(max(2, interval_minutes * 2), _SEEN_CANDLES_KEEP_MAX)
-        """
         self._risk.reset_daily()
 
         keep = min(max(2, self._interval_minutes * 2), _SEEN_CANDLES_KEEP_MAX)
@@ -423,8 +435,6 @@ class AutomationEngine:
         logger.info(
             "[automation] midnight reset — seen_candles trimmed to last %d per symbol", keep
         )
-
-    # ──────────────────────────────────────────── TTL idempotency helpers
 
     def _register_placed_id(self, signal_id: str) -> None:
         now = monotonic()
@@ -442,8 +452,6 @@ class AutomationEngine:
             return False
         return True
 
-    # ──────────────────────────────────────────────── recent signals
-
     def _add_recent_signal(self, signal: StrategySignal, status: str) -> None:
         entry = {
             **signal.model_dump(),
@@ -456,8 +464,6 @@ class AutomationEngine:
 
     def get_recent_signals(self, limit: int = 50) -> List[Dict[str, Any]]:
         return self._recent_signals[-limit:]
-
-    # ──────────────────────────────────────────────── event hooks
 
     def on(self, event: str, handler: Callable[..., Coroutine]) -> None:
         self._events.on(event, handler)

@@ -5,6 +5,8 @@ All values read from environment / .env file.
 CHANGELOG:
   🟢 AI Copilot: adaugat groq_api_key, openai_api_key, ai_enabled, ai_model
      Groq e provider implicit (gratuit). Fallback la OpenAI daca groq_api_key e gol.
+  🟡 Trade config: adaugat max_holding_hours, inactivity_hours, tp1_fraction,
+     tp2_fraction, trail_pct — mutate din hardcode in trade_logic.py catre config.
 """
 from __future__ import annotations
 
@@ -23,14 +25,14 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    # ── Environment ──────────────────────────────────────────────────────────────────
+    # ── Environment ────────────────────────────────────────────────────────────────────────
     environment: str = Field(
         default="development",
         pattern="^(development|staging|production)$",
         description="Runtime environment: development | staging | production",
     )
 
-    # ── Exchange ────────────────────────────────────────────────────────────────────
+    # ── Exchange ──────────────────────────────────────────────────────────────────────
     binance_api_key: str = Field(default="", description="Binance API key")
     binance_api_secret: str = Field(default="", description="Binance API secret")
     testnet: bool = Field(default=True, description="Use Binance testnet")
@@ -40,13 +42,13 @@ class Settings(BaseSettings):
     binance_futures_api_key: str = Field(default="")
     binance_futures_api_secret: str = Field(default="")
 
-    # ── Mode ──────────────────────────────────────────────────────────────────────────
+    # ── Mode ──────────────────────────────────────────────────────────────────────────────────
     market_mode: str = Field(default="spot", pattern="^(spot|futures)$")
     futures_enabled: bool = Field(default=False)
     default_leverage: int = Field(default=1, ge=1, le=125)
     futures_leverage: int = Field(default=1, ge=1, le=125)
 
-    # ── Risk ───────────────────────────────────────────────────────────────────────────
+    # ── Risk ─────────────────────────────────────────────────────────────────────────────
     risk_per_trade: float = Field(default=0.01, gt=0, le=0.05)
     max_positions: int = Field(default=5, ge=1, le=20)
     max_daily_loss: float = Field(default=0.03, gt=0, le=0.20)
@@ -59,7 +61,7 @@ class Settings(BaseSettings):
     atr_max_pct: float = Field(default=0.05, gt=0)
     spread_max_pct: float = Field(default=0.002, gt=0)
 
-    # ── Execution ───────────────────────────────────────────────────────────────────────
+    # ── Execution ─────────────────────────────────────────────────────────────────────
     order_timeout_sec: float = Field(default=10.0, gt=0)
     retry_max_attempts: int = Field(default=3, ge=1)
     retry_base_delay: float = Field(default=0.5, gt=0)
@@ -67,7 +69,7 @@ class Settings(BaseSettings):
     exchange_info_ttl_seconds: int = Field(default=1800, ge=60)
     max_retries: int = Field(default=3, ge=1)
 
-    # ── Automation ─────────────────────────────────────────────────────────────────────
+    # ── Automation ───────────────────────────────────────────────────────────────────
     automation_interval_sec: int = Field(default=60, ge=5)
     strategy_interval_seconds: int = Field(default=60, ge=5)
     scan_interval_seconds: int = Field(default=60, ge=5)
@@ -77,20 +79,45 @@ class Settings(BaseSettings):
     symbol_whitelist: str = Field(default="BTCUSDT,ETHUSDT")
     symbol_blacklist: str = Field(default="")
 
+    # ── Trade exit parameters (anterior hardcodate in trade_logic.py) ────────────────
+    # 🟡 FIX #5: configurabile din .env — nu mai necesita modificare de cod
+    max_holding_hours: int = Field(
+        default=72, ge=1,
+        description="Inchide fortat pozitia dupa N ore (TIME_EXIT)",
+    )
+    inactivity_hours: int = Field(
+        default=24, ge=1,
+        description="Inchide daca pretul nu progreseaza dupa N ore (INACTIVITY)",
+    )
+    tp1_fraction: float = Field(
+        default=0.40, gt=0, lt=1.0,
+        description="Fractia din pozitie inchisa la TP1 (ex: 0.40 = 40%)",
+    )
+    tp2_fraction: float = Field(
+        default=0.40, gt=0, lt=1.0,
+        description="Fractia din remainder inchisa la TP2",
+    )
+    trail_pct: float = Field(
+        default=0.015, gt=0, lt=0.20,
+        description="Trailing stop fix in procente. Ignorat daca ATR e disponibil (dinamic).",
+    )
+    signal_close_min_confidence: float = Field(
+        default=0.75, gt=0.5, lt=1.0,
+        description="Confidence minim pentru SIGNAL_CLOSE pe semnal opus. Setat > min_consensus.",
+    )
+
     # ── Journal ───────────────────────────────────────────────────────────────────────
     journal_csv_path: str = Field(default="journal/trades.csv")
     journal_db_path: str = Field(default="journal/trades.db")
 
-    # ── Telegram ──────────────────────────────────────────────────────────────────────
+    # ── Telegram ─────────────────────────────────────────────────────────────────────
     telegram_bot_token: str = Field(default="")
     telegram_chat_id: str = Field(default="")
 
-    # ── Redis ────────────────────────────────────────────────────────────────────────
+    # ── Redis ───────────────────────────────────────────────────────────────────────────
     redis_url: str = Field(default="")
 
-    # ── AI Copilot ─────────────────────────────────────────────────────────────────────
-    # Provider: Groq implicit (gratuit), fallback OpenAI daca groq_api_key e gol.
-    # Seteaza cel putin unul din aceste doua key-uri in .env pentru a activa AI.
+    # ── AI Copilot ───────────────────────────────────────────────────────────────────
     groq_api_key: str = Field(
         default="",
         description="Groq API key (llama-3.3-70b-versatile — gratuit, recomandat)",
@@ -118,7 +145,7 @@ class Settings(BaseSettings):
         description="Comma-separated CORS allowed origins",
     )
 
-    # ── Derived helpers ────────────────────────────────────────────────────────────────────
+    # ── Derived helpers ────────────────────────────────────────────────────────────────────────
 
     @property
     def symbols_list(self) -> List[str]:
@@ -143,11 +170,6 @@ class Settings(BaseSettings):
 
     @property
     def ws_url(self) -> str:
-        """
-        Returneaza URL-ul corect pentru WebSocket, garantat sub /api/v1/ws.
-        Guard auto-correct: daca WS_URL din .env e setat la /ws (fara prefix),
-        il normalizeaza automat la /api/v1/ws — zero breaking changes.
-        """
         scheme = "wss" if self.is_production else "ws"
         base = f"{scheme}://{self.host}:{self.port}"
         return f"{base}/api/v1/ws"

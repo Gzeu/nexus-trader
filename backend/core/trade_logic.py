@@ -8,6 +8,16 @@ FIX 4: calc_position_size() uses effective_leverage correctly:
         The formula is: (equity * risk_per_trade) / sl_distance
         Position size in BASE asset is then: notional_risk * leverage / entry_price
         This matches how Binance Futures margin actually works.
+
+CHANGELOG (trade improvements):
+  🔴 FIX #5: MAX_HOLDING_HOURS, INACTIVITY_HOURS, TP1_FRACTION, TP2_FRACTION
+            mutate din constante hardcodate in valori citite din config.
+            Configurabile din .env fara modificare de cod.
+  🟡 FIX #6: trail_pct dinamic ATR-based daca position.metadata['atr_value'] e disponibil.
+            trail_pct = atr_value / current_price (adaptat la volatilitate reala).
+            Fallback la cfg.trail_pct (fix) daca ATR nu e in metadata.
+  🟡 FIX #7: signal_close_min_confidence citit din config (anterior 0.75 hardcodat).
+            Acum configurabil si verificat sa fie > min_consensus din CompositeStrategy.
 """
 from __future__ import annotations
 
@@ -20,13 +30,13 @@ from backend.config import get_settings
 from backend.models import Action, MarketMode, Position, PositionSide, StrategySignal
 
 log = structlog.get_logger(__name__)
-settings = get_settings()
 
 
-# ─── Entry Decision ──────────────────────────────────────────────────────────
+# ─── Entry Decision ───────────────────────────────────────────────────────────────────
 
 def should_enter_long(signal: StrategySignal, current_price: float, equity: float) -> Tuple[bool, str]:
     """Evaluate whether to enter a long position. Returns (ok, reason)."""
+    settings = get_settings()
     if signal.action not in (Action.BUY,):
         return False, "Signal action is not BUY"
     if signal.confidence < 0.5:
@@ -45,6 +55,7 @@ def should_enter_long(signal: StrategySignal, current_price: float, equity: floa
 
 def should_enter_short(signal: StrategySignal, current_price: float, equity: float) -> Tuple[bool, str]:
     """Evaluate short entry (futures only)."""
+    settings = get_settings()
     if signal.market_mode != MarketMode.FUTURES:
         return False, "Short only allowed in FUTURES mode"
     if signal.action != Action.SELL:
@@ -70,31 +81,8 @@ def calc_position_size(
 ) -> float:
     """
     FIX 4: Leverage-aware position sizing.
-
-    SPOT (leverage=1):
-        risk_amount  = equity * risk_per_trade          (e.g. 1% of $10 000 = $100)
-        sl_distance  = |entry - stop_loss|              (e.g. $200 for BTC)
-        size_in_base = risk_amount / sl_distance        (e.g. 0.5 BTC)
-
-    FUTURES (leverage=N):
-        The margin required per unit = entry / leverage.
-        If we are willing to lose risk_amount (in USDT) on this trade:
-          sl_distance_per_unit = |entry - stop_loss|
-          units = risk_amount / sl_distance_per_unit
-        This is IDENTICAL to spot in terms of unit count — because leverage
-        amplifies BOTH gains and losses symmetrically. The difference is that
-        the MARGIN USED = (units * entry) / leverage, which is smaller.
-
-        However for futures we apply a leverage_risk_scale so that we don't
-        accidentally over-size when volatility is high. We cap the effective
-        notional at equity * risk_per_trade * leverage.
-
-        Example: equity=$10000, risk=1%, entry=$60000, SL=$58000, leverage=5
-          sl_distance = $2000
-          max_notional_risk = $100 * 5 = $500  (leverage-scaled)
-          size = $500 / $2000 = 0.25 BTC
-          margin used = 0.25 * $60000 / 5 = $3000  (30% of equity — within limits)
     """
+    settings = get_settings()
     if entry <= 0 or stop_loss <= 0:
         return 0.0
 
@@ -105,32 +93,20 @@ def calc_position_size(
     risk_amount = equity * settings.risk_per_trade
 
     if market_mode == MarketMode.FUTURES:
-        effective_leverage = max(1, min(leverage, 20))  # hard cap at 20x
-        # Scale risk by leverage — more leverage → more units per $ of risk
+        effective_leverage = max(1, min(leverage, 20))
         risk_amount = risk_amount * effective_leverage
-    # Spot: leverage=1, risk_amount unchanged
 
     size = risk_amount / sl_distance
     return round(size, 8)
 
 
 def required_margin(size: float, entry: float, leverage: int) -> float:
-    """
-    Calculate the margin (USDT) required to open a futures position.
-    margin = (size * entry) / leverage
-    """
     if leverage <= 0:
         return size * entry
     return (size * entry) / leverage
 
 
-# ─── Exit Decision ────────────────────────────────────────────────────────────
-
-MAX_HOLDING_HOURS = 72
-INACTIVITY_HOURS  = 24
-TP1_FRACTION      = 0.40
-TP2_FRACTION      = 0.40
-
+# ─── Exit Decision ─────────────────────────────────────────────────────────────────────
 
 class ExitDecision:
     NONE         = "NONE"
@@ -151,13 +127,18 @@ def evaluate_exit(
     """
     Returns (exit_reason, close_fraction).
     close_fraction = 0.0 → no exit; 1.0 → full close; 0.4 → partial.
+
+    🟡 FIX #5: MAX_HOLDING_HOURS, INACTIVITY_HOURS, TP1_FRACTION, TP2_FRACTION
+            citite din config — nu mai sunt hardcodate.
+    🟡 FIX #7: signal_close_min_confidence citit din config.
     """
+    cfg     = get_settings()
     is_long = position.side == PositionSide.LONG
     now     = datetime.utcnow()
     age_h   = (now - position.opened_at).total_seconds() / 3600
 
     # 1. Max holding time
-    if age_h > MAX_HOLDING_HOURS:
+    if age_h > cfg.max_holding_hours:
         return ExitDecision.TIME_EXIT, 1.0
 
     # 2. Stop loss
@@ -173,32 +154,33 @@ def evaluate_exit(
         if not is_long and current_price >= position.trailing_stop:
             return ExitDecision.TRAILING, 1.0
 
-    # 4. TP1 partial close (40%)
+    # 4. TP1 partial close
     if not position.tp1_hit:
         if is_long  and current_price >= position.take_profit_1:
-            return ExitDecision.TP1, TP1_FRACTION
+            return ExitDecision.TP1, cfg.tp1_fraction
         if not is_long and current_price <= position.take_profit_1:
-            return ExitDecision.TP1, TP1_FRACTION
+            return ExitDecision.TP1, cfg.tp1_fraction
 
-    # 5. TP2 partial close (40% of remainder)
+    # 5. TP2 partial close
     if position.tp1_hit:
-        remaining_fraction = 1 - TP1_FRACTION
-        partial = TP2_FRACTION / remaining_fraction if remaining_fraction > 0 else 1.0
+        remaining_fraction = 1 - cfg.tp1_fraction
+        partial = cfg.tp2_fraction / remaining_fraction if remaining_fraction > 0 else 1.0
         if is_long  and current_price >= position.take_profit_2:
             return ExitDecision.TP2, partial
         if not is_long and current_price <= position.take_profit_2:
             return ExitDecision.TP2, partial
 
-    # 6. Opposite signal with high confidence
-    if opposite_signal is not None and opposite_signal.confidence > 0.75:
+    # 6. Opposite signal with configurable confidence threshold
+    # 🟡 FIX #7: signal_close_min_confidence din config (nu mai e 0.75 hardcodat)
+    if opposite_signal is not None and opposite_signal.confidence > cfg.signal_close_min_confidence:
         opp = opposite_signal.action
         if is_long  and opp == Action.SELL:
             return ExitDecision.SIGNAL_CLOSE, 1.0
         if not is_long and opp == Action.BUY:
             return ExitDecision.SIGNAL_CLOSE, 1.0
 
-    # 7. Inactivity (no meaningful progress)
-    if age_h > INACTIVITY_HOURS:
+    # 7. Inactivity
+    if age_h > cfg.inactivity_hours:
         if is_long  and current_price < position.entry_price * 1.001:
             return ExitDecision.INACTIVITY, 1.0
         if not is_long and current_price > position.entry_price * 0.999:
@@ -225,9 +207,26 @@ def update_position_after_tp1(position: Position, current_price: float) -> Posit
 def update_trailing_stop(
     position: Position,
     current_price: float,
-    trail_pct: float = 0.015,
+    trail_pct: float | None = None,
 ) -> Position:
-    """Ratchet the trailing stop in direction of trade."""
+    """
+    Ratchet the trailing stop in direction of trade.
+
+    🟡 FIX #6: trail_pct dinamic ATR-based daca position.metadata['atr_value'] e disponibil.
+    trail_pct = atr_value / current_price — adaptat la volatilitate reala.
+    Fallback la cfg.trail_pct (fix) daca ATR nu e prezent sau trail_pct e furnizat explicit.
+    """
+    if trail_pct is None:
+        cfg = get_settings()
+        # ATR-based dynamic trailing: mai larg pe piete volatile, mai stramt pe piete line
+        atr_value = None
+        if hasattr(position, "metadata") and position.metadata:
+            atr_value = position.metadata.get("atr_value")
+        if atr_value and current_price > 0:
+            trail_pct = atr_value / current_price
+        else:
+            trail_pct = cfg.trail_pct
+
     if position.side == PositionSide.LONG:
         new_trail = current_price * (1 - trail_pct)
         if position.trailing_stop is None or new_trail > position.trailing_stop:
