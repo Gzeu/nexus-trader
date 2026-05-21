@@ -19,6 +19,8 @@ CHANGELOG:
   🟡 FIX #6 (prev): place_order() wrapped cu asyncio.wait_for(cfg.order_timeout_seconds)
   🔴 FIX REVIEW #1: klines fetched cu cfg.primary_timeframe in loc de "1m" hardcodat
   🟠 FIX REVIEW #4: on_position_opened() apelat INAINTE de place_order cu rollback pe esec
+  🟡 REFACTOR     : rollback foloseste risk.rollback_position_opened() — nu mai acceseaza
+                    _open_symbols direct (atribut privat al RiskManager).
 """
 from __future__ import annotations
 
@@ -255,8 +257,8 @@ class AutomationEngine:
 
         # 🟠 FIX REVIEW #4: on_position_opened() inainte de place_order
         # cu rollback explicit daca place_order esueaza sau da timeout.
-        # Previne race condition unde place_order reuseste pe exchange dar
-        # exceptia arunca inainte ca on_position_opened() sa fie apelat.
+        # 🟡 REFACTOR: foloseste rollback_position_opened() public — nu mai acceseaza
+        # self._risk._open_symbols direct.
         self._risk.on_position_opened(signal.symbol)
         order_placed = False
         try:
@@ -281,12 +283,8 @@ class AutomationEngine:
             )
         finally:
             if not order_placed:
-                # Rollback: elimina simbolul din _open_symbols daca ordinul nu a ajuns pe exchange
-                self._risk._open_symbols.discard(signal.symbol)
-                logger.warning(
-                    "[automation] rollback on_position_opened for %s (place_order failed)",
-                    signal.symbol,
-                )
+                # 🟡 REFACTOR: rollback prin metoda publica — encapsulare corecta
+                self._risk.rollback_position_opened(signal.symbol)
                 return
 
         # 🔴 FIX A: Sincronizeaza equity in RiskManager dupa fiecare order plasat.

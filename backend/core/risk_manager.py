@@ -15,6 +15,8 @@ CHANGELOG:
                      → system raman blocat imediat dupa resume.
   🟡 FIX REVIEW #6 : VETO_VOLATILITY implementat in check_signal() folosind atr_pct din
                      metadata semnalului. Configurat prin MAX_ATR_PCT in settings.
+  🟡 REFACTOR      : rollback_position_opened() adaugat ca method public.
+                     Inlocuieste accesul direct la _open_symbols din AutomationEngine.
 """
 from __future__ import annotations
 
@@ -193,6 +195,19 @@ class RiskManager:
         self._open_symbols.add(symbol)
         logger.debug(
             "[risk] position opened: symbol=%s open_count=%d",
+            symbol, self.open_position_count,
+        )
+
+    def rollback_position_opened(self, symbol: str) -> None:
+        """
+        🟡 REFACTOR: Rollback explicit daca place_order a esuat dupa on_position_opened().
+
+        Inlocuieste accesul direct la _open_symbols din apelatori externi (AutomationEngine).
+        Metoda e idempotenta — discard() pe un simbol absent e no-op.
+        """
+        self._open_symbols.discard(symbol)
+        logger.warning(
+            "[risk] rollback_position_opened: symbol=%s open_count=%d",
             symbol, self.open_position_count,
         )
 
