@@ -6,6 +6,7 @@ Injectează în prompt:
   - Risk state (paused, drawdown, daily PnL, consecutive losses)
   - Pozițiile deschise curente (symbol, side, size, entry, unrealized PnL)
   - Ultimele 5 semnale generate de AutomationEngine
+  - Trade history din jurnal (ultimele 10 trades realizate)
   - Configurație sistem (dry_run, testnet, market_mode, automation running)
 
 Folosit exclusiv de ai_routes.py → POST /api/v1/ai/chat.
@@ -18,6 +19,62 @@ from datetime import datetime, timezone
 from backend.api.state import AppState
 
 logger = logging.getLogger(__name__)
+
+
+def _fmt_trade(trade: dict) -> str:
+    """
+    Formatează un trade din jurnal ca linie compactă pentru system prompt.
+
+    Input (dict din journal.query_trades):
+      symbol, side, realized_pnl, entry_price, exit_price, opened_at
+
+    Output example:
+      BTCUSDT BUY +$42.30 | entry=68420.00 exit=69890.00 | 2026-05-21 14:22 UTC
+    """
+    symbol = trade.get("symbol", "?")
+    side   = str(trade.get("side", "?")).upper()
+
+    pnl_raw = trade.get("realized_pnl", trade.get("pnl", None))
+    if pnl_raw is not None:
+        try:
+            pnl_val = float(pnl_raw)
+            pnl_str = f"+${pnl_val:.2f}" if pnl_val >= 0 else f"-${abs(pnl_val):.2f}"
+        except (ValueError, TypeError):
+            pnl_str = str(pnl_raw)
+    else:
+        pnl_str = "n/a"
+
+    entry = trade.get("entry_price", trade.get("open_price", None))
+    exit_ = trade.get("exit_price",  trade.get("close_price", None))
+    price_str = ""
+    if entry is not None:
+        try:
+            price_str = f" | entry={float(entry):.4f}"
+        except (ValueError, TypeError):
+            price_str = f" | entry={entry}"
+    if exit_ is not None:
+        try:
+            price_str += f" exit={float(exit_):.4f}"
+        except (ValueError, TypeError):
+            price_str += f" exit={exit_}"
+
+    ts_raw = trade.get("opened_at", trade.get("closed_at", trade.get("timestamp", "")))
+    ts_str = ""
+    if ts_raw:
+        try:
+            # Acceptă ISO string sau datetime object
+            if isinstance(ts_raw, str):
+                dt = datetime.fromisoformat(ts_raw.replace("Z", "+00:00"))
+            elif isinstance(ts_raw, datetime):
+                dt = ts_raw
+            else:
+                dt = None
+            if dt:
+                ts_str = f" | {dt.strftime('%Y-%m-%d %H:%M UTC')}"
+        except (ValueError, TypeError):
+            ts_str = f" | {ts_raw}"
+
+    return f"  {symbol} {side} {pnl_str}{price_str}{ts_str}"
 
 
 async def build_system_prompt(state: AppState) -> str:
@@ -34,7 +91,7 @@ async def build_system_prompt(state: AppState) -> str:
         f"=== STAREA SISTEMULUI (actualizat: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}) ===",
     ]
 
-    # ── Config de bază ────────────────────────────────────────────────────────
+    # ── Config de bază ────────────────────────────────────────────────────────────────
     try:
         from backend.config import get_settings
         cfg = get_settings()
@@ -49,7 +106,7 @@ async def build_system_prompt(state: AppState) -> str:
         logger.warning("ai_context: config fetch failed: %s", exc)
         lines.append("Config: indisponibil momentan")
 
-    # ── Metrics / Equity ──────────────────────────────────────────────────────
+    # ── Metrics / Equity ───────────────────────────────────────────────────────────────
     lines.append("")
     lines.append("--- Financiar ---")
     try:
@@ -61,11 +118,10 @@ async def build_system_prompt(state: AppState) -> str:
         ]
     except Exception as exc:
         logger.warning("ai_context: balance fetch failed: %s", exc)
-        # Fallback la equity cached
         equity = state.portfolio.get_equity()
         lines.append(f"Equity (cached): ${equity:.2f} USDT (date live indisponibile)")
 
-    # ── Risk state ────────────────────────────────────────────────────────────
+    # ── Risk state ───────────────────────────────────────────────────────────────────
     lines.append("")
     lines.append("--- Risk Manager ---")
     try:
@@ -84,7 +140,7 @@ async def build_system_prompt(state: AppState) -> str:
         logger.warning("ai_context: risk state failed: %s", exc)
         lines.append("Risk state: indisponibil")
 
-    # ── Poziții deschise ──────────────────────────────────────────────────────
+    # ── Poziții deschise ──────────────────────────────────────────────────────────────
     lines.append("")
     lines.append("--- Poziții deschise ---")
     try:
@@ -103,7 +159,7 @@ async def build_system_prompt(state: AppState) -> str:
         logger.warning("ai_context: positions failed: %s", exc)
         lines.append("Poziții: indisponibile")
 
-    # ── Ultimele semnale ──────────────────────────────────────────────────────
+    # ── Ultimele semnale ──────────────────────────────────────────────────────────────
     lines.append("")
     lines.append("--- Ultimele 5 semnale ---")
     try:
@@ -112,18 +168,36 @@ async def build_system_prompt(state: AppState) -> str:
             lines.append("Niciun semnal recent.")
         else:
             for sig in signals:
-                symbol = sig.get("symbol", "?")
-                action = sig.get("action", sig.get("signal_type", "?"))
+                symbol     = sig.get("symbol", "?")
+                action     = sig.get("action", sig.get("signal_type", "?"))
                 confidence = sig.get("confidence", sig.get("strength", ""))
-                ts = sig.get("timestamp", sig.get("created_at", ""))
-                conf_str = f" | confidence={confidence}" if confidence else ""
-                ts_str = f" | {ts}" if ts else ""
+                ts         = sig.get("timestamp", sig.get("created_at", ""))
+                conf_str   = f" | confidence={confidence}" if confidence else ""
+                ts_str     = f" | {ts}" if ts else ""
                 lines.append(f"  {symbol} → {action}{conf_str}{ts_str}")
     except Exception as exc:
         logger.warning("ai_context: signals failed: %s", exc)
         lines.append("Semnale: indisponibile")
 
-    # ── Trade analytics ───────────────────────────────────────────────────────
+    # ── Trade history din jurnal (I4) ──────────────────────────────────────────────────────
+    lines.append("")
+    lines.append("--- Trade history (ultimele 10 trades realizate) ---")
+    try:
+        trades = await state.journal.query_trades(limit=10)
+        if not trades:
+            lines.append("Niciun trade în jurnal.")
+        else:
+            for trade in trades:
+                lines.append(_fmt_trade(trade))
+    except AttributeError:
+        # journal poate lipsi pe setup-uri minimale
+        logger.warning("ai_context: state.journal indisponibil (AttributeError)")
+        lines.append("Trade history: jurnal indisponibil pe această instanță.")
+    except Exception as exc:
+        logger.warning("ai_context: trade history failed: %s", exc)
+        lines.append("Trade history: indisponibil momentan.")
+
+    # ── Trade analytics ──────────────────────────────────────────────────────────────────
     lines.append("")
     lines.append("--- Analytics trades ---")
     try:
@@ -144,6 +218,8 @@ async def build_system_prompt(state: AppState) -> str:
         "=== INSTRUCȚIUNI ===",
         "- Bazează-te EXCLUSIV pe datele de mai sus când răspunzi despre starea sistemului.",
         "- Dacă datele lipsesc, spune că sunt temporar indisponibile.",
+        "- Foloseste trade history pentru analiza performanței: PnL per simbol, streak-uri de pierderi, pattern-uri.",
+        "- Semnalează activ dacă vezi: >3 pierderi consecutive, drawdown >5%, win_rate <40%.",
         "- Nu executa niciodată ordine reale — ești în modul read-only/analiză.",
         "- La întrebări despre setup/configurație, explică clar pașii.",
     ]
