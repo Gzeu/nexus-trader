@@ -1,6 +1,10 @@
 """
 config.py – Pydantic v2 Settings, loaded once via @lru_cache singleton.
 All values read from environment / .env file.
+
+CHANGELOG:
+  🟢 AI Copilot: adaugat groq_api_key, openai_api_key, ai_enabled, ai_model
+     Groq e provider implicit (gratuit). Fallback la OpenAI daca groq_api_key e gol.
 """
 from __future__ import annotations
 
@@ -26,7 +30,7 @@ class Settings(BaseSettings):
         description="Runtime environment: development | staging | production",
     )
 
-    # ── Exchange ──────────────────────────────────────────────────────────────────────
+    # ── Exchange ────────────────────────────────────────────────────────────────────
     binance_api_key: str = Field(default="", description="Binance API key")
     binance_api_secret: str = Field(default="", description="Binance API secret")
     testnet: bool = Field(default=True, description="Use Binance testnet")
@@ -51,11 +55,11 @@ class Settings(BaseSettings):
     cooldown_minutes: int = Field(default=20, ge=0)
     max_consecutive_losses: int = Field(default=3, ge=1)
 
-    # ── Volatility / Spread filters ────────────────────────────────────────────────────
+    # ── Volatility / Spread filters ──────────────────────────────────────────────────
     atr_max_pct: float = Field(default=0.05, gt=0)
     spread_max_pct: float = Field(default=0.002, gt=0)
 
-    # ── Execution ────────────────────────────────────────────────────────────────────────
+    # ── Execution ───────────────────────────────────────────────────────────────────────
     order_timeout_sec: float = Field(default=10.0, gt=0)
     retry_max_attempts: int = Field(default=3, ge=1)
     retry_base_delay: float = Field(default=0.5, gt=0)
@@ -73,16 +77,36 @@ class Settings(BaseSettings):
     symbol_whitelist: str = Field(default="BTCUSDT,ETHUSDT")
     symbol_blacklist: str = Field(default="")
 
-    # ── Journal ────────────────────────────────────────────────────────────────────────
+    # ── Journal ───────────────────────────────────────────────────────────────────────
     journal_csv_path: str = Field(default="journal/trades.csv")
     journal_db_path: str = Field(default="journal/trades.db")
 
-    # ── Telegram ───────────────────────────────────────────────────────────────────────
+    # ── Telegram ──────────────────────────────────────────────────────────────────────
     telegram_bot_token: str = Field(default="")
     telegram_chat_id: str = Field(default="")
 
     # ── Redis ────────────────────────────────────────────────────────────────────────
     redis_url: str = Field(default="")
+
+    # ── AI Copilot ─────────────────────────────────────────────────────────────────────
+    # Provider: Groq implicit (gratuit), fallback OpenAI daca groq_api_key e gol.
+    # Seteaza cel putin unul din aceste doua key-uri in .env pentru a activa AI.
+    groq_api_key: str = Field(
+        default="",
+        description="Groq API key (llama-3.3-70b-versatile — gratuit, recomandat)",
+    )
+    openai_api_key: str = Field(
+        default="",
+        description="OpenAI API key (gpt-4o-mini — fallback daca Groq nu e setat)",
+    )
+    ai_model: str = Field(
+        default="",
+        description="Override model name. Gol = llama-3.3-70b-versatile (Groq) sau gpt-4o-mini (OpenAI)",
+    )
+    ai_enabled: bool = Field(
+        default=False,
+        description="Activeaza AI Copilot. Necesita cel putin un API key (Groq sau OpenAI).",
+    )
 
     # ── Server ─────────────────────────────────────────────────────────────────────────
     host: str = Field(default="0.0.0.0")

@@ -7,6 +7,7 @@ CHANGELOG:
      La timeout: serverul porneste in stare not_reconciled (trading blocat),
      logheza CRITICAL si trimite Telegram alert.
   🟢 settings_routes inregistrat in create_app() — GET/PATCH /api/v1/settings functional.
+  🟢 ai_router inregistrat in create_app() — /api/v1/ai/* endpoints active.
 """
 from __future__ import annotations
 
@@ -17,6 +18,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from backend.api.ai_routes import router as ai_router
 from backend.api.routes import router as main_router
 from backend.api.settings_routes import router as settings_router
 from backend.api.state import AppState, set_state
@@ -26,7 +28,7 @@ from backend.config import get_settings
 
 logger = logging.getLogger(__name__)
 
-RECONCILE_TIMEOUT_S = 30  # secunde — configurabil daca necesitar
+RECONCILE_TIMEOUT_S = 30  # secunde — configurabil daca necesar
 
 
 @asynccontextmanager
@@ -41,13 +43,7 @@ async def lifespan(app: FastAPI):
     if state.telegram:
         ws_manager.set_telegram(state.telegram)
 
-    # ── Startup reconciliation cu timeout ────────────────────────────────────
-    # 🟠 FIX: asyncio.wait_for previne blocajul infinit la startup.
-    # Daca Binance nu raspunde in RECONCILE_TIMEOUT_S secunde:
-    #   - serverul porneste (health check raspunde)
-    #   - is_ready = False => toate ordinele sunt blocate
-    #   - CRITICAL log + Telegram alert
-    # Automation-ul NU porneste pana la reconciliere reusita.
+    # ── Startup reconciliation cu timeout ──────────────────────────────────────────
     try:
         result = await asyncio.wait_for(
             state.portfolio.reconcile(),
@@ -60,7 +56,6 @@ async def lifespan(app: FastAPI):
                 result.positions_synced,
                 result.orders_synced,
             )
-            # Porneste automation doar dupa reconciliere reusita
             await state.automation.start()
             logger.info("AutomationEngine started")
         else:
@@ -88,9 +83,9 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.critical("Startup reconciliation unexpected error: %s", exc, exc_info=True)
 
-    yield  # ── aplicatia ruleaza ─────────────────────────────────────────────
+    yield  # ── aplicatia ruleaza ─────────────────────────────────────────────────────
 
-    # ── Shutdown ──────────────────────────────────────────────────────────────
+    # ── Shutdown ──────────────────────────────────────────────────────────────────────
     logger.info("Shutting down...")
     try:
         await state.automation.stop()
@@ -124,5 +119,6 @@ def create_app() -> FastAPI:
     app.include_router(main_router, prefix="/api/v1")
     app.include_router(settings_router)   # prefix /api/v1 definit intern in settings_routes.py
     app.include_router(ws_router)
+    app.include_router(ai_router)         # prefix /api/v1/ai definit intern in ai_routes.py
 
     return app
