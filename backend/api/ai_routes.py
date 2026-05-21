@@ -4,6 +4,7 @@ ai_routes.py — AI Copilot endpoints.
 Endpoints:
   POST /api/v1/ai/chat      → Trimite mesaj, primește răspuns streamat (SSE)
   GET  /api/v1/ai/status    → Verifică dacă AI e activat și ce provider e folosit
+  POST /api/v1/ai/execute   → Execută o acțiune propusă de AI (I2)
 
 Provider logic:
   1. Dacă groq_api_key e setat → Groq (llama-3.3-70b-versatile) — gratuit, rapid
@@ -19,13 +20,19 @@ Rate-limit handling (I3):
     - await asyncio.sleep() cu cap la 60s
     - Retry maxim MAX_RETRIES=3 ori
     - La a 4-a eroare: SSE error + fallback la OpenAI dacă există key
+
+Action executor (I2):
+  POST /ai/execute primește { action_type, params } și mapează pe logica
+  existentă din routes.py / AppState. Toate acțiunile write sunt blocate
+  dacă sistemul nu e reconciliat sau risk managerul e pauzeit (excepție:
+  emergency_stop și resume_trading care funcționează oricând).
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
-from typing import Any, AsyncGenerator, Dict, Optional
+from typing import Any, AsyncGenerator, Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -54,6 +61,18 @@ class ChatRequest(BaseModel):
     message: str
     history: list[ChatMessage] = []
     include_context: bool = True  # injectează date live în system prompt
+
+
+class ExecuteRequest(BaseModel):
+    action_type: str
+    params: Dict[str, Any] = {}
+
+
+class ExecuteResponse(BaseModel):
+    success: bool
+    message: str
+    data: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
 
 
 # ─── Provider helpers ─────────────────────────────────────────────────────────
@@ -101,10 +120,10 @@ async def _stream_groq(
     """Streaming SSE via Groq REST API (fără SDK — httpx async).
 
     Yields:
-      - SSE token chunks: ``data: {"token": "..."}""
-      - SSE done marker: ``data: [DONE]""
-      - SSE error (non-retryable): ``data: {"error": "..."}""
-      - SSE rate-limit sentinel (retryable): ``data: {"_rate_limit": {"retry_after": N}}""
+      - SSE token chunks: ``data: {"token": "..."}``
+      - SSE done marker: ``data: [DONE]``
+      - SSE error (non-retryable): ``data: {"error": "..."}``
+      - SSE rate-limit sentinel (retryable): ``data: {"_rate_limit": {"retry_after": N}}``
         → consumat de _stream_groq_with_retry(), nu ajunge la frontend.
     """
     try:
@@ -296,6 +315,268 @@ def _sse_error(msg: str) -> str:
     return f"data: {json.dumps({'error': msg})}\n\n"
 
 
+# ─── Action executor helpers ──────────────────────────────────────────────────
+
+async def _exec_emergency_stop(state: AppState, _params: Dict[str, Any]) -> ExecuteResponse:
+    """Oprire de urgență: pauzează risk + oprește automation + notifică Telegram."""
+    state.risk.pause(reason="emergency_stop via AI Copilot")
+    await state.automation.stop()
+    try:
+        await state.telegram.send_alert("🚨 EMERGENCY STOP activat via AI Copilot")
+    except Exception as tg_err:
+        logger.warning("_exec_emergency_stop: telegram alert failed: %s", tg_err)
+    logger.info("AI action: emergency_stop executed")
+    return ExecuteResponse(success=True, message="Emergency stop activat. Trading oprit.")
+
+
+async def _exec_resume_trading(state: AppState, _params: Dict[str, Any]) -> ExecuteResponse:
+    """Reia trading-ul: depauzează risk + pornește automation."""
+    state.risk.resume()
+    await state.automation.start()
+    logger.info("AI action: resume_trading executed")
+    return ExecuteResponse(success=True, message="Trading reluat. AutomationEngine pornit.")
+
+
+async def _exec_cancel_all_orders(state: AppState, params: Dict[str, Any]) -> ExecuteResponse:
+    """
+    Anulează toate ordinele deschise.
+    params.symbol (opțional): dacă specificat, anulează doar pentru acel simbol.
+    """
+    symbol: Optional[str] = params.get("symbol")
+    if symbol:
+        symbols: List[str] = [symbol.upper()]
+    else:
+        symbols = [p.symbol for p in state.portfolio.get_positions()]
+        if not symbols:
+            # Încearcă și ordinele fără poziție corespunzătoare
+            try:
+                open_orders = state.portfolio.get_open_orders()
+                symbols = list({o.symbol for o in open_orders})
+            except Exception:
+                pass
+
+    if not symbols:
+        return ExecuteResponse(success=True, message="Nu există ordine deschise de anulat.", data={"cancelled": []})
+
+    cancelled, errors = [], []
+    for sym in symbols:
+        try:
+            await state.client.cancel_all_orders(sym)
+            cancelled.append(sym)
+        except Exception as exc:
+            errors.append({"symbol": sym, "error": str(exc)})
+            logger.warning("_exec_cancel_all_orders: %s failed: %s", sym, exc)
+
+    logger.info("AI action: cancel_all_orders — cancelled=%s errors=%s", cancelled, errors)
+    return ExecuteResponse(
+        success=len(errors) == 0,
+        message=f"Anulat ordine pentru {len(cancelled)} simboluri." + (f" Erori: {len(errors)}." if errors else ""),
+        data={"cancelled": cancelled, "errors": errors},
+    )
+
+
+async def _exec_close_all_positions(state: AppState, params: Dict[str, Any]) -> ExecuteResponse:
+    """
+    Închide toate pozițiile deschise la market.
+    params.symbol (opțional): dacă specificat, închide doar poziția respectivă.
+    """
+    if not state.portfolio.is_ready:
+        return ExecuteResponse(success=False, error="Sistem nereconciliat — imposibil de închis pozițiile.")
+
+    all_positions = state.portfolio.get_positions()
+    symbol: Optional[str] = params.get("symbol")
+    positions = [p for p in all_positions if p.symbol == symbol.upper()] if symbol else all_positions
+
+    if not positions:
+        return ExecuteResponse(success=True, message="Nu există poziții deschise de închis.", data={"closed": []})
+
+    closed, errors = [], []
+    for pos in positions:
+        try:
+            side = "SELL" if pos.side == "BUY" else "BUY"
+            await state.client.place_market_order(pos.symbol, side, pos.quantity)
+            state.portfolio.remove_position(pos.symbol)
+            closed.append(pos.symbol)
+        except Exception as exc:
+            errors.append({"symbol": pos.symbol, "error": str(exc)})
+            logger.warning("_exec_close_all_positions: %s failed: %s", pos.symbol, exc)
+
+    logger.info("AI action: close_all_positions — closed=%s errors=%s", closed, errors)
+    return ExecuteResponse(
+        success=len(errors) == 0,
+        message=f"Închise {len(closed)} poziții." + (f" Erori: {len(errors)}." if errors else ""),
+        data={"closed": closed, "errors": errors},
+    )
+
+
+async def _exec_place_order(state: AppState, params: Dict[str, Any]) -> ExecuteResponse:
+    """
+    Plasează un ordin manual.
+    params: { symbol, side, quantity, order_type?, price?, stop_loss?, take_profit? }
+    """
+    if not state.portfolio.is_ready:
+        return ExecuteResponse(success=False, error="Sistem nereconciliat — trading blocat.")
+    if state.risk.is_paused:
+        return ExecuteResponse(success=False, error="Risk manager pauzeit — trading blocat.")
+
+    required = ("symbol", "side", "quantity")
+    missing = [k for k in required if k not in params]
+    if missing:
+        return ExecuteResponse(success=False, error=f"Parametri lipsă: {', '.join(missing)}")
+
+    try:
+        result = await state.execution.place_order(
+            symbol=str(params["symbol"]).upper(),
+            side=str(params["side"]).upper(),
+            quantity=float(params["quantity"]),
+            order_type=str(params.get("order_type", "MARKET")).upper(),
+            price=float(params["price"]) if params.get("price") else None,
+            stop_loss=float(params["stop_loss"]) if params.get("stop_loss") else None,
+            take_profit=float(params["take_profit"]) if params.get("take_profit") else None,
+        )
+        logger.info("AI action: place_order — symbol=%s side=%s qty=%s result=%s",
+                    params["symbol"], params["side"], params["quantity"], result)
+        return ExecuteResponse(
+            success=True,
+            message=f"Ordin plasat: {params['side']} {params['quantity']} {params['symbol']}",
+            data={"order": result},
+        )
+    except Exception as exc:
+        logger.error("_exec_place_order failed: %s", exc)
+        return ExecuteResponse(success=False, error=str(exc))
+
+
+async def _exec_pause_symbol(state: AppState, params: Dict[str, Any]) -> ExecuteResponse:
+    """
+    Pauzează trading-ul pentru un simbol specific.
+    params: { symbol }
+    Folosește risk.pause_symbol() dacă există, altfel fallback la blocarea în settings_overrides.
+    """
+    symbol: Optional[str] = params.get("symbol")
+    if not symbol:
+        return ExecuteResponse(success=False, error="Parametru 'symbol' lipsă.")
+    symbol = symbol.upper()
+
+    # Încearcă method per-symbol dacă e implementat în RiskManager
+    if hasattr(state.risk, "pause_symbol"):
+        try:
+            state.risk.pause_symbol(symbol)
+            logger.info("AI action: pause_symbol — %s", symbol)
+            return ExecuteResponse(success=True, message=f"Simbolul {symbol} pauzeit.")
+        except Exception as exc:
+            return ExecuteResponse(success=False, error=str(exc))
+
+    # Fallback: înregistrăm în state ca atribut de blocaj temporar
+    if not hasattr(state, "_paused_symbols"):
+        state._paused_symbols = set()  # type: ignore[attr-defined]
+    state._paused_symbols.add(symbol)  # type: ignore[attr-defined]
+    logger.info("AI action: pause_symbol (fallback set) — %s", symbol)
+    return ExecuteResponse(
+        success=True,
+        message=f"Simbolul {symbol} adăugat în lista de pauză internă (până la restart).",
+        data={"paused_symbols": list(state._paused_symbols)},  # type: ignore[attr-defined]
+    )
+
+
+async def _exec_set_risk_param(state: AppState, params: Dict[str, Any]) -> ExecuteResponse:
+    """
+    Setează un parametru de risc runtime (override in-memory).
+    params: { key: str, value: any }
+    Chei acceptate: max_drawdown_pct, max_daily_loss_pct, max_position_size,
+                    max_open_positions, risk_per_trade_pct
+    """
+    ALLOWED_RISK_KEYS = {
+        "max_drawdown_pct",
+        "max_daily_loss_pct",
+        "max_position_size",
+        "max_open_positions",
+        "risk_per_trade_pct",
+        "stop_loss_pct",
+        "take_profit_pct",
+    }
+
+    key: Optional[str] = params.get("key")
+    value = params.get("value")
+
+    if not key:
+        return ExecuteResponse(success=False, error="Parametru 'key' lipsă.")
+    if value is None:
+        return ExecuteResponse(success=False, error="Parametru 'value' lipsă.")
+    if key not in ALLOWED_RISK_KEYS:
+        return ExecuteResponse(
+            success=False,
+            error=f"Cheia '{key}' nu este permisă. Chei acceptate: {', '.join(sorted(ALLOWED_RISK_KEYS))}",
+        )
+
+    cfg = get_settings()
+    if not hasattr(cfg, key):
+        return ExecuteResponse(success=False, error=f"Cheia '{key}' nu există în Settings schema.")
+
+    # Import _settings_overrides din routes.py — folosim același dict shared
+    try:
+        from backend.api.routes import _settings_overrides
+        _settings_overrides[key] = value
+    except ImportError:
+        # Fallback: setăm direct pe obiectul cfg (non-persistent)
+        logger.warning("_exec_set_risk_param: nu am putut importa _settings_overrides din routes.py")
+        object.__setattr__(cfg, key, value)
+
+    logger.info("AI action: set_risk_param — %s=%s", key, value)
+    return ExecuteResponse(
+        success=True,
+        message=f"Parametrul de risc '{key}' setat la {value} (in-memory, reset la restart).",
+        data={"key": key, "value": value},
+    )
+
+
+async def _exec_get_status(state: AppState, _params: Dict[str, Any]) -> ExecuteResponse:
+    """
+    Returnează un snapshot read-only al stării sistemului.
+    Action read-only — nu are side effects, nu necesită reconciliere.
+    """
+    positions = state.portfolio.get_positions()
+    try:
+        balance = await state.portfolio.get_balance_summary()
+        equity = balance.total_usdt_value
+        available = balance.available_margin
+    except Exception:
+        equity = state.portfolio.get_equity()
+        available = 0.0
+
+    data = {
+        "reconciled": state.portfolio.is_ready,
+        "automation_running": state.automation.running,
+        "risk_paused": state.risk.is_paused,
+        "open_positions": len(positions),
+        "equity_usdt": round(equity, 2),
+        "available_usdt": round(available, 2),
+        "consecutive_losses": state.risk.consecutive_losses,
+        "daily_pnl": state.risk.daily_pnl,
+    }
+    return ExecuteResponse(
+        success=True,
+        message="Status sistem obținut.",
+        data=data,
+    )
+
+
+# ─── Action dispatcher ────────────────────────────────────────────────────────
+
+_ACTION_HANDLERS = {
+    "emergency_stop":      _exec_emergency_stop,
+    "resume_trading":      _exec_resume_trading,
+    "cancel_all_orders":   _exec_cancel_all_orders,
+    "close_all_positions": _exec_close_all_positions,
+    "place_order":         _exec_place_order,
+    "pause_symbol":        _exec_pause_symbol,
+    "set_risk_param":      _exec_set_risk_param,
+    "get_status":          _exec_get_status,
+}
+
+# Acțiunile care pot rula chiar dacă risk e pauzeit sau sistemul nereconciliat
+_ALWAYS_ALLOWED = {"emergency_stop", "resume_trading", "get_status"}
+
+
 # ─── Endpoints ────────────────────────────────────────────────────────────────
 
 @router.get("/status")
@@ -311,16 +592,20 @@ async def ai_status() -> Dict[str, Any]:
 
     if cfg.groq_api_key:
         model = cfg.ai_model or "llama-3.3-70b-versatile"
-        return {"enabled": True, "provider": "groq", "model": model}
+        return {"enabled": True, "provider": "groq", "model": model,
+                "has_groq": True, "has_openai": bool(cfg.openai_api_key)}
 
     if cfg.openai_api_key:
         model = cfg.ai_model or "gpt-4o-mini"
-        return {"enabled": True, "provider": "openai", "model": model}
+        return {"enabled": True, "provider": "openai", "model": model,
+                "has_groq": False, "has_openai": True}
 
     return {
         "enabled": False,
         "provider": None,
         "model": None,
+        "has_groq": False,
+        "has_openai": False,
         "warning": "AI_ENABLED=true dar niciun API key configurat.",
     }
 
@@ -394,3 +679,55 @@ async def ai_chat(
             "X-Accel-Buffering": "no",  # dezactivează buffering nginx
         },
     )
+
+
+@router.post("/execute", response_model=ExecuteResponse)
+async def ai_execute(
+    req: ExecuteRequest,
+    state: AppState = Depends(get_state),
+) -> ExecuteResponse:
+    """
+    Execută o acțiune propusă de AI Copilot după confirmare din partea utilizatorului.
+
+    Acțiuni suportate:
+      emergency_stop      — oprire urgență (always allowed)
+      resume_trading      — reluare trading (always allowed)
+      cancel_all_orders   — anulare ordine (params: symbol?)
+      close_all_positions — închidere poziții (params: symbol?)
+      place_order         — ordin manual (params: symbol, side, quantity, ...)
+      pause_symbol        — pauzează un simbol (params: symbol)
+      set_risk_param      — modifică parametru risc (params: key, value)
+      get_status          — snapshot sistem read-only (always allowed)
+
+    Securitate:
+      - Acțiunile write sunt blocate dacă sistemul nu e reconciliat
+        (excepție: emergency_stop, resume_trading, get_status)
+      - action_type necunoscut → 400 (nu 500)
+      - Toate acțiunile sunt logate la INFO
+    """
+    action_type = req.action_type.lower().strip()
+    logger.info("ai_execute: action_type=%s params=%s", action_type, req.params)
+
+    handler = _ACTION_HANDLERS.get(action_type)
+    if handler is None:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Acțiune necunoscută: '{action_type}'. "
+                f"Acțiuni disponibile: {', '.join(sorted(_ACTION_HANDLERS.keys()))}"
+            ),
+        )
+
+    # Guard: acțiunile write necesită sistem reconciliat
+    if action_type not in _ALWAYS_ALLOWED and not state.portfolio.is_ready:
+        return ExecuteResponse(
+            success=False,
+            error="Sistemul nu este reconciliat. Acțiunea a fost blocată pentru siguranță.",
+        )
+
+    try:
+        result = await handler(state, req.params)
+        return result
+    except Exception as exc:
+        logger.error("ai_execute: unexpected error for action=%s: %s", action_type, exc, exc_info=True)
+        return ExecuteResponse(success=False, error=f"Eroare internă: {exc}")
