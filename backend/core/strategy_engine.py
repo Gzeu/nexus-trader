@@ -5,6 +5,10 @@ CHANGELOG:
   🟡 FIX #6: CompositeStrategy normalizeaza weight-urile inainte de voting.
      Daca suma weights != 1.0 (e.g. [0.5, 0.3, 0.3] = 1.1),
      confidence final putea depasi 1.0 → clampat dupa normalizare.
+  🔴 FIX REVIEW #2: _make_signal() accepta param timeframe (nu mai e hardcodat "1m").
+     Fiecare strategie paseza timeframe-ul corect primit din context.
+  🟡 FIX REVIEW #5: BreakoutStrategy confidence dinamic bazat pe magnitudinea breakout-ului.
+     Anterior: confidence=0.75 fix → distorsiona votul in CompositeStrategy.
 """
 from __future__ import annotations
 
@@ -79,7 +83,7 @@ class BaseStrategy(ABC):
     name: str = "base"
 
     @abstractmethod
-    def compute(self, klines: List[List[Any]]) -> Optional[StrategySignal]:
+    def compute(self, klines: List[List[Any]], timeframe: str = "1m") -> Optional[StrategySignal]:
         """Primeste klines OHLCV si returneaza StrategySignal sau None."""
         ...
 
@@ -97,7 +101,9 @@ class BaseStrategy(ABC):
         reason: str = "",
         candle_open_time: Optional[str] = None,
         metadata: Optional[Dict] = None,
+        timeframe: str = "1m",
     ) -> StrategySignal:
+        # 🔴 FIX REVIEW #2: timeframe passat ca param — nu mai e hardcodat "1m"
         sl_dist = atr * sl_atr_mult
         if action in (Action.BUY,):
             stop_loss    = close - sl_dist
@@ -108,6 +114,11 @@ class BaseStrategy(ABC):
             take_profit1 = close - sl_dist * tp1_rr
             take_profit2 = close - sl_dist * tp2_rr
 
+        # Adauga atr_pct in metadata pentru VETO_VOLATILITY din RiskManager
+        meta = metadata or {}
+        if close > 0 and atr > 0:
+            meta["atr_pct"] = round(atr / close, 6)
+
         return StrategySignal(
             symbol=symbol,
             action=action,
@@ -117,10 +128,10 @@ class BaseStrategy(ABC):
             stop_loss=round(stop_loss, 8),
             take_profit_1=round(take_profit1, 8),
             take_profit_2=round(take_profit2, 8),
-            timeframe="1m",
+            timeframe=timeframe,
             reason=reason,
             candle_open_time=candle_open_time,
-            metadata=metadata or {},
+            metadata=meta,
         )
 
 
@@ -136,7 +147,7 @@ class TrendFollowingStrategy(BaseStrategy):
         self._fast   = fast
         self._slow   = slow
 
-    def compute(self, klines: List[List[Any]]) -> Optional[StrategySignal]:
+    def compute(self, klines: List[List[Any]], timeframe: str = "1m") -> Optional[StrategySignal]:
         if len(klines) < self._slow + 5:
             return None
 
@@ -159,13 +170,13 @@ class TrendFollowingStrategy(BaseStrategy):
             conf = min(0.5 + (curr_cross / closes[-1]) * 10, 1.0)
             return self._make_signal(
                 self._symbol, Action.BUY, conf, closes[-1], atr,
-                reason="EMA bullish crossover", candle_open_time=ts,
+                reason="EMA bullish crossover", candle_open_time=ts, timeframe=timeframe,
             )
         if prev_cross > 0 and curr_cross < 0 and rsi > 30:
             conf = min(0.5 + abs(curr_cross / closes[-1]) * 10, 1.0)
             return self._make_signal(
                 self._symbol, Action.SELL, conf, closes[-1], atr,
-                reason="EMA bearish crossover", candle_open_time=ts,
+                reason="EMA bearish crossover", candle_open_time=ts, timeframe=timeframe,
             )
         return None
 
@@ -181,7 +192,7 @@ class MeanReversionStrategy(BaseStrategy):
         self._rsi_ob = rsi_ob
         self._rsi_os = rsi_os
 
-    def compute(self, klines: List[List[Any]]) -> Optional[StrategySignal]:
+    def compute(self, klines: List[List[Any]], timeframe: str = "1m") -> Optional[StrategySignal]:
         if len(klines) < self._period + 5:
             return None
 
@@ -200,14 +211,14 @@ class MeanReversionStrategy(BaseStrategy):
             conf     = min(0.45 + dist_pct * 5, 0.95)
             return self._make_signal(
                 self._symbol, Action.BUY, conf, close, atr,
-                reason=f"BB lower touch + RSI={rsi:.1f}", candle_open_time=ts,
+                reason=f"BB lower touch + RSI={rsi:.1f}", candle_open_time=ts, timeframe=timeframe,
             )
         if close > upper and rsi > self._rsi_ob:
             dist_pct = (close - upper) / upper if upper else 0
             conf     = min(0.45 + dist_pct * 5, 0.95)
             return self._make_signal(
                 self._symbol, Action.SELL, conf, close, atr,
-                reason=f"BB upper touch + RSI={rsi:.1f}", candle_open_time=ts,
+                reason=f"BB upper touch + RSI={rsi:.1f}", candle_open_time=ts, timeframe=timeframe,
             )
         return None
 
@@ -222,7 +233,7 @@ class BreakoutStrategy(BaseStrategy):
         self._lookback = lookback
         self._vol_mult = vol_mult
 
-    def compute(self, klines: List[List[Any]]) -> Optional[StrategySignal]:
+    def compute(self, klines: List[List[Any]], timeframe: str = "1m") -> Optional[StrategySignal]:
         if len(klines) < self._lookback + 2:
             return None
 
@@ -232,7 +243,7 @@ class BreakoutStrategy(BaseStrategy):
         volumes = [_safe_float(k[5]) for k in klines]
         ts      = str(klines[-1][0]) if klines else None
 
-        atr  = _atr(highs, lows, closes)
+        atr   = _atr(highs, lows, closes)
         close = closes[-1]
 
         prev_highs  = highs[-(self._lookback + 1):-1]
@@ -241,15 +252,24 @@ class BreakoutStrategy(BaseStrategy):
         curr_vol    = volumes[-1]
         vol_ok      = curr_vol > avg_vol * self._vol_mult
 
-        if close > max(prev_highs) and vol_ok:
+        resistance = max(prev_highs)
+        support    = min(prev_lows)
+
+        if close > resistance and vol_ok:
+            # 🟡 FIX REVIEW #5: confidence dinamic pe baza magnitudinii breakout-ului
+            # Anterior: confidence=0.75 fix → distorsiona votul in CompositeStrategy
+            breakout_pct = (close - resistance) / resistance if resistance else 0.0
+            conf = min(0.60 + breakout_pct * 20, 0.95)
             return self._make_signal(
-                self._symbol, Action.BUY, 0.75, close, atr,
-                reason=f"{self._lookback}c high breakout + vol", candle_open_time=ts,
+                self._symbol, Action.BUY, conf, close, atr,
+                reason=f"{self._lookback}c high breakout + vol", candle_open_time=ts, timeframe=timeframe,
             )
-        if close < min(prev_lows) and vol_ok:
+        if close < support and vol_ok:
+            breakout_pct = (support - close) / support if support else 0.0
+            conf = min(0.60 + breakout_pct * 20, 0.95)
             return self._make_signal(
-                self._symbol, Action.SELL, 0.75, close, atr,
-                reason=f"{self._lookback}c low breakout + vol", candle_open_time=ts,
+                self._symbol, Action.SELL, conf, close, atr,
+                reason=f"{self._lookback}c low breakout + vol", candle_open_time=ts, timeframe=timeframe,
             )
         return None
 
@@ -286,12 +306,12 @@ class CompositeStrategy(BaseStrategy):
         self._weights: Dict[str, float] = {k: v / total_w for k, v in raw.items()}
         logger.debug("CompositeStrategy normalized weights: %s", self._weights)
 
-    def compute(self, klines: List[List[Any]]) -> Optional[StrategySignal]:
+    def compute(self, klines: List[List[Any]], timeframe: str = "1m") -> Optional[StrategySignal]:
         signals: List[Tuple[StrategySignal, float]] = []
 
         for strat in self._strategies:
             try:
-                sig = strat.compute(klines)
+                sig = strat.compute(klines, timeframe=timeframe)
             except Exception as exc:
                 logger.warning("CompositeStrategy: %s failed: %s", strat.name, exc)
                 sig = None
@@ -328,7 +348,7 @@ class CompositeStrategy(BaseStrategy):
             stop_loss=round(avg_sl,  8),
             take_profit_1=round(avg_tp1, 8),
             take_profit_2=round(avg_tp2, 8),
-            timeframe=ref.timeframe,
+            timeframe=timeframe,
             reason=f"Composite({best_action}) conf={net_conf:.2f} from {len(concordant)} strategies",
             candle_open_time=ref.candle_open_time,
             metadata={"votes": votes, "weights": self._weights},

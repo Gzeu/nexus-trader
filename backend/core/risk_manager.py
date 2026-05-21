@@ -10,6 +10,11 @@ CHANGELOG:
                      Anterior: count += 1 independent de set.add() → count=2 pe acelasi simbol
                      daca on_position_opened() era apelat dublu.
                      Acum: count = len(set) in ambele metode — sursa unica de adevar.
+  🟠 FIX REVIEW #3 : resume() reseteaza consecutive_losses la 0.
+                     Anterior: dupa pause/resume, consecutive_losses pastra valoarea veche
+                     → system raman blocat imediat dupa resume.
+  🟡 FIX REVIEW #6 : VETO_VOLATILITY implementat in check_signal() folosind atr_pct din
+                     metadata semnalului. Configurat prin MAX_ATR_PCT in settings.
 """
 from __future__ import annotations
 
@@ -43,8 +48,6 @@ class RiskManager:
         self._max_drawdown_seen: float = 0.0
         self._open_symbols: set[str] = set()
 
-        # 🟡 FIX D: _open_position_count e derivat din _open_symbols, nu mentinut separat.
-        # Proprietatea de mai jos garanteaza sincronizarea — nu mai exista stare duplicata.
         self._max_positions       = cfg.max_open_positions
         self._risk_per_trade      = cfg.risk_per_trade
         self._max_daily_loss      = cfg.max_daily_loss_pct
@@ -52,6 +55,8 @@ class RiskManager:
         self._min_rr              = cfg.min_risk_reward
         self._cooldown_minutes    = cfg.sl_cooldown_minutes
         self._max_consec_losses   = cfg.max_consecutive_losses
+        # 🟡 FIX REVIEW #6: prag ATR% pentru veto volatilitate (default 5%)
+        self._max_atr_pct: float  = getattr(cfg, "max_atr_pct", 0.05)
 
     # ─────────────────────────────────────────────────────── public properties
 
@@ -130,7 +135,6 @@ class RiskManager:
             if daily_loss_pct >= self._max_daily_loss:
                 return RiskVeto.DAILY_LOSS
 
-        # 🟡 FIX D: foloseste property derivat — garantat sincronizat cu _open_symbols
         if self.open_position_count >= self._max_positions:
             return RiskVeto.MAX_POSITIONS
 
@@ -147,11 +151,20 @@ class RiskManager:
         if self._consecutive_losses >= self._max_consec_losses:
             return RiskVeto.CONSECUTIVE_LOSSES
 
-        if signal.stop_loss and signal.take_profit_1 and signal.entry_price:
+        if signal.stop_loss is not None and signal.take_profit_1 is not None and signal.entry_price is not None:
             risk   = abs(signal.entry_price - signal.stop_loss)
             reward = abs(signal.take_profit_1 - signal.entry_price)
             if risk > 0 and (reward / risk) < self._min_rr:
                 return RiskVeto.MIN_RR
+
+        # 🟡 FIX REVIEW #6: VETO_VOLATILITY — atr_pct injectat de _make_signal() in metadata
+        atr_pct = signal.metadata.get("atr_pct") if signal.metadata else None
+        if atr_pct is not None and self._max_atr_pct > 0 and atr_pct > self._max_atr_pct:
+            logger.info(
+                "[risk] VETO_VOLATILITY: symbol=%s atr_pct=%.4f > max=%.4f",
+                signal.symbol, atr_pct, self._max_atr_pct,
+            )
+            return RiskVeto.VOLATILITY
 
         return RiskVeto.PASS
 
@@ -160,7 +173,6 @@ class RiskManager:
     def on_trade_closed(self, pnl: float, symbol: str) -> None:
         """Apelat de AutomationEngine la inchiderea unui trade cu realized_pnl."""
         self._open_symbols.discard(symbol)
-        # 🟡 FIX D: count derivat autoritar — nu mai e mentinute separat
 
         if pnl < 0:
             self._consecutive_losses += 1
@@ -194,7 +206,11 @@ class RiskManager:
     def resume(self) -> None:
         self._paused = False
         self._pause_reason = ""
-        logger.info("[risk] RESUMED")
+        # 🟠 FIX REVIEW #3: reseteaza consecutive_losses la resume.
+        # Anterior: consecutive_losses pastra valoarea veche dupa pause/resume
+        # → sistem blocat imediat dupa resume daca max_consecutive_losses era deja atins.
+        self._consecutive_losses = 0
+        logger.info("[risk] RESUMED — consecutive_losses reset to 0")
 
     def reset_daily(self) -> None:
         """

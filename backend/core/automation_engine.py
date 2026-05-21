@@ -17,6 +17,8 @@ CHANGELOG:
   🟡 FIX #2 (curr): _midnight_reset() trim cap la 20 — previne acumulare la interval=60m
   🟡 FIX #5 (curr): _seen_candles init consistent cu deque(maxlen=_SEEN_CANDLES_MAXLEN)
   🟡 FIX #6 (prev): place_order() wrapped cu asyncio.wait_for(cfg.order_timeout_seconds)
+  🔴 FIX REVIEW #1: klines fetched cu cfg.primary_timeframe in loc de "1m" hardcodat
+  🟠 FIX REVIEW #4: on_position_opened() apelat INAINTE de place_order cu rollback pe esec
 """
 from __future__ import annotations
 
@@ -174,8 +176,10 @@ class AutomationEngine:
 
     async def _process_symbol(self, symbol: str) -> None:
         """Genereaza semnal, valideaza risc, executa daca OK."""
+        # 🔴 FIX REVIEW #1: foloseste primary_timeframe din config, nu "1m" hardcodat
+        timeframe = self._cfg.primary_timeframe
         try:
-            klines = await self._client.get_klines(symbol, interval="1m", limit=100)
+            klines = await self._client.get_klines(symbol, interval=timeframe, limit=100)
         except Exception as exc:
             logger.warning("[automation] klines fetch failed for %s: %s", symbol, exc)
             return
@@ -247,8 +251,14 @@ class AutomationEngine:
             logger.warning("[automation] calc_position_size returned 0 for %s", signal.symbol)
             return
 
-        # 🟠 FIX #3 (curr): cfg.order_timeout_seconds direct
         order_timeout = cfg.order_timeout_seconds
+
+        # 🟠 FIX REVIEW #4: on_position_opened() inainte de place_order
+        # cu rollback explicit daca place_order esueaza sau da timeout.
+        # Previne race condition unde place_order reuseste pe exchange dar
+        # exceptia arunca inainte ca on_position_opened() sa fie apelat.
+        self._risk.on_position_opened(signal.symbol)
+        order_placed = False
         try:
             await asyncio.wait_for(
                 self._execution.place_order(
@@ -262,19 +272,24 @@ class AutomationEngine:
                 ),
                 timeout=order_timeout,
             )
+            order_placed = True
         except asyncio.TimeoutError:
             logger.error(
                 "[automation] place_order TIMEOUT (%ds) for %s — order may not have been placed!",
                 order_timeout,
                 signal.symbol,
             )
-            return
-
-        self._risk.on_position_opened(signal.symbol)
+        finally:
+            if not order_placed:
+                # Rollback: elimina simbolul din _open_symbols daca ordinul nu a ajuns pe exchange
+                self._risk._open_symbols.discard(signal.symbol)
+                logger.warning(
+                    "[automation] rollback on_position_opened for %s (place_order failed)",
+                    signal.symbol,
+                )
+                return
 
         # 🔴 FIX A: Sincronizeaza equity in RiskManager dupa fiecare order plasat.
-        # Fara acest apel, _equity=0 si _peak_equity=0 → drawdown check fata de 0
-        # → potential ZeroDivisionError sau veto MAX_DRAWDOWN la primul semnal.
         equity_after = self._portfolio.get_equity()
         self._risk.update_equity(equity_after)
         logger.debug(
@@ -312,8 +327,7 @@ class AutomationEngine:
                     close_qty = round(pos.quantity * close_fraction, 8)
                     side = "SELL" if pos.side == "BUY" else "BUY"
 
-                    # 🟠 FIX B: split dublu assignment — order_timeout = cfg = get_settings()
-                    # Anterior, prima linie seta order_timeout = AppSettings (obiect!), suprascrisa imediat.
+                    # 🟠 FIX B: split dublu assignment
                     cfg = get_settings()
                     order_timeout = cfg.order_timeout_seconds
                     try:
