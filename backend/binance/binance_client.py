@@ -5,9 +5,12 @@ CHANGELOG:
   🔴 FIX #1 : get_open_orders() accepta futures=bool — rutare corecta Spot vs Futures.
   🔴 FIX #9 : cancel_all_orders() accepta futures=bool — anuleaza si ordinele Futures.
   🟡 FIX #7 : hmac.new() cu keyword args (Python 3.13+ safe, fara deprecation warnings).
+  🟢 FEAT   : listenKey management complet (create / keepalive / delete / background task).
+               Compatibil cu BinanceWebSocket.user_data_stream() din binance_ws.py.
 """
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import hmac
 import logging
@@ -25,6 +28,9 @@ _SPOT_LIVE = "https://api.binance.com"
 _SPOT_TEST = "https://testnet.binance.vision"
 _FUTS_LIVE = "https://fapi.binance.com"
 _FUTS_TEST = "https://testnet.binancefuture.com"
+
+# listenKey expira dupa 60 min; trimitem keepalive la fiecare 30 min
+_LISTEN_KEY_KEEPALIVE_INTERVAL = 30 * 60
 
 
 class BinanceClient:
@@ -44,6 +50,7 @@ class BinanceClient:
         self._futures_base = _FUTS_TEST if self._testnet else _FUTS_LIVE
 
         self._client: Optional[httpx.AsyncClient] = None
+        self._keepalive_task: Optional[asyncio.Task] = None
 
     # ----------------------------------------------------------------- lifecycle
 
@@ -65,6 +72,12 @@ class BinanceClient:
         )
 
     async def stop(self) -> None:
+        if self._keepalive_task and not self._keepalive_task.done():
+            self._keepalive_task.cancel()
+            try:
+                await self._keepalive_task
+            except asyncio.CancelledError:
+                pass
         if self._client:
             await self._client.aclose()
 
@@ -311,3 +324,128 @@ class BinanceClient:
             },
             base_url=self._futures_base,
         )
+
+    # ----------------------------------------------------------------- listenKey (User Data Stream)
+
+    async def create_listen_key(self, futures: bool = False) -> str:
+        """
+        Creeaza un listenKey pentru WebSocket User Data Stream.
+
+        Spot:    POST /api/v3/userDataStream  — NU necesita semnatura HMAC
+        Futures: POST /fapi/v1/listenKey      — necesita header X-MBX-APIKEY
+
+        Args:
+            futures: Daca True, creeaza listenKey pentru Futures stream.
+
+        Returns:
+            listenKey string (valabil 60 minute; mentine-l activ cu keepalive_listen_key).
+
+        Exemplu de utilizare cu BinanceWebSocket:
+            listen_key = await client.create_listen_key()
+            await client.start_listen_key_keepalive(listen_key)
+            await ws.user_data_stream(listen_key, my_callback)
+        """
+        if futures:
+            url = self._futures_base + "/fapi/v1/listenKey"
+            r = await self._client.post(url)  # type: ignore
+        else:
+            url = self._spot_base + "/api/v3/userDataStream"
+            r = await self._client.post(url)  # type: ignore
+        r.raise_for_status()
+        data = r.json()
+        listen_key: str = data["listenKey"]
+        logger.info("listenKey creat (%s): %s...", "futures" if futures else "spot", listen_key[:12])
+        return listen_key
+
+    async def keepalive_listen_key(self, listen_key: str, futures: bool = False) -> None:
+        """
+        Trimite keepalive pentru a preveni expirarea listenKey (expira dupa 60 min).
+
+        Spot:    PUT /api/v3/userDataStream?listenKey=...
+        Futures: PUT /fapi/v1/listenKey?listenKey=...
+
+        Apeleaza la fiecare ~30 minute sau foloseste start_listen_key_keepalive().
+
+        Args:
+            listen_key: listenKey obtinut din create_listen_key().
+            futures:    Daca True, face keepalive pe Futures endpoint.
+        """
+        params = {"listenKey": listen_key}
+        if futures:
+            url = self._futures_base + "/fapi/v1/listenKey"
+        else:
+            url = self._spot_base + "/api/v3/userDataStream"
+        r = await self._client.put(url, params=params)  # type: ignore
+        r.raise_for_status()
+        logger.debug("listenKey keepalive OK: %s...", listen_key[:12])
+
+    async def delete_listen_key(self, listen_key: str, futures: bool = False) -> None:
+        """
+        Sterge explicit listenKey la shutdown (buna practica pentru a nu lasa sesiuni zombie).
+
+        Spot:    DELETE /api/v3/userDataStream?listenKey=...
+        Futures: DELETE /fapi/v1/listenKey?listenKey=...
+
+        Args:
+            listen_key: listenKey de sters.
+            futures:    Daca True, sterge pe Futures endpoint.
+        """
+        params = {"listenKey": listen_key}
+        if futures:
+            url = self._futures_base + "/fapi/v1/listenKey"
+        else:
+            url = self._spot_base + "/api/v3/userDataStream"
+        r = await self._client.delete(url, params=params)  # type: ignore
+        try:
+            r.raise_for_status()
+        except httpx.HTTPStatusError:
+            logger.warning("delete_listen_key: status %s (ignorat la shutdown)", r.status_code)
+        logger.info("listenKey sters: %s...", listen_key[:12])
+
+    async def start_listen_key_keepalive(
+        self,
+        listen_key: str,
+        futures: bool = False,
+        interval: int = _LISTEN_KEY_KEEPALIVE_INTERVAL,
+    ) -> asyncio.Task:
+        """
+        Porneste un background task asyncio care face keepalive automat.
+
+        Task-ul se opreste automat la stop() sau poate fi anulat manual.
+        Un singur task keepalive activ per client (task anterior anulat automat).
+
+        Args:
+            listen_key: listenKey activ.
+            futures:    Daca True, face keepalive pe Futures endpoint.
+            interval:   Interval in secunde intre keepalive-uri. Default 30 min.
+
+        Returns:
+            asyncio.Task — poti await-a sau cancel() manual daca e nevoie.
+
+        Exemplu complet:
+            async with BinanceClient() as client:
+                key = await client.create_listen_key()
+                await client.start_listen_key_keepalive(key)
+                # porneste WS stream in paralel
+                ws = BinanceWebSocket()
+                await ws.user_data_stream(key, handle_fill)
+        """
+        if self._keepalive_task and not self._keepalive_task.done():
+            self._keepalive_task.cancel()
+            logger.debug("Task keepalive anterior anulat.")
+
+        async def _loop() -> None:
+            while True:
+                await asyncio.sleep(interval)
+                try:
+                    await self.keepalive_listen_key(listen_key, futures=futures)
+                except Exception as e:
+                    logger.error("listenKey keepalive FAILED: %s", e)
+
+        self._keepalive_task = asyncio.create_task(_loop(), name="binance_listen_key_keepalive")
+        logger.info(
+            "listenKey keepalive task pornit (interval=%ds, futures=%s)",
+            interval,
+            futures,
+        )
+        return self._keepalive_task
