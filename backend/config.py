@@ -7,6 +7,9 @@ CHANGELOG:
      Groq e provider implicit (gratuit). Fallback la OpenAI daca groq_api_key e gol.
   🟡 Trade config: adaugat max_holding_hours, inactivity_hours, tp1_fraction,
      tp2_fraction, trail_pct — mutate din hardcode in trade_logic.py catre config.
+  🟢 WebSocket: adaugat ws_reconnect_delay, ws_ping_interval.
+  🟢 Sync: adaugat is_production field, reconcile_timeout_seconds, toate setarile
+     documentate in .env.example sunt acum prezente in Settings.
 """
 from __future__ import annotations
 
@@ -30,6 +33,10 @@ class Settings(BaseSettings):
         default="development",
         pattern="^(development|staging|production)$",
         description="Runtime environment: development | staging | production",
+    )
+    is_production: bool = Field(
+        default=False,
+        description="Dezactiveaza /docs, /redoc si /openapi.json cand True. NU lasa False pe prod!",
     )
 
     # ── Exchange ──────────────────────────────────────────────────────────────────────
@@ -62,7 +69,8 @@ class Settings(BaseSettings):
     spread_max_pct: float = Field(default=0.002, gt=0)
 
     # ── Execution ─────────────────────────────────────────────────────────────────────
-    order_timeout_sec: float = Field(default=10.0, gt=0)
+    order_timeout_sec: float = Field(default=10.0, gt=0, description="Timeout place_order() in secunde")
+    reconcile_timeout_seconds: float = Field(default=60.0, gt=0, description="Timeout reconcile() la startup")
     retry_max_attempts: int = Field(default=3, ge=1)
     retry_base_delay: float = Field(default=0.5, gt=0)
     retry_max_delay: float = Field(default=8.0, gt=0)
@@ -79,8 +87,7 @@ class Settings(BaseSettings):
     symbol_whitelist: str = Field(default="BTCUSDT,ETHUSDT")
     symbol_blacklist: str = Field(default="")
 
-    # ── Trade exit parameters (anterior hardcodate in trade_logic.py) ────────────────
-    # 🟡 FIX #5: configurabile din .env — nu mai necesita modificare de cod
+    # ── Trade exit parameters ─────────────────────────────────────────────────────────
     max_holding_hours: int = Field(
         default=72, ge=1,
         description="Inchide fortat pozitia dupa N ore (TIME_EXIT)",
@@ -104,6 +111,16 @@ class Settings(BaseSettings):
     signal_close_min_confidence: float = Field(
         default=0.75, gt=0.5, lt=1.0,
         description="Confidence minim pentru SIGNAL_CLOSE pe semnal opus. Setat > min_consensus.",
+    )
+
+    # ── WebSocket ─────────────────────────────────────────────────────────────────────
+    ws_reconnect_delay: int = Field(
+        default=5, ge=1,
+        description="Secunde asteptare inainte de reconectare WS dupa drop",
+    )
+    ws_ping_interval: int = Field(
+        default=30, ge=10,
+        description="Interval ping WebSocket pentru a mentine conexiunea activa",
     )
 
     # ── Journal ───────────────────────────────────────────────────────────────────────
@@ -165,12 +182,13 @@ class Settings(BaseSettings):
         return [o.strip() for o in self.cors_origins.split(",") if o.strip()]
 
     @property
-    def is_production(self) -> bool:
-        return self.environment == "production"
+    def effective_is_production(self) -> bool:
+        """True daca environment == production SAU is_production flag e setat explicit."""
+        return self.environment == "production" or self.is_production
 
     @property
     def ws_url(self) -> str:
-        scheme = "wss" if self.is_production else "ws"
+        scheme = "wss" if self.effective_is_production else "ws"
         base = f"{scheme}://{self.host}:{self.port}"
         return f"{base}/api/v1/ws"
 
